@@ -1,0 +1,52 @@
+name: drift-guard
+
+# Epic #396: the shared off-axis Kooima math (display3d_view / camera3d_view,
+# W3) and the C++ app scaffolding (logging / input / window / xr_session /
+# HUD / d3d11_renderer / capture helper / stb, W4) live in displayxr-common
+# (displayxr::math + displayxr::common) and are consumed via FetchContent.
+# They must NOT be re-vendored into this repo's tracked sources — re-copying
+# is exactly how the drift this epic killed got started. This guard fails if
+# a vendored copy reappears.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: drift-guard-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  no-vendored-math:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: No re-vendored displayxr::math sources
+        shell: bash
+        run: |
+          # FetchContent copies live in _deps/ (gitignored) and a git submodule's
+          # files are not parent-tracked, so neither trips this check.
+          hits=$(git ls-files | grep -E '(^|/)(display3d_view|camera3d_view)\.(c|h)$' || true)
+          if [ -n "$hits" ]; then
+            echo "::error::Re-vendored displayxr::math sources found. The off-axis Kooima"
+            echo "::error::math must come from displayxr::math (FetchContent / submodule),"
+            echo "::error::not be copied into this repo. See epic #396."
+            echo "$hits"
+            exit 1
+          fi
+          echo "OK: no vendored display3d_view / camera3d_view sources."
+      - name: No re-vendored displayxr::common scaffolding
+        shell: bash
+        run: |
+          # W4 (#396): the C++ scaffolding lives in displayxr::common.
+          # leia_math.h is intentionally absent (app-local reference).
+          hits=$(git ls-files | grep -E '(^|/)(logging|input_handler|window_manager|xr_session_common|xr_window_space_hud|atlas_capture|atlas_capture_macos|hud_renderer|hud_renderer_macos|text_overlay|d3d11_renderer|mip_chain|optimus_dgpu_hint|view_params|stb_image|stb_image_write|stb_image_impl_macos)\.(c|cpp|h|mm)$|(^|/)displayxr_manifest\.cmake$' || true)
+          if [ -n "$hits" ]; then
+            echo "::error::Re-vendored displayxr::common scaffolding found. The shared C++"
+            echo "::error::scaffolding must come from displayxr::common (FetchContent),"
+            echo "::error::not be copied into this repo. See epic #396 W4."
+            echo "$hits"
+            exit 1
+          fi
+          echo "OK: no vendored scaffolding sources."

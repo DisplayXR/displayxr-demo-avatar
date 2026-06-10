@@ -1,0 +1,246 @@
+name: Build Windows
+
+# Windows installer build. Mirrors build-macos.yml (and the BuildInstaller
+# job in displayxr-runtime's build-windows.yml). The demo's release cadence
+# is manual — devs push a v* tag when ready; on a v* tag this workflow builds
+# DisplayXRModelViewerSetup-<version>.exe and attaches it to the GitHub
+# Release. workflow_dispatch lets the build be exercised without cutting a tag.
+#
+# PR + push-to-main runs are validation only: they compile the app + installer
+# to catch breakage before a release, but the release-attach step and the
+# versions.json DispatchVersionsBump job stay gated on a v* ref, so they only
+# fire on tags.
+#
+# The DetectChanges job + docs_only step gating let this workflow be a required
+# status check (the "Build Windows" job always runs and reports success in
+# ~30s on doc-only PRs, skipping the heavy build) without blocking doc PRs.
+# Mirrors the sentinel pattern in displayxr-runtime + displayxr-leia-plugin.
+
+on:
+  pull_request: {}
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  workflow_dispatch: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# contents: write is required by softprops/action-gh-release@v2 to
+# create-or-update the GitHub Release on a v* tag push. GH_TOKEN is exported
+# explicitly because the action prefers $GH_TOKEN over its `token:` input.
+permissions:
+  contents: write
+
+jobs:
+  DetectChanges:
+    runs-on: ubuntu-latest
+    outputs:
+      docs_only: ${{ steps.filter.outputs.docs_only }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: filter
+        run: |
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            echo "docs_only=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE=${{ github.event.pull_request.base.sha }}
+          else
+            BASE=${{ github.event.before }}
+          fi
+          CHANGED=$(git diff --name-only "$BASE" HEAD)
+          NON_DOC=$(echo "$CHANGED" | grep -vE '^(docs/|.*\.md$|LICENSE$|\.github/ISSUE_TEMPLATE/)' || true)
+          if [ -n "$CHANGED" ] && [ -z "$NON_DOC" ]; then
+            echo "docs_only=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "docs_only=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  BuildInstaller:
+    name: Build Windows
+    needs: DetectChanges
+    runs-on: windows-2022
+    env:
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Doc-only PR — skipping heavy build steps
+        if: needs.DetectChanges.outputs.docs_only == 'true'
+        run: echo "docs_only=true; build steps will skip and report success."
+
+      - name: Install Vulkan SDK
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        # Same action + version the runtime + Leia-plugin Windows CI use.
+        # Provides glslangValidator (if the demo's shader compile needs it)
+        # under $VULKAN_SDK\Bin.
+        uses: humbletim/install-vulkan-sdk@v1.2
+        with:
+          version: 1.3.283.0
+          cache: true
+
+      - if: needs.DetectChanges.outputs.docs_only != 'true'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Add Vulkan SDK tools to PATH
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        shell: pwsh
+        run: '"$env:VULKAN_SDK\Bin" | Out-File -FilePath $env:GITHUB_PATH -Append'
+
+      - name: Install OpenXR loader
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        shell: pwsh
+        run: |
+          # The demo links the OpenXR loader. Mirror the runtime repo: grab the
+          # prebuilt Khronos loader and point CMake at it via OpenXR_ROOT.
+          $openxrVersion = "1.1.43"
+          $openxrUrl = "https://github.com/KhronosGroup/OpenXR-SDK-Source/releases/download/release-$openxrVersion/openxr_loader_windows-$openxrVersion.zip"
+          Invoke-WebRequest -Uri $openxrUrl -OutFile openxr_loader.zip
+          Expand-Archive -Path openxr_loader.zip -DestinationPath openxr_sdk -Force
+
+      - name: Derive installer version
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        id: version
+        shell: pwsh
+        run: |
+          # `v1.2.3` -> `1.2.3` for the installer version + filename. Untagged
+          # (PR / push / workflow_dispatch) builds use a numeric placeholder so
+          # the NSIS VIProductVersion stays valid; they never publish a release.
+          if ($env:GITHUB_REF -like 'refs/tags/v*') {
+            $version = $env:GITHUB_REF -replace '^refs/tags/v',''
+          } else {
+            $version = "0.0.0"
+          }
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Write-Host "Building installer with VERSION=$version"
+
+      - name: Build demo
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        shell: pwsh
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release `
+            -DOpenXR_ROOT="${{ github.workspace }}/openxr_sdk"
+          cmake --build build
+
+      - name: Stage OpenXR loader next to demo binary
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        shell: pwsh
+        run: |
+          # An OpenXR app must ship its own openxr_loader.dll next to the exe.
+          # CMake POST_BUILD already attempts this, but guarantee it here so the
+          # installer's File "${BIN_DIR}\openxr_loader.dll" can't silently miss
+          # (the runtime's copy is not on an app's DLL search path). Source is
+          # the Khronos loader we downloaded into openxr_sdk.
+          #
+          # The Khronos zip ships THREE loaders — x64, Win32 (x86), AND arm64.
+          # Select x64 explicitly: a naive recursive first-match can grab the
+          # arm64 build (it sorts first), which the x64 demo exe then fails to
+          # load with a "bad image" error at startup (exit 0xC000007B).
+          $dll = Get-ChildItem -Path openxr_sdk -Recurse -Filter openxr_loader.dll |
+                 Where-Object { $_.FullName -match '[\\/]x64[\\/]' } | Select-Object -First 1
+          if (-not $dll) { Write-Host "::error::x64 openxr_loader.dll not found under openxr_sdk"; exit 1 }
+          # Defense in depth: verify the PE machine is actually x64 (0x8664).
+          $bytes = [System.IO.File]::ReadAllBytes($dll.FullName)
+          $peOff = [BitConverter]::ToInt32($bytes, 0x3C)
+          $machine = [BitConverter]::ToUInt16($bytes, $peOff + 4)
+          if ($machine -ne 0x8664) { Write-Host ("::error::staged openxr_loader.dll is not x64 (PE machine=0x{0:X})" -f $machine); exit 1 }
+          New-Item -ItemType Directory -Force build\windows | Out-Null
+          Copy-Item $dll.FullName build\windows\openxr_loader.dll -Force
+          Write-Host "Staged x64 $($dll.FullName) -> build\windows\openxr_loader.dll"
+
+      - name: Build installer
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        shell: cmd
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: call installer\build-installer.bat
+
+      - name: Assert installer carries no vendor SR DLL (regression guard)
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem installer\DisplayXRModelViewerSetup-*.exe | Select-Object -First 1
+          if (-not $exe) { Write-Host "::error::installer .exe not produced"; exit 1 }
+          Write-Host "Installer: $($exe.FullName)"
+          # NSIS payloads are listable by 7-Zip (preinstalled on the runner).
+          # SimulatedRealityVulkanBeta.dll is a Leia SDK binary owned by the
+          # Leia plug-in (it ships + self-loads it) — it must never appear in
+          # this vendor-neutral demo's installer. See displayxr-runtime#314.
+          $listing = & 7z l "$($exe.FullName)" 2>&1 | Out-String
+          if ($listing -match 'SimulatedReality') {
+            Write-Host "::error::installer bundles a SimulatedReality* DLL — that's a Leia plug-in concern, not demo content."
+            exit 1
+          }
+          Write-Host "PASS: installer contains no SimulatedReality* binary."
+          # The demo must ship the OpenXR loader next to its exe (apps carry
+          # their own; the runtime's copy is not on an app's DLL search path).
+          # Mirrors the macOS bundle's libopenxr_loader assertion.
+          if ($listing -notmatch 'openxr_loader\.dll') {
+            Write-Host "::error::installer is missing openxr_loader.dll — OpenXR apps must bundle the loader."
+            exit 1
+          }
+          Write-Host "PASS: installer bundles openxr_loader.dll."
+
+      - name: Upload installer
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          retention-days: 3
+          name: DisplayXRModelViewer-Windows
+          if-no-files-found: error
+          path: installer/DisplayXRModelViewerSetup-*.exe
+
+      # softprops/action-gh-release@v2 create-or-updates the GitHub Release on
+      # a v* tag and attaches the .exe. If the macOS workflow races on the same
+      # tag, the action just appends — both assets land on the same release.
+      - name: Attach installer to GitHub release on tag
+        if: needs.DetectChanges.outputs.docs_only != 'true' && startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: installer/DisplayXRModelViewerSetup-*.exe
+          fail_on_unmatched_files: true
+          draft: false
+          prerelease: false
+
+  # On v* tag push, after BuildInstaller succeeds, tell
+  # displayxr-runtime to bump versions.json[modelviewer_demo] to
+  # this tag. Only the Windows workflow dispatches — the macOS
+  # workflow racing on the same tag would just no-op against the
+  # idempotent handler, but a single dispatch is cleaner.
+  #
+  # Spec: DisplayXR/displayxr-runtime
+  # docs/specs/runtime/versions-json-autobump.md.
+  DispatchVersionsBump:
+    if: ${{ startsWith(github.ref, 'refs/tags/v') && github.repository == 'DisplayXR/displayxr-demo-modelviewer' }}
+    needs: [BuildInstaller]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mint dispatch token
+        id: dispatch-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.DISPLAYXR_APP_ID }}
+          private-key: ${{ secrets.DISPLAYXR_APP_PRIVATE_KEY }}
+          owner: DisplayXR
+          repositories: displayxr-runtime
+
+      - name: Dispatch versions.json bump
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ steps.dispatch-token.outputs.token }}
+          repository: DisplayXR/displayxr-runtime
+          event-type: versions-bump
+          client-payload: |
+            {
+              "field":       "modelviewer_demo",
+              "tag":         "${{ github.ref_name }}",
+              "source_repo": "${{ github.repository }}"
+            }

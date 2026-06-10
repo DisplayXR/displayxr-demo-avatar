@@ -1,0 +1,33 @@
+// Copyright 2025, Leia Inc.
+// SPDX-License-Identifier: BSL-1.0
+
+#include <winver.h>
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION     1,0,0,0
+PRODUCTVERSION  1,0,0,0
+FILEFLAGSMASK   VS_FFI_FILEFLAGSMASK
+FILEFLAGS       0
+FILEOS          VOS_NT_WINDOWS32
+FILETYPE        VFT_APP
+FILESUBTYPE     VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName",      "Leia Inc."
+            VALUE "FileDescription",  "DisplayXR 3D Avatar"
+            VALUE "FileVersion",      "1.0.0.0"
+            VALUE "InternalName",     "avatar_handle_vk_win"
+            VALUE "LegalCopyright",   "Copyright 2026 Leia Inc."
+            VALUE "OriginalFilename", "avatar_handle_vk_win.exe"
+            VALUE "ProductName",      "DisplayXR 3D Avatar"
+            VALUE "ProductVersion",   "1.0.0.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

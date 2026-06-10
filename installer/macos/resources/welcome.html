@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>3D Model Viewer</title>
+<style>
+body { font: 13px -apple-system, sans-serif; margin: 1em 2em; color: #222; }
+h1 { font-size: 1.3em; margin-bottom: 0.4em; }
+p { line-height: 1.45; }
+.note { background: #f5f5f0; border-left: 3px solid #c4a200; padding: 0.6em 0.9em; margin: 1em 0; }
+code { background: #eee; padding: 0 4px; border-radius: 3px; }
+</style>
+</head>
+<body>
+<h1>3D Model Viewer</h1>
+<p>
+Real-time glTF 2.0 PBR model viewer for glasses-free 3D displays, built on
+the <strong>DisplayXR</strong> OpenXR runtime via Vulkan. Loads
+<code>.glb</code> and <code>.gltf</code> models and renders with asymmetric
+per-eye Kooima projection.
+</p>
+<p>
+Once installed, the app lands at
+<code>/Applications/3D Model Viewer.app</code>. A bundled
+<code>sample.glb</code> auto-loads at startup; press <strong>L</strong> or
+drag-and-drop another model to load it.
+</p>
+<div class="note">
+<strong>Prerequisite:</strong> the <strong>DisplayXR runtime</strong> must be
+installed first. Download
+<code>DisplayXR-Installer-*.pkg</code> from the
+<a href="https://github.com/DisplayXR/displayxr-runtime/releases">displayxr-runtime
+releases page</a>. The demo bundles its own copy of MoltenVK and the OpenXR
+loader, but it discovers the actual runtime through the system's OpenXR
+configuration registered by the runtime installer.
+</div>
+</body>
+</html>

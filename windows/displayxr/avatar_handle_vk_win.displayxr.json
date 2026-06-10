@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "id": "avatar",
+  "name": "3D Avatar",
+  "type": "3d",
+  "category": "demo",
+  "display_mode": "auto",
+  "description": "A transparent, click-through 3D avatar that floats over your desktop. The character is weaved in 3D; a flat 2D speech bubble sits beside it; clicks pass through to whatever is behind. W/S dolly with clipping at the display plane.",
+  "icon": "avatar_icon.png",
+  "icon_3d": "avatar_icon_sbs.png",
+  "icon_3d_layout": "sbs-lr"
+}

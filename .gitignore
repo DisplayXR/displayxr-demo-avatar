@@ -1,0 +1,6 @@
+build/
+installer/*.exe
+installer/macos/*.pkg
+_artifact/
+_package/
+*.log

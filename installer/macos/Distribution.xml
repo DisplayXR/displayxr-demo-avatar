@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<installer-gui-script minSpecVersion="2">
+    <title>3D Model Viewer</title>
+    <organization>com.displayxr</organization>
+    <os-version min="13.0" />
+    <license file="LICENSE" />
+    <welcome file="welcome.html" />
+    <choices-outline>
+        <line choice="demo" />
+    </choices-outline>
+    <choice id="demo" visible="true" start_selected="true" enabled="false"
+        title="3D Model Viewer"
+        description="DisplayXR demo: real-time 3D Model Viewerting viewer for glasses-free 3D displays. Loads .glb / .gltf scenes and renders with asymmetric per-eye Kooima projection. Requires the DisplayXR runtime to be installed.">
+        <pkg-ref id="com.displayxr.modelviewer" />
+    </choice>
+    <pkg-ref id="com.displayxr.modelviewer" version="1.0" onConclusion="none">modelviewer.pkg</pkg-ref>
+</installer-gui-script>

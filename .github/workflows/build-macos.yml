@@ -1,0 +1,178 @@
+name: Build macOS
+
+# macOS .pkg build. Mirrors the BuildInstaller job in displayxr-runtime's
+# build-macos.yml. The demo's release cadence is manual — devs build locally
+# and push a v* tag when ready; on a v* tag this workflow produces
+# `DisplayXRModelViewer-<version>.pkg` and attaches it to the GitHub Release.
+#
+# PR + push-to-main runs are validation only: they build the app + .pkg and
+# assert its payload to catch breakage before a release. The release-attach
+# step stays gated on a v* ref, so it only fires on tags.
+#
+# The DetectChanges job + docs_only step gating let this workflow be a required
+# status check (the "Build macOS" job always runs and reports success in ~30s
+# on doc-only PRs, skipping the heavy build) without blocking doc PRs. Mirrors
+# the sentinel pattern in displayxr-runtime + displayxr-leia-plugin.
+
+on:
+  pull_request: {}
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  workflow_dispatch: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# contents: write is required by softprops/action-gh-release@v2 to
+# create-or-update the GitHub Release on v* tag push. The runtime repo's
+# build-macos.yml also exports GH_TOKEN explicitly because the action
+# prefers $GH_TOKEN over its `token:` input when set — without this it
+# falls back to a credentials path that hits "Bad credentials".
+permissions:
+  contents: write
+
+jobs:
+  DetectChanges:
+    runs-on: ubuntu-latest
+    outputs:
+      docs_only: ${{ steps.filter.outputs.docs_only }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: filter
+        run: |
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            echo "docs_only=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE=${{ github.event.pull_request.base.sha }}
+          else
+            BASE=${{ github.event.before }}
+          fi
+          CHANGED=$(git diff --name-only "$BASE" HEAD)
+          NON_DOC=$(echo "$CHANGED" | grep -vE '^(docs/|.*\.md$|LICENSE$|\.github/ISSUE_TEMPLATE/)' || true)
+          if [ -n "$CHANGED" ] && [ -z "$NON_DOC" ]; then
+            echo "docs_only=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "docs_only=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  BuildInstaller:
+    name: Build macOS
+    needs: DetectChanges
+    runs-on: macos-14
+    env:
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Doc-only PR — skipping heavy build steps
+        if: needs.DetectChanges.outputs.docs_only == 'true'
+        run: echo "docs_only=true; build steps will skip and report success."
+
+      - name: Install dependencies
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        # No `openxr-loader` formula exists in Homebrew core. The build
+        # script clones KhronosGroup/OpenXR-SDK-Source and installs the
+        # loader under /tmp/openxr-install (mirroring the runtime repo).
+        # vulkan-loader + molten-vk supply the dylibs the .app bundle ships;
+        # build_macos.sh resolves them via `brew --prefix <formula>`.
+        run: |
+          brew install cmake ninja glslang vulkan-headers vulkan-loader molten-vk
+          BREW_PREFIX=$(brew --prefix)
+          echo "VULKAN_SDK=$BREW_PREFIX" >> "$GITHUB_ENV"
+
+      - name: Derive installer version
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        id: version
+        run: |
+          # `v1.2.3` → `1.2.3` for productbuild's --version arg and the
+          # .pkg filename. Untagged (PR / push / workflow_dispatch) builds
+          # use a -dev placeholder; they never publish a release.
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/v}"
+          else
+            VERSION="0.0.0-dev.${GITHUB_SHA::8}"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Building installer with VERSION=$VERSION"
+
+      - name: Build demo + installer
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        env:
+          DISPLAYXR_VERSION: ${{ steps.version.outputs.version }}
+        run: ./scripts/build_macos.sh --installer
+
+      - name: Assert .pkg payload (regression guard)
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          PKG=$(find _package -maxdepth 1 -name "DisplayXRModelViewer-*.pkg" -type f | head -1)
+          if [ -z "$PKG" ] || [ ! -f "$PKG" ]; then
+            echo "::error::DisplayXRModelViewer-*.pkg missing from _package/"
+            ls -la _package/ || true
+            exit 1
+          fi
+          echo "Found installer: $PKG"
+          EXPAND_DIR=$(mktemp -d)
+          pkgutil --expand "$PKG" "$EXPAND_DIR/expand"
+          PAYLOAD="$EXPAND_DIR/expand/modelviewer.pkg/Payload"
+          if [ ! -f "$PAYLOAD" ]; then
+            echo "::error::modelviewer.pkg/Payload not found inside .pkg"
+            ls -la "$EXPAND_DIR/expand/" || true
+            exit 1
+          fi
+          gunzip -c "$PAYLOAD" | cpio -i -t > "$EXPAND_DIR/files" 2>/dev/null
+
+          MISSING=0
+          assert_present() {
+            local pattern="$1"
+            local what="$2"
+            if ! grep -q "$pattern" "$EXPAND_DIR/files"; then
+              echo "::error::$what missing from .pkg payload (pattern: $pattern)"
+              MISSING=1
+            fi
+          }
+          assert_present 'Applications/3D Model Viewer\.app/Contents/MacOS/3D Model Viewer' "launcher"
+          assert_present 'Applications/3D Model Viewer\.app/Contents/Resources/model_viewer_handle_vk_macos' "demo binary"
+          assert_present 'Applications/3D Model Viewer\.app/Contents/Resources/sample\.glb' "bundled scene"
+          assert_present 'Applications/3D Model Viewer\.app/Contents/Resources/lib/libMoltenVK' "MoltenVK"
+          assert_present 'Applications/3D Model Viewer\.app/Contents/Resources/lib/libvulkan' "Vulkan loader"
+          assert_present 'Applications/3D Model Viewer\.app/Contents/Resources/lib/libopenxr_loader' "OpenXR loader"
+          if [ "$MISSING" -ne 0 ]; then
+            echo "Payload listing:"
+            cat "$EXPAND_DIR/files"
+            exit 1
+          fi
+          echo "PASS: .pkg payload contains app + bundled scene + dylibs."
+
+      - name: Upload installer
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          retention-days: 3
+          name: DisplayXRModelViewer-macOS
+          if-no-files-found: error
+          path: _package/DisplayXRModelViewer-*.pkg
+
+      # softprops/action-gh-release@v2 create-or-updates the GitHub
+      # Release on v* tag push and attaches the .pkg. If a Windows
+      # release workflow on the same tag races, the action just appends
+      # — both assets end up on the same release.
+      - name: Attach .pkg to GitHub release on tag
+        if: needs.DetectChanges.outputs.docs_only != 'true' && startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: _package/DisplayXRModelViewer-*.pkg
+          fail_on_unmatched_files: true
+          draft: false
+          prerelease: false

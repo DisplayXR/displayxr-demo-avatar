@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "displayxr": {
+      "type": "stdio",
+      "command": "${DISPLAYXR_MCP_ADAPTER:-C:\\Program Files\\DisplayXR\\MCP\\bin\\displayxr-mcp.exe}",
+      "args": ["--target", "auto"]
+    }
+  }
+}
