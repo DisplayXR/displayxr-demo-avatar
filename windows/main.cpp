@@ -27,6 +27,7 @@
 #include "xr_session.h"
 #include "model_renderer.h"
 #include "model_vulkan_utils.h"   // scratch image/buffer for the click-through silhouette
+#include <openxr/XR_EXT_local_3d_zone.h>  // XrCompositionLayerLocal2DEXT (speech bubble)
 #include "display3d_view.h"
 #include "projection_depth.h"
 
@@ -90,13 +91,13 @@ static inline float AnimBtnXFraction() {
     return 1.0f - ANIM_BTN_WIDTH_FRACTION - ANIM_BTN_MARGIN_FRACTION;
 }
 
-// Bar swapchain texture (wide + thin) and its window-space layer geometry. The
-// layer spans the full window width; its height preserves the texture aspect so
-// the pills aren't distorted as the tile is resized. The pills fill ~70% of the
-// bar height, vertically centered.
-static const uint32_t BTN_BAR_TEX_W = 1920;
-static const uint32_t BTN_BAR_TEX_H = 56;
-static const uint32_t BTN_BAR_FONT_BASE = BTN_BAR_TEX_H * 14;
+// Speech-bubble swapchain texture. Chunky (~5:1) so the rounded pill reads as a
+// proper speech bubble / nameplate filling the top ~30% band of the window
+// (placed via the Local2D layer rect below). FONT_BASE drives the label size
+// (HUD scales fonts by FONT_BASE/470 → ~85 px text here).
+static const uint32_t BTN_BAR_TEX_W = 1280;
+static const uint32_t BTN_BAR_TEX_H = 216;   // full top-30% band aspect (1280:216 ≈ 1280×0.30·720)
+static const uint32_t BTN_BAR_FONT_BASE = 1300;
 static const float    BTN_BAR_Y_FRACTION = 0.008f;
 static inline float BtnBarHeightFraction(uint32_t windowW, uint32_t windowH) {
     if (windowW == 0 || windowH == 0) return 0.05f;
@@ -501,6 +502,13 @@ struct SilhouetteCoverage {
 };
 static SilhouetteCoverage g_silCoverage;
 
+// Speech-bubble client-window rect, published by the render thread and unioned
+// into the window region by UpdateClickRegion so the bubble (which sits above
+// the tiger, outside the silhouette) isn't clipped away by the shaped window.
+static std::mutex g_bubbleMtx;
+static RECT       g_bubbleRect = {0, 0, 0, 0};
+static bool       g_bubbleVisible = false;
+
 // True if the client-space point is over the avatar silhouette (with a small
 // dilation so hovering near edges is forgiving). Thread-safe; called on the UI
 // thread from WM_NCHITTEST.
@@ -558,6 +566,16 @@ static void UpdateClickRegion(HWND hwnd) {
                 r.bottom = (y + 1) * winH / ch;
                 rects.push_back(r);
             }
+        }
+    }
+
+    // Add the speech-bubble rect so it stays visible (and clickable) even though
+    // it lies outside the tiger silhouette that otherwise shapes the window.
+    {
+        std::lock_guard<std::mutex> bl(g_bubbleMtx);
+        if (g_bubbleVisible && g_bubbleRect.right > g_bubbleRect.left &&
+            g_bubbleRect.bottom > g_bubbleRect.top) {
+            rects.push_back(g_bubbleRect);
         }
     }
 
@@ -886,9 +904,14 @@ static void UpdateSilhouette(VkDevice dev, VkPhysicalDevice phys, VkQueue queue,
     {
         std::lock_guard<std::mutex> lock(g_sceneMutex);
         if (!g_modelRenderer.hasModel()) return;
+        // Render the avatar into the bottom 70% of the silhouette image too, so the
+        // hit mask matches the confined on-screen avatar. The top 30% is left as-is
+        // (covered by the full-top-30% bubble rect in the click region).
+        const uint32_t silAvH = (h * 7u) / 10u;
+        const uint32_t silAvY = h - silAvH;
         g_modelRenderer.renderEye(g_silImage.image, VK_FORMAT_R8G8B8A8_UNORM,
             xr->swapchain.width, xr->swapchain.height,
-            0, 0, w, h, viewMat, projMat, /*transparentBg=*/true, clipFar);
+            0, silAvY, w, silAvH, viewMat, projMat, /*transparentBg=*/true, clipFar);
     }
     // renderEye leaves the scratch image in COLOR_ATTACHMENT_OPTIMAL → copy to host.
     VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
@@ -1277,9 +1300,18 @@ static void RenderThreadFunc(
                             float pxSizeX = xr->displayWidthM / dispPxW;
                             float pxSizeY = xr->displayHeightM / dispPxH;
                             float winW_m = (float)windowW * pxSizeX;
-                            float winH_m = (float)windowH * pxSizeY;
+                            // Confine the 3D rig to the BOTTOM 70% of the window: the
+                            // Kooima canvas is a bottom-70% sub-rect (full width, correct
+                            // aspect, centre lowered), and the per-eye projection is
+                            // remapped into the bottom 70% of the tile (below). The top
+                            // 30% is left for the flat 2D speech bubble. This is the
+                            // handle-app equivalent of a texture app's
+                            // xrSetSharedTextureOutputRectEXT canvas rect.
+                            const float kCanvasH       = 0.70f;  // canvas height / window
+                            const float kCanvasCenterY = 0.65f;  // canvas centre / window (0.30 + 0.70/2)
+                            float winH_m = (float)windowH * kCanvasH * pxSizeY;
 
-                            // Window-relative Kooima: compute eye offset from window center
+                            // Window-relative Kooima: compute eye offset from canvas center
                             float eyeOffsetX = 0.0f, eyeOffsetY = 0.0f;
                             {
                                 POINT clientOrigin = {0, 0};
@@ -1288,7 +1320,7 @@ static void RenderThreadFunc(
                                 MONITORINFO mi = {sizeof(mi)};
                                 if (GetMonitorInfo(hMon, &mi)) {
                                     float winCenterX = (float)(clientOrigin.x - mi.rcMonitor.left) + windowW / 2.0f;
-                                    float winCenterY = (float)(clientOrigin.y - mi.rcMonitor.top) + windowH / 2.0f;
+                                    float winCenterY = (float)(clientOrigin.y - mi.rcMonitor.top) + windowH * kCanvasCenterY;
                                     float dispW = (float)(mi.rcMonitor.right - mi.rcMonitor.left);
                                     float dispH = (float)(mi.rcMonitor.bottom - mi.rcMonitor.top);
                                     eyeOffsetX = (winCenterX - dispW / 2.0f) * pxSizeX;
@@ -1424,6 +1456,11 @@ static void RenderThreadFunc(
                             // (reproduces modelviewer's prior direct-[0,1] output). [#396 W3]
                             for (uint32_t _v = 0; _v < (uint32_t)eyeCount; _v++)
                                 convert_projection_gl_to_zero_to_one(stereoViews[_v].projection_matrix);
+                            // NOTE: the bottom-70% confinement is done by rendering into
+                            // the bottom-70% sub-VIEWPORT of the tile (below) with this
+                            // sub-canvas projection — NOT by a clip-space remap (which
+                            // can't reproduce the sub-rect aspect and just cancels the
+                            // sub-canvas scaling).
                         }
 
                         // Double-click focus: center-eye ray through mouse, pick splat,
@@ -1608,10 +1645,17 @@ static void RenderThreadFunc(
                                     uint32_t row = (uint32_t)eye / cols;
                                     uint32_t vpX = col * renderW;
                                     uint32_t vpY = row * renderH;
+                                    // Confine the avatar to the BOTTOM 70% of the tile (→
+                                    // bottom 70% of the window). The top 30% of the tile is
+                                    // left untouched — the full-top-30% Local2D bubble's
+                                    // implicit mask (M=0) replaces the weave there with the
+                                    // flat bubble, so those pixels are never shown.
+                                    const uint32_t avH = (renderH * 7u) / 10u;
+                                    const uint32_t avY = vpY + (renderH - avH);
                                     g_modelRenderer.renderEye(
                                         (*swapchainVkImages)[imageIndex], colorFormat,
                                         xr->swapchain.width, xr->swapchain.height,
-                                        vpX, vpY, renderW, renderH,
+                                        vpX, avY, renderW, avH,
                                         viewMat[eye], projMat[eye],
                                         g_transparentBg.load(), clipFar[eye]);
                                 }
@@ -1873,57 +1917,23 @@ static void RenderThreadFunc(
                 //    when the model has clips. Reuses the window-space-layer
                 //    machinery (own swapchain / text renderer / staging) widened
                 //    to a bar — see runtime issue #389. ──
-                XrCompositionLayerWindowSpaceEXT barLayer = {};
-                bool barLayerReady = false;
-                if (g_animBtnReady && g_hasAnimBtnSwapchain) {
-                    const float mxf = (g_windowWidth > 0)
-                        ? (float)inputSnapshot.mouseX / (float)g_windowWidth : 0.0f;
-                    const float myf = (g_windowHeight > 0)
-                        ? (float)inputSnapshot.mouseY / (float)g_windowHeight : 0.0f;
-                    const float barY = BTN_BAR_Y_FRACTION;
-                    const float barH = BtnBarHeightFraction(windowW, windowH);
-                    // Bar layer spans the full window width, so a button at
-                    // window-x-fraction xf maps straight onto bar-texture-x. Pills
-                    // fill ~70% of the bar height, vertically centered.
-                    const float pillY = (float)BTN_BAR_TEX_H * 0.15f;
-                    const float pillH = (float)BTN_BAR_TEX_H * 0.70f;
-                    auto makeBtn = [&](float xf, float wf, const std::wstring& label) {
-                        HudButton b;
-                        b.label = label;
-                        b.x = xf * (float)BTN_BAR_TEX_W;
-                        b.y = pillY;
-                        b.width = wf * (float)BTN_BAR_TEX_W;
-                        b.height = pillH;
-                        b.hovered = (mxf >= xf && mxf <= xf + wf &&
-                                     myf >= barY && myf <= barY + barH);
-                        return b;
-                    };
+                XrCompositionLayerLocal2DEXT bubbleLayer = {(XrStructureType)XR_TYPE_COMPOSITION_LAYER_LOCAL_2D_EXT};
+                bool bubbleReady = false;
+                if (g_animBtnReady && g_hasAnimBtnSwapchain && g_hasLocal3DZone) {
+                    // One centred "speech bubble" pill filling the bubble texture.
+                    // HudButton renders a rounded pill + centred label — exactly a
+                    // nameplate/speech bubble. The pill is opaque; the rest of the
+                    // texture is transparent (alpha 0).
                     std::vector<HudButton> barButtons;
-                    barButtons.push_back(makeBtn(OPEN_BTN_X_FRACTION, OPEN_BTN_WIDTH_FRACTION, L"Open…"));
-                    std::wstring modeLabel = L"Mode";
-                    if (xr->renderingModeCount > 0 &&
-                        xr->currentModeIndex < xr->renderingModeCount &&
-                        xr->renderingModeNames[xr->currentModeIndex]) {
-                        const char* nm = xr->renderingModeNames[xr->currentModeIndex];
-                        modeLabel = L"Mode: " + std::wstring(nm, nm + strlen(nm));
-                    }
-                    // Surface workspace mode-lock so the user knows clicking Mode
-                    // is a no-op in a locked workspace.
-                    if (xr->renderingModeCount > 0 &&
-                        xr->currentModeIndex < xr->renderingModeCount &&
-                        !xr->renderingModeIsRequestable[xr->currentModeIndex]) {
-                        modeLabel += L" [locked]";
-                    }
-                    barButtons.push_back(makeBtn(MODE_BTN_X_FRACTION, MODE_BTN_WIDTH_FRACTION, modeLabel));
-                    if (g_hasAnimations.load()) {
-                        std::wstring animLabel = L"Anim";
-                        {
-                            std::string clip; int ci, cn; float ct, cd; bool playing;
-                            std::lock_guard<std::mutex> lk(g_sceneMutex);
-                            if (g_modelRenderer.getPlaybackInfo(clip, ci, cn, ct, cd, playing))
-                                animLabel = playing ? std::wstring(clip.begin(), clip.end()) : L"Paused";
-                        }
-                        barButtons.push_back(makeBtn(AnimBtnXFraction(), ANIM_BTN_WIDTH_FRACTION, animLabel));
+                    {
+                        HudButton b;
+                        b.label = L"Hi there! I'm Leo, your friendly 3D desktop avatar.";
+                        b.x = (float)BTN_BAR_TEX_W * 0.04f;
+                        b.y = (float)BTN_BAR_TEX_H * 0.12f;
+                        b.width  = (float)BTN_BAR_TEX_W * 0.92f;
+                        b.height = (float)BTN_BAR_TEX_H * 0.76f;
+                        b.hovered = false;
+                        barButtons.push_back(b);
                     }
 
                     uint32_t pitch = 0;
@@ -1979,18 +1989,28 @@ static void RenderThreadFunc(
                         vkFreeCommandBuffers(vkDevice, g_animBtnCmdPool, 1, &cb);
                         ReleaseWindowSpaceImage(g_animBtnSwapchain);
 
-                        barLayer.type = (XrStructureType)XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_EXT;
-                        barLayer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
-                        barLayer.subImage.swapchain = g_animBtnSwapchain.swapchain;
-                        barLayer.subImage.imageRect.offset = {0, 0};
-                        barLayer.subImage.imageRect.extent = {(int32_t)BTN_BAR_TEX_W, (int32_t)BTN_BAR_TEX_H};
-                        barLayer.subImage.imageArrayIndex = 0;
-                        barLayer.x = 0.0f;
-                        barLayer.y = BTN_BAR_Y_FRACTION;
-                        barLayer.width = 1.0f;
-                        barLayer.height = barH;
-                        barLayer.disparity = 0.0f;
-                        barLayerReady = true;
+                        // Place the bubble as a post-weave Local2D layer occupying
+                        // the top ~30% band of the window (80% wide, centred).
+                        // No explicit mask: submitting a Local2D layer implies a
+                        // mask of M=0 inside this rect (flat, crisp 2D) and M=1
+                        // elsewhere (the avatar keeps weaving) — exactly the 2D/3D
+                        // split we want.
+                        const int bubW = windowW;
+                        const int bubH = (int)(windowH * 0.30f);
+                        const int bubX = 0;
+                        const int bubY = 0;
+                        bubbleLayer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+                        bubbleLayer.subImage.swapchain = g_animBtnSwapchain.swapchain;
+                        bubbleLayer.subImage.imageRect.offset = {0, 0};
+                        bubbleLayer.subImage.imageRect.extent = {(int32_t)BTN_BAR_TEX_W, (int32_t)BTN_BAR_TEX_H};
+                        bubbleLayer.subImage.imageArrayIndex = 0;
+                        bubbleLayer.rect.offset = {bubX, bubY};
+                        bubbleLayer.rect.extent = {bubW, bubH};
+                        bubbleReady = true;
+                        // Publish the rect so the click region keeps the bubble.
+                        std::lock_guard<std::mutex> bl(g_bubbleMtx);
+                        g_bubbleRect = {bubX, bubY, bubX + bubW, bubY + bubH};
+                        g_bubbleVisible = true;
                     } else if (px) {
                         UnmapHud(g_animBtnHud);
                     }
@@ -2001,20 +2021,26 @@ static void RenderThreadFunc(
                 if (submitViewCount == 0) submitViewCount = 1;
                 if (submitViewCount > 8) submitViewCount = 8;  // matches projectionViews[8] sizing
                 if (rendered) {
-                    // Always go through the window-space-layers path so the top
-                    // button bar (an extra layer) shows. The HUD info-panel layer
-                    // is gated by `submitHud = hudSubmitted`: when the panel is
-                    // toggled off it was never rendered/acquired this frame, so we
-                    // drop it entirely (true toggle, not a transparent layer).
-                    // SOURCE_ALPHA on the projection layer: displayxr::common
-                    // defaults projectionLayerFlags to 0, so pass the bit
-                    // explicitly (the vendored copy hardcoded it; required for
-                    // the Ctrl+T transparent-background path).
-                    EndFrameWithWindowSpaceLayers(*xr, frameState.predictedDisplayTime, projectionViews,
-                        0.0f, 0.0f, layerFracW, layerFracH, 0.0f, submitViewCount,
-                        barLayerReady ? &barLayer : nullptr, barLayerReady ? 1u : 0u,
-                        0, 0, -1, -1, /*submitHud=*/hudSubmitted,
-                        XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT);
+                    // Submit the projection layer (the weaved avatar) plus the
+                    // Local2D speech bubble. Hand-built (displayxr-common's helper
+                    // has no Local2D path). ALPHA_BLEND: the avatar is always
+                    // transparent (compose-under-bg), proven by the rest of the app.
+                    XrCompositionLayerProjection proj = {XR_TYPE_COMPOSITION_LAYER_PROJECTION};
+                    proj.space = xr->localSpace;
+                    proj.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+                    proj.viewCount = submitViewCount;
+                    proj.views = projectionViews;
+                    const XrCompositionLayerBaseHeader* layers[2];
+                    uint32_t layerN = 0;
+                    layers[layerN++] = (const XrCompositionLayerBaseHeader*)&proj;
+                    if (bubbleReady)
+                        layers[layerN++] = (const XrCompositionLayerBaseHeader*)&bubbleLayer;
+                    XrFrameEndInfo endInfo = {XR_TYPE_FRAME_END_INFO};
+                    endInfo.displayTime = frameState.predictedDisplayTime;
+                    endInfo.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND;
+                    endInfo.layerCount = layerN;
+                    endInfo.layers = layers;
+                    xrEndFrame(xr->session, &endInfo);
                 } else {
                     XrFrameEndInfo endInfo = {XR_TYPE_FRAME_END_INFO};
                     endInfo.displayTime = frameState.predictedDisplayTime;
