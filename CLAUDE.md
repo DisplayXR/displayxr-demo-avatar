@@ -4,17 +4,45 @@ Guidance for Claude Code (claude.ai/code) working on this repo.
 
 ## Project Overview
 
-DisplayXR Demo — **3D Model Viewer**. Real-time PBR model viewer for
-glasses-free 3D displays, on the DisplayXR OpenXR runtime via Vulkan (Windows)
-and MoltenVK (macOS). Loads glTF 2.0 (`.glb`/`.gltf`), STL, OBJ, FBX, and USD
-(`.usdz`/`.usd`/`.usda`/`.usdc`), renders with asymmetric per-eye
-Kooima projection. Standalone repo, independent release cadence; `common/` +
-`openxr_includes/` were seeded from the runtime and are maintained here.
+DisplayXR Demo — **3D Avatar**. A transparent, click-through 3D character
+("**Leo**", an animated tiger) that floats over the desktop on a glasses-free 3D
+display, on the DisplayXR OpenXR runtime via Vulkan. A native-Vulkan `_handle`
+OpenXR app **derived from `displayxr-demo-modelviewer`**: it reuses that demo's
+`model_common/` renderer to weave the bundled FBX, then wraps it in an avatar
+shell — transparent-by-default borderless window, per-pixel click-through, a
+face-the-viewer billboard, depth dolly with display-plane clipping, and a flat
+2D speech bubble (`XR_EXT_local_3d_zone` Local2D) above the weaved character.
+Standalone repo, independent release cadence; `common/` + `openxr_includes/`
+were seeded from the runtime and are maintained here.
 
-**Status: shipped & working on Windows + macOS.** The renderer is fully
-implemented (this is NOT a skeleton — ignore any old "porting baseline"
-phrasing). Released: v0.1.0 (initial), v0.2.0 (macOS + ZDP clip). Bundled
-`sample.glb` = Khronos DamagedHelmet (CC BY 4.0), auto-loaded at startup.
+**Status: Windows working; macOS port in progress.** The renderer is fully
+implemented (inherited from modelviewer — NOT a skeleton). Bundled avatar =
+`assets/tiger/avatar.fbx` (+ `rgb.jpg`), copied next to the exe and auto-loaded
+at startup.
+
+### Avatar shell (what this demo adds on top of the modelviewer renderer)
+- **Transparent-by-default window** — borderless `WS_POPUP` + `WS_EX_TOPMOST` +
+  `WS_EX_NOREDIRECTIONBITMAP`; session transparency is wired at `xrCreateSession`
+  (always on). `g_transparentBg` flips the renderer's output alpha + enables
+  display-plane foreground clipping. `Ctrl+T` toggles for debugging. `B` toggles
+  decoration (title bar) so the OS can move/resize, then back to borderless.
+- **Per-pixel click-through** — `UpdateSilhouette` renders one mono eye into a
+  scratch image (~1/3 res, every other frame), reads back alpha → coverage
+  bitmap; `UpdateClickRegion` shapes the window with `SetWindowRgn` so input
+  outside the silhouette falls through cross-process. `DXR_DUMP_SILHOUETTE=1`
+  dumps the mask to `%TEMP%\avatar_silhouette.png`.
+- **Face-the-viewer billboard** — yaw tracks the tracked head centre (from
+  `rawEyes`), time-based smoothing, gated on `xr->isEyeTracking`. Pitch is
+  implemented but disabled (`FACE_PITCH_SIGN`). LMB-drag overrides it.
+- **Bottom-70 % confinement + speech bubble** — the Kooima canvas is a bottom-70 %
+  sub-rect (full width, centre at 65 %) and the avatar renders into the bottom-70 %
+  sub-viewport of each tile; the top 30 % is a flat 2D bubble submitted by a
+  hand-built `xrEndFrame` (a `XrCompositionLayerLocal2DEXT` pill + a full-band
+  transparent backer, both implicit-M=0). This is the handle-app equivalent of a
+  texture app's `xrSetSharedTextureOutputRectEXT`.
+- **W/S depth dolly only** — X/Y are anchored each frame to the animated skeleton
+  centroid (`getAnimatedAnchor`), so A/D/Q/E are effectively no-ops; `W`/`S`
+  drive Z through the display-plane clip.
 
 ## Runtime dependency
 
@@ -27,9 +55,17 @@ Apps load the runtime via the registry-resolved manifest (no `XR_RUNTIME_JSON`).
 ## Architecture
 
 ```
-windows/main.cpp, macos/main.mm  — platform entry: window, OpenXR session,
-                                    input/HUD, per-frame view/projection, atlas
-                                    capture ('I'), file load (L / drag-drop)
+windows/main.cpp                 — platform entry + avatar shell: borderless
+                                    transparent window, OpenXR session, per-frame
+                                    view/projection (bottom-70% Kooima sub-canvas),
+                                    billboard, click-through silhouette + window
+                                    region, speech-bubble Local2D xrEndFrame, atlas
+                                    capture ('I'). NO model-load UI (auto-loads the
+                                    bundled tiger; optional CLI model-path arg).
+windows/xr_session.cpp/.h        — OpenXR instance/session/Vulkan setup; enables
+                                    XR_EXT_local_3d_zone (g_hasLocal3DZone gates
+                                    the bubble).
+macos/main.mm                    — Cocoa/MoltenVK avatar-shell port (in progress).
 model_common/                     — the renderer (vendor-neutral, analog of
                                     3dgs_common in the gaussiansplat demo):
   model_loader.{h,cpp}            — format dispatcher (by extension) + path
@@ -82,8 +118,11 @@ openxr_includes/                  — vendored OpenXR + DisplayXR ext headers
   `model_loader_obj.cpp` likewise owns `TINYOBJLOADER_IMPLEMENTATION`.
 
 ### Loader limits (today) → these are the next phases
+The avatar bundles an **FBX** (the tiger) and has no in-app load UI, but the
+inherited `model_common` loader still accepts every format below — pass a path as
+the first CLI arg to float a different character.
 - **Multi-format:** glTF/STL/OBJ/FBX/USD all load (see PORTING.md → *Multi-format
-  import* for the per-backend table). **FBX now skins + animates** (ufbx skins +
+  import* for the per-backend table). **FBX skins + animates** (ufbx skins +
   baked anim-stack clips wired into the same ModelData fields the glTF path uses;
   no blend shapes yet, and non-skinned meshes don't follow node animation);
   **USD honours base-color/emissive textures + PBR factors** but not
@@ -98,8 +137,11 @@ See **PORTING.md** for the phased roadmap.
 Use **`scripts\build-with-deps.bat`** — it sets vcvars64 + `OpenXR_ROOT` +
 Vulkan SDK then runs cmake. The bare `scripts\build_windows.bat` assumes you're
 already in a VS dev environment and will fail otherwise. Output:
-`build\windows\model_viewer_handle_vk_win.exe` (+ bundled openxr_loader.dll +
-sample.glb copied next to it). `model_common` FetchContents tinygltf + glm.
+`build\windows\avatar_handle_vk_win.exe` (+ bundled openxr_loader.dll +
+`avatar.fbx`/`rgb.jpg` copied next to it). `model_common` FetchContents
+tinygltf + glm. Kill any running instance before rebuilding, or the linker hits
+`LNK1104` on the locked exe; verify the build printed `=== DONE ===` + a
+`Linking ... avatar_handle_vk_win.exe` line.
 
 ### macOS (local dev)
 `./scripts/build_macos.sh` (builds the OpenXR loader from source, pulls
@@ -115,31 +157,38 @@ dispatch `versions-bump` to displayxr-runtime). So every PR is build-checked on
 both platforms — keep it that way.
 
 ## Self-verifying a render (no 3D display needed)
-Pass a model path as the first CLI arg to skip auto-load:
-`model_viewer_handle_vk_win.exe <path.glb>`. Then press **`I`** to dump the
-multi-view atlas to `%USERPROFILE%\Pictures\DisplayXR\<model>-<cols>_<rows>x<n>.png`
-(skipped for 1×1 mono layouts) — readable to eyeball geometry/shading/framing
-without a glasses-free display. To drive it headlessly, launch the exe then
-`AppActivate` its window (title `DisplayXR 3D Model Viewer`) + SendKeys `i` via
-`WScript.Shell`, and read the newest PNG in that dir. Caveat: the capture is a
-single arbitrary frame — for animated models the timing is uncontrolled, so a
-"wrong" pose/face-on grab means bad luck, not a bug; recapture.
+Two capture paths, both readable on a flat monitor:
+- **Atlas capture (`I`)** — dumps the multi-view atlas to
+  `%USERPROFILE%\Pictures\DisplayXR\<name>_atlas_<vc>_<cols>x<rows>.png` (skipped
+  for 1×1 mono), via runtime-owned `xrCaptureAtlasEXT`. Good for
+  geometry/shading/framing + the bottom-70% confinement.
+- **Silhouette dump (`DXR_DUMP_SILHOUETTE=1`)** — writes the click-through hit
+  mask to `%TEMP%\avatar_silhouette.png` (~1/sec; white = avatar, black =
+  pass-through). Good for debugging projection + the shaped window region.
+
+The compositor file-trigger screenshot does **not** work for the in-process VK
+compositor — use the two dumps above, or ask the user to eyeball the live SR
+display (the harness can't reach the window for input or see the 3D output).
+Window title is `DisplayXR 3D Avatar`. Caveat: an atlas capture is a single
+arbitrary frame — for the animated tiger the pose is uncontrolled; recapture.
 
 ## Shell tile
-`windows/displayxr/` + `macos/displayxr/` carry the `.displayxr.json` sidecar +
-**per-app-named** icons `model_viewer_icon.png` (2D) + `model_viewer_icon_sbs.png`
-(3D, sbs-lr). The names MUST be unique: the shell's `%ProgramData%\DisplayXR\apps\`
-dir is shared by all demos and icon paths resolve relative to it — generic
-`icon.png` collides (it clobbered the gaussiansplat demo once). The icons are a
-square-cropped render of the bundled model. `scripts\dev_register.bat` points
-the shell launcher at your dev build.
+`windows/displayxr/avatar_handle_vk_win.displayxr.json` (schema_version 1, `id`
+`avatar`) carries the sidecar + **per-app-named** icons `avatar_icon.png` (2D) +
+`avatar_icon_sbs.png` (3D, sbs-lr). The names MUST be unique: the shell's
+`%ProgramData%\DisplayXR\apps\` dir is shared by all demos and icon paths resolve
+relative to it — a generic `icon.png` collides. Regenerate real icons from a live
+atlas capture with **`/make-app-logos`** (run from the runtime repo); it splits
+the centre two views into the 2D + 3D logos and updates the manifest. Lint the
+app against the authoring rules with
+`python3 scripts/check_displayxr_app.py windows/` (from the runtime repo).
 
 ## Releasing
-Tag `vX.Y.Z` → CI builds both installers, attaches them to the GH Release, and
-dispatches `versions-bump` (`modelviewer_demo` field) to displayxr-runtime,
-which mirrors `versions.json` to `displayxr-installer`. The Windows meta-installer
-bundle ships this demo (`/installer-release` on the bundle, when ready).
-Independent cadence from the runtime.
+Not yet wired as a `/dxr-release` component (no `avatar_demo` field in the
+runtime's `versions.json` yet — see PORTING.md). When wired, the pattern mirrors
+the sibling demos: tag `vX.Y.Z` → CI builds the installer, attaches it to the GH
+Release, and dispatches `versions-bump` to displayxr-runtime, which mirrors
+`versions.json` to `displayxr-installer`. Independent cadence from the runtime.
 
 ## Coding conventions
 - C++17/20, Vulkan 1.0+, Objective-C++ on macOS.
@@ -153,8 +202,9 @@ Independent cadence from the runtime.
 | Repo | Purpose |
 |---|---|
 | [`displayxr-runtime`](https://github.com/DisplayXR/displayxr-runtime) | The runtime (+ versions.json hub, release skills). |
+| [`displayxr-demo-modelviewer`](https://github.com/DisplayXR/displayxr-demo-modelviewer) | **Parent demo** — this app's `model_common/` renderer comes from there. |
 | [`displayxr-demo-gaussiansplat`](https://github.com/DisplayXR/displayxr-demo-gaussiansplat) | Sibling splat-viewer demo; shares the `common/` view math. |
-| [`displayxr-installer`](https://github.com/DisplayXR/displayxr-installer) | Windows meta-installer bundle (chains this demo). |
+| [`displayxr-installer`](https://github.com/DisplayXR/displayxr-installer) | Windows meta-installer bundle (chains the demos). |
 | [`displayxr-shell-releases`](https://github.com/DisplayXR/displayxr-shell-releases) | Shell installer (optional add-on). |
 
 ## MCP atlas capture (agent-side debugging)
@@ -162,7 +212,7 @@ Independent cadence from the runtime.
 `.mcp.json` registers the `displayxr` MCP server — the DisplayXR MCP adapter
 installed by `DisplayXRMCPSetup` (`HKLM\Software\DisplayXR\Capabilities\MCP`).
 When that capability is installed, **every OpenXR app process hosts an
-in-process MCP server**, so a running `model_viewer_handle_vk_win` exposes:
+in-process MCP server**, so a running `avatar_handle_vk_win` exposes:
 
 - `capture_frame` — writes the composed atlas as
   `%TEMP%\displayxr-mcp-capture-<pid>-<frame>.png` and returns the path

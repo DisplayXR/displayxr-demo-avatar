@@ -1,58 +1,49 @@
 # Roadmap
 
-The initial port — turning the gaussiansplat skeleton into a working glTF 2.0
-PBR viewer on Windows + macOS — is **complete and shipped** (v0.1.0 Windows,
-v0.2.0 macOS + ZDP clip). This file is now the forward roadmap. For how the
-renderer works today, see `CLAUDE.md` → *Renderer conventions*.
+This demo is the **3D Avatar** — `displayxr-demo-modelviewer`'s renderer
+(`model_common/`) wrapped in an avatar shell (transparent click-through floating
+character + speech bubble). The Windows shell is **working**; the forward
+roadmap is below. For how the renderer works today, see `CLAUDE.md` →
+*Renderer conventions*; for the avatar-shell internals, see *Avatar shell* there.
 
-## Done (the port)
+## Done (the avatar shell, Windows)
 
-- **`model_common/`** — real renderer, not stubs. tinygltf load (factors +
-  textures, world-baked node transforms, AABB), interleaved vertex/index
-  upload, metallic-roughness Cook-Torrance GGX, split-sum IBL (BRDF LUT +
-  irradiance + prefiltered-env from a procedural analytic sky), blurred skybox,
-  sRGB-correct + tangent-free normal mapping, internal image → per-eye viewport
-  blit. View math mirrors gs_renderer's Y-flip.
-- **Platform glue** — `windows/main.cpp` + `xr_session.cpp` and `macos/main.mm`
-  retargeted to `ModelRenderer` (`loadModel`/`hasModel`/`getRobustSceneBounds`,
-  `.glb/.gltf` dialogs + drag-drop, `sample.glb` auto-load, 1.2× auto-fit).
-- **ZDP clip planes** — `display3d_compute_view/_views` take
-  `(near_offset, far_offset)` as absolute `vH`-unit offsets; per-eye
-  `near = eye.z − near_offset`, `far = eye.z + far_offset`. Callers pass
-  `near_offset = vH`, `far_offset = 1000·vH`; transparent → far_offset 0.
-- **Bundled `sample.glb`** = Khronos DamagedHelmet, copied next to the exe.
-- **Installer + sidecar** — Windows NSIS + macOS `.pkg`; per-app icon names
-  (`model_viewer_icon{,_sbs}.png`). Wired into the meta-installer bundle.
-- **CI** — `build-windows.yml` + `build-macos.yml` validate every PR + main
-  push on both platforms; tags also build+attach installers and dispatch the
-  `versions-bump`.
+- **Borderless transparent window** — `WS_POPUP` + topmost + no-redirection
+  bitmap; always-on session transparency; `B` toggles decoration for OS
+  move/resize; `Ctrl+T` debug-toggles the opaque path.
+- **Per-pixel click-through** — throttled silhouette pass (mono eye → alpha
+  readback) drives `SetWindowRgn`; input outside the silhouette falls through
+  cross-process. `DXR_DUMP_SILHOUETTE=1` dumps the mask.
+- **Face-the-viewer billboard** — yaw tracks the tracked head centre, time-based
+  smoothing, gated on `isEyeTracking`. Pitch coded but disabled.
+- **W/S depth dolly + display-plane clip** — X/Y anchored to the animated
+  skeleton centroid; `W`/`S` drive Z through the ZDP clip (transparent →
+  `far_offset = 0`, foreground only).
+- **Speech bubble (Local2D)** — bottom-70 % Kooima sub-canvas + bottom-70 %
+  sub-viewport for the weaved avatar; one `XrCompositionLayerLocal2DEXT` pill
+  (auto-fit, balanced, aspect-preserving) + a full-band transparent backer over
+  the top 30 %, submitted in a hand-built `xrEndFrame`. Gated on
+  `XR_EXT_local_3d_zone`.
+- **Bundled avatar** = `assets/tiger/avatar.fbx` (+ `rgb.jpg`), copied next to the
+  exe and auto-loaded. Inherited renderer: metallic-roughness GGX + split-sum IBL
+  + ufbx **skinning + animation** (the tiger plays its first clip).
+- **Inherited renderer + ZDP clip + multi-format loader** — see the table below;
+  these came from modelviewer unchanged.
 
-## Next: animation + skinning (the big one)
+## Next (avatar)
 
-glTF carries skeletal animation, node (TRS) animation, and morph targets; the
-viewer currently renders the **bind pose** only. Phased plan:
-
-1. **Node/TRS animation (no skin)** — parse `animations[]` channels
-   (translation/rotation/scale) + samplers (input/output accessors, LINEAR /
-   STEP / CUBICSPLINE). Per frame, sample the active animation → per-node local
-   TRS → re-walk the node hierarchy to world matrices. Today `model_loader`
-   bakes world transforms **once at load**; this must become a per-frame pass
-   (keep the static fast-path when no animation is active). Cheapest first win;
-   no shader change (push-constant `model` matrix already per-primitive).
-2. **Skinning** — extend `ModelVertex` with `joints0` (u16x4) + `weights0`
-   (f32x4) vertex attributes; parse `skins[]` (joints list + inverseBindMatrices
-   accessor). Add a **joint-matrix SSBO/UBO** (set 3) and do linear-blend
-   skinning in `pbr.vert`. Joint matrices = `globalNode * inverseBind`,
-   recomputed per frame from the step-1 node walk. Watch the UBO size cap →
-   prefer an SSBO for large skeletons.
-3. **Morph targets** — accessor deltas + per-node weights; either CPU-blend into
-   a dynamic vertex buffer or pass targets as extra attributes/SSBO. Lower
-   priority (fewer sample assets use it).
-4. **Playback UI** — HUD line (clip name, time, play/pause), a key to cycle
-   `animations[]`, auto-play the first clip on load. Keep it minimal.
-
-Suggested bundled animated sample: Khronos **CesiumMan** or **Fox** (small,
-CC-licensed, exercises skin + clips).
+1. **App logos** — regenerate `windows/displayxr/avatar_icon{,_sbs}.png` from a
+   live atlas capture (`/make-app-logos`); they are still modelviewer
+   placeholders. Lint with `scripts/check_displayxr_app.py`.
+2. **macOS port** — `macos/main.mm` is a partial avatar-shell port. macOS has no
+   transparent-window bridge or `SetWindowRgn` analogue yet, so the click-through
+   + compose-under-desktop story needs a Cocoa/Metal-layer design; the renderer
+   is already cross-platform.
+3. **`/dxr-release` wiring** — add an `avatar_demo` field to the runtime's
+   `versions.json` + a `versions-bump` dispatch in CI so the bundle can ship it.
+4. **Polish** — optional: fill the full top-30 % band with a balanced centered
+   bubble (currently the pill hugs the text); re-enable the pitch billboard
+   (`FACE_PITCH_SIGN`); a second/idle greeting line.
 
 ## Multi-format import (done)
 
@@ -69,8 +60,9 @@ consumes (adding a format is front-end work only):
 | `.usd*` | `model_loader_usd.cpp` | tinyusdz/tydra (FetchContent) | UsdPreviewSurface (PBR) |
 
 OBJ + FBX share `model_loader_material.{h,cpp}` (texture decode + Phong→roughness).
-The four open-dialog filters (Windows spatial picker + Win32 fallback, macOS
-`NSOpenPanel`) and `model_validate_file` gate the same extension set.
+The avatar has no in-app load UI (it auto-loads the bundled FBX), but
+`model_validate_file` still gates the CLI model-path arg against this extension
+set, so any of these can be floated as the avatar via the command line.
 
 **FBX skinning / animation (done):** `model_load_fbx` now emits skins (per-vertex
 top-4 joints/weights; `inverseBind` = ufbx `cluster->geometry_to_bone`; skinned
