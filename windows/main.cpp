@@ -14,6 +14,7 @@
 #define UNICODE
 #define _UNICODE
 #include <windows.h>
+#include <windowsx.h>   // GET_X_LPARAM / GET_Y_LPARAM for WM_NCHITTEST
 #include <commdlg.h>
 #include <shlwapi.h>
 #include <shlobj.h>
@@ -25,6 +26,7 @@
 #include "input_handler.h"
 #include "xr_session.h"
 #include "model_renderer.h"
+#include "model_vulkan_utils.h"   // scratch image/buffer for the click-through silhouette
 #include "display3d_view.h"
 #include "projection_depth.h"
 
@@ -42,6 +44,11 @@
 #include <vector>
 
 using namespace DirectX;
+
+// stb_image_write implementation is linked from displayxr-common; used by the
+// debug silhouette dump in UpdateSilhouette.
+extern "C" int stbi_write_png(char const* filename, int w, int h, int comp,
+                              const void* data, int stride_in_bytes);
 
 static const char* APP_NAME = "avatar_handle_vk_win";
 
@@ -304,9 +311,11 @@ static void ToggleDecoration(HWND hwnd) {
     // put at the same screen position and size.
     RECT want = { topLeft.x, topLeft.y, topLeft.x + clientW, topLeft.y + clientH };
     AdjustWindowRect(&want, style, FALSE);
-    SetWindowPos(hwnd, HWND_TOP, want.left, want.top,
+    // HWND_TOPMOST: keep the avatar above other windows across the decoration
+    // toggle (it floats on top whether borderless or framed).
+    SetWindowPos(hwnd, HWND_TOPMOST, want.left, want.top,
         want.right - want.left, want.bottom - want.top,
-        SWP_FRAMECHANGED | SWP_NOZORDER);
+        SWP_FRAMECHANGED);
     LOG_INFO("Window decoration: %s (B)", g_decorated ? "ON (move/resize)" : "OFF (borderless)");
 }
 
@@ -475,6 +484,111 @@ static void OpenLoadDialog(HWND hwnd) {
     }
 }
 
+// ── Per-pixel click-through silhouette ─────────────────────────────────────
+// Each frame the render thread draws a mono, display-plane (single-eye) view of
+// the avatar into a small scratch image (transparent bg → alpha≈1 on the
+// avatar, 0 on the background) and publishes the alpha as a coverage bitmap.
+// WM_NCHITTEST samples it: over the avatar → HTCLIENT (the app gets the click);
+// off it → HTTRANSPARENT (the click falls through to the desktop window behind).
+// Only consulted while borderless; when decorated (B) the normal frame stays
+// fully interactive so the title bar can move/resize the window.
+struct SilhouetteCoverage {
+    std::mutex mtx;
+    std::vector<uint8_t> bits;   // covW*covH, 1 = avatar present
+    int covW = 0, covH = 0;
+    int winW = 0, winH = 0;      // client size this coverage maps to
+    bool ready = false;
+};
+static SilhouetteCoverage g_silCoverage;
+
+// True if the client-space point is over the avatar silhouette (with a small
+// dilation so hovering near edges is forgiving). Thread-safe; called on the UI
+// thread from WM_NCHITTEST.
+static bool SilhouetteHit(int clientX, int clientY) {
+    std::lock_guard<std::mutex> lock(g_silCoverage.mtx);
+    if (!g_silCoverage.ready || g_silCoverage.winW <= 0 || g_silCoverage.winH <= 0) return false;
+    if (clientX < 0 || clientY < 0 || clientX >= g_silCoverage.winW || clientY >= g_silCoverage.winH) return false;
+    const int sx = clientX * g_silCoverage.covW / g_silCoverage.winW;
+    const int sy = clientY * g_silCoverage.covH / g_silCoverage.winH;
+    const int R = 2;  // dilation radius in coverage pixels
+    for (int dy = -R; dy <= R; ++dy)
+        for (int dx = -R; dx <= R; ++dx) {
+            const int x = sx + dx, y = sy + dy;
+            if (x < 0 || y < 0 || x >= g_silCoverage.covW || y >= g_silCoverage.covH) continue;
+            if (g_silCoverage.bits[(size_t)y * g_silCoverage.covW + x]) return true;
+        }
+    return false;
+}
+
+// Cross-process click-through via SetWindowRgn (the technique the working Unity
+// plugin uses). WM_NCHITTEST/HTTRANSPARENT only forwards to same-thread windows,
+// and a dynamically-toggled WS_EX_TRANSPARENT both fails to route cross-process
+// reliably and stops the window getting mouse messages — both dead ends (the
+// plugin tried and rejected them). SetWindowRgn instead clips the window to the
+// avatar silhouette: OUTSIDE the region the OS treats the HWND as if it isn't
+// there (for hit-testing AND rendering), so input falls through to whatever
+// desktop window is behind — natively, cross-process. INSIDE the region the
+// window catches input normally. We rebuild the region each tick from the
+// published silhouette coverage. When decorated, the region is cleared so the
+// whole framed window stays interactive for move/resize.
+static const UINT_PTR kClickThroughTimerId = 0xC17;
+
+static void UpdateClickRegion(HWND hwnd) {
+    if (g_decorated) { SetWindowRgn(hwnd, NULL, TRUE); return; }
+
+    std::vector<RECT> rects;
+    int winW = 0, winH = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_silCoverage.mtx);
+        if (!g_silCoverage.ready || g_silCoverage.covW <= 0 || g_silCoverage.covH <= 0)
+            return;
+        const int cw = g_silCoverage.covW, ch = g_silCoverage.covH;
+        winW = g_silCoverage.winW; winH = g_silCoverage.winH;
+        // One client-space RECT per horizontal run of covered coverage-pixels.
+        for (int y = 0; y < ch; ++y) {
+            int x = 0;
+            while (x < cw) {
+                if (!g_silCoverage.bits[(size_t)y * cw + x]) { ++x; continue; }
+                int xs = x;
+                while (x < cw && g_silCoverage.bits[(size_t)y * cw + x]) ++x;
+                RECT r;
+                r.left   = xs * winW / cw;
+                r.right  = x  * winW / cw;
+                r.top    = y       * winH / ch;
+                r.bottom = (y + 1) * winH / ch;
+                rects.push_back(r);
+            }
+        }
+    }
+
+    if (rects.empty()) {
+        // Nothing drawn → empty region = the whole window is click-through.
+        SetWindowRgn(hwnd, CreateRectRgn(0, 0, 0, 0), TRUE);
+        return;
+    }
+
+    // Pack the rects into one RGNDATA and build the region in a single call
+    // (cheaper than CombineRgn per rect, and matches the plugin's approach).
+    const size_t bytes = sizeof(RGNDATAHEADER) + rects.size() * sizeof(RECT);
+    std::vector<uint8_t> buf(bytes);
+    RGNDATA* rd = reinterpret_cast<RGNDATA*>(buf.data());
+    rd->rdh.dwSize = sizeof(RGNDATAHEADER);
+    rd->rdh.iType = RDH_RECTANGLES;
+    rd->rdh.nCount = (DWORD)rects.size();
+    rd->rdh.nRgnSize = (DWORD)(rects.size() * sizeof(RECT));
+    RECT bb = rects[0];
+    for (const RECT& r : rects) {
+        if (r.left   < bb.left)   bb.left   = r.left;
+        if (r.top    < bb.top)    bb.top    = r.top;
+        if (r.right  > bb.right)  bb.right  = r.right;
+        if (r.bottom > bb.bottom) bb.bottom = r.bottom;
+    }
+    rd->rdh.rcBound = bb;
+    memcpy(rd->Buffer, rects.data(), rects.size() * sizeof(RECT));
+    HRGN rgn = ExtCreateRegion(NULL, (DWORD)bytes, rd);
+    SetWindowRgn(hwnd, rgn, TRUE);  // OS takes ownership of rgn
+}
+
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     {
         std::lock_guard<std::mutex> lock(g_inputMutex);
@@ -482,6 +596,13 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     }
 
     switch (msg) {
+    case WM_NCHITTEST: {
+        // Borderless: the OS only delivers this when the cursor is INSIDE the
+        // SetWindowRgn silhouette region (outside it the window is skipped
+        // entirely and the event reaches the desktop), so just claim it.
+        if (!g_decorated) return HTCLIENT;
+        break;
+    }
     case WM_LBUTTONDOWN: {
         int mx = LOWORD(lParam);
         int my = HIWORD(lParam);
@@ -534,6 +655,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         return 0;
 
     case WM_TIMER:
+        if (wParam == kClickThroughTimerId) {
+            UpdateClickRegion(hwnd);
+            return 0;
+        }
         if (wParam == dxr_capture::kFlashTimerId) {
             dxr_capture::TickCaptureFlash(hwnd);
             return 0;
@@ -626,7 +751,10 @@ static HWND CreateAppWindow(HINSTANCE hInstance, int width, int height) {
         }
     }
 
-    HWND hwnd = CreateWindowEx(WS_EX_NOREDIRECTIONBITMAP, WINDOW_CLASS, WINDOW_TITLE,
+    // WS_EX_TOPMOST: the avatar always floats above other windows — when a
+    // click passes through (HTTRANSPARENT) to a window behind, that window
+    // activates but stays BELOW the avatar, so the tiger is never covered.
+    HWND hwnd = CreateWindowEx(WS_EX_NOREDIRECTIONBITMAP | WS_EX_TOPMOST, WINDOW_CLASS, WINDOW_TITLE,
         WS_POPUP | WS_VISIBLE,
         posX, posY,
         width, height,
@@ -714,6 +842,108 @@ static void RenderPlaceholder(VkDevice device, VkQueue queue, VkCommandPool cmdP
     vkQueueWaitIdle(queue);
 
     vkFreeCommandBuffers(device, cmdPool, 1, &cmd);
+}
+
+// Scratch GPU image + host-visible readback for the silhouette pass (created
+// lazily, resized with the window). Render-thread-owned.
+static ModelImage  g_silImage = {};
+static ModelBuffer g_silReadback = {};
+static void*       g_silMapped = nullptr;
+
+static bool EnsureSilhouetteTargets(VkDevice dev, VkPhysicalDevice phys, uint32_t w, uint32_t h) {
+    if (g_silImage.image != VK_NULL_HANDLE && g_silImage.width == w && g_silImage.height == h)
+        return true;
+    if (g_silImage.image != VK_NULL_HANDLE) modelDestroyImage(dev, g_silImage);
+    if (g_silReadback.buffer != VK_NULL_HANDLE) {
+        if (g_silMapped) vkUnmapMemory(dev, g_silReadback.memory);
+        modelDestroyBuffer(dev, g_silReadback);
+        g_silMapped = nullptr;
+    }
+    g_silImage = modelCreateImage2D(dev, phys, w, h, VK_FORMAT_R8G8B8A8_UNORM,
+        VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+    if (g_silImage.image == VK_NULL_HANDLE) return false;
+    g_silReadback = modelCreateBuffer(dev, phys, (VkDeviceSize)w * h * 4,
+        VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (g_silReadback.buffer == VK_NULL_HANDLE) return false;
+    vkMapMemory(dev, g_silReadback.memory, 0, (VkDeviceSize)w * h * 4, 0, &g_silMapped);
+    return g_silMapped != nullptr;
+}
+
+// Render one mono eye of the avatar into the scratch image, read the alpha back,
+// and publish the coverage bitmap consumed by WM_NCHITTEST. Cheap (downscaled to
+// ~1/3 the window). Runs on the render thread right after the main eye render so
+// it reuses the renderer's internal targets (no resize thrash — imageWidth/Height
+// passed here match the main swapchain).
+static void UpdateSilhouette(VkDevice dev, VkPhysicalDevice phys, VkQueue queue, VkCommandPool pool,
+                            XrSessionManager* xr, uint32_t winW, uint32_t winH,
+                            const float viewMat[16], const float projMat[16], float clipFar) {
+    if (winW == 0 || winH == 0) return;
+    uint32_t w = winW / 3; if (w < 64) w = 64; if (w > 640) w = 640;
+    uint32_t h = winH / 3; if (h < 64) h = 64; if (h > 360) h = 360;
+    if (!EnsureSilhouetteTargets(dev, phys, w, h)) return;
+
+    {
+        std::lock_guard<std::mutex> lock(g_sceneMutex);
+        if (!g_modelRenderer.hasModel()) return;
+        g_modelRenderer.renderEye(g_silImage.image, VK_FORMAT_R8G8B8A8_UNORM,
+            xr->swapchain.width, xr->swapchain.height,
+            0, 0, w, h, viewMat, projMat, /*transparentBg=*/true, clipFar);
+    }
+    // renderEye leaves the scratch image in COLOR_ATTACHMENT_OPTIMAL → copy to host.
+    VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    ai.commandPool = pool; ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; ai.commandBufferCount = 1;
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    vkAllocateCommandBuffers(dev, &ai, &cmd);
+    VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cmd, &bi);
+    VkImageMemoryBarrier toSrc = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    toSrc.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    toSrc.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    toSrc.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    toSrc.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    toSrc.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toSrc.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toSrc.image = g_silImage.image;
+    toSrc.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toSrc);
+    VkBufferImageCopy region = {};
+    region.bufferRowLength = w;
+    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.imageExtent = {w, h, 1};
+    vkCmdCopyImageToBuffer(cmd, g_silImage.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        g_silReadback.buffer, 1, &region);
+    vkEndCommandBuffer(cmd);
+    VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.commandBufferCount = 1; si.pCommandBuffers = &cmd;
+    vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE);
+    vkQueueWaitIdle(queue);
+    vkFreeCommandBuffers(dev, pool, 1, &cmd);
+
+    const uint8_t* px = (const uint8_t*)g_silMapped;
+    if (!px) return;
+    std::lock_guard<std::mutex> lock(g_silCoverage.mtx);
+    g_silCoverage.bits.resize((size_t)w * h);
+    for (uint32_t i = 0; i < w * h; ++i) g_silCoverage.bits[i] = (px[i * 4 + 3] > 40) ? 1 : 0;
+    g_silCoverage.covW = (int)w; g_silCoverage.covH = (int)h;
+    g_silCoverage.winW = (int)winW; g_silCoverage.winH = (int)winH;
+    g_silCoverage.ready = true;
+
+    // Debug: with DXR_DUMP_SILHOUETTE set, dump the silhouette alpha (~once/sec)
+    // to %TEMP%\avatar_silhouette.png so the hit mask can be eyeballed (white =
+    // avatar, black = pass-through). Off by default.
+    static const bool s_dumpSil = (GetEnvironmentVariableA("DXR_DUMP_SILHOUETTE", nullptr, 0) > 0);
+    static int s_dbgCounter = 0;
+    if (s_dumpSil && (s_dbgCounter++ % 60) == 0) {
+        std::vector<uint8_t> a((size_t)w * h);
+        for (uint32_t i = 0; i < w * h; ++i) a[i] = px[i * 4 + 3];
+        char tmp[MAX_PATH] = {0};
+        GetTempPathA(MAX_PATH, tmp);
+        std::string path = std::string(tmp) + "avatar_silhouette.png";
+        stbi_write_png(path.c_str(), (int)w, (int)h, 1, a.data(), (int)w);
+    }
 }
 
 static void RenderThreadFunc(
@@ -1117,16 +1347,28 @@ static void RenderThreadFunc(
                                 const float horiz = sqrtf(hx * hx + hzAbs * hzAbs);
                                 float targetYaw   = FACE_YAW_SIGN   * atan2f(hx, hzAbs);
                                 float targetPitch = FACE_PITCH_SIGN * atan2f(hy, horiz);
-                                // Exponential, shortest-angle smoothing to damp eye-
-                                // tracking jitter (~0.18/frame settle).
+                                // Exponential shortest-angle smoothing, TIME-BASED so
+                                // it's frame-rate independent: a per-frame factor made
+                                // the billboard stutter once the silhouette pass made
+                                // frame timing uneven. A tight tau also keeps the yaw
+                                // tracking the head as promptly as the motion-parallax
+                                // projection, so the two don't visibly desync.
                                 static float s_faceYaw = 0.0f, s_facePitch = 0.0f;
-                                static bool  s_faceInit = false;
-                                if (!s_faceInit) { s_faceYaw = targetYaw; s_facePitch = targetPitch; s_faceInit = true; }
-                                float dy = targetYaw - s_faceYaw;
-                                while (dy >  3.14159265f) dy -= 6.28318531f;
-                                while (dy < -3.14159265f) dy += 6.28318531f;
-                                s_faceYaw   += dy * 0.18f;
-                                s_facePitch += (targetPitch - s_facePitch) * 0.18f;
+                                const float tau = 0.04f;  // seconds (settle ≈ 3·tau)
+                                float a = 1.0f - expf(-perfStats.deltaTime / tau);
+                                if (a < 0.0f) a = 0.0f; else if (a > 1.0f) a = 1.0f;
+                                // Only chase the head while eye tracking is LOCKED.
+                                // During warmup (the first few seconds, isEyeTracking
+                                // false) the tracker reports unstable positions that
+                                // would jitter the heading — hold facing-forward
+                                // (yaw/pitch 0) until it settles, then ease in.
+                                if (xr->isEyeTracking) {
+                                    float dy = targetYaw - s_faceYaw;
+                                    while (dy >  3.14159265f) dy -= 6.28318531f;
+                                    while (dy < -3.14159265f) dy += 6.28318531f;
+                                    s_faceYaw   += dy * a;
+                                    s_facePitch += (targetPitch - s_facePitch) * a;
+                                }
                                 // Override the render heading; auto-orbit + manual LMB
                                 // are superseded by the face-the-viewer behaviour.
                                 // displayPose below consumes inputSnapshot.yaw and the
@@ -1438,6 +1680,19 @@ static void RenderThreadFunc(
                                     (monoMode ? rawViews[0].fov : rawViews[eye].fov);
                             }
                             ReleaseSwapchainImage(*xr);
+
+                            // Update the click-through silhouette from the same
+                            // left-eye matrices we just drew (so the hit mask
+                            // tracks the animation, W/S dolly, billboard yaw, and
+                            // the display-plane clip). Render-thread-local. Throttled
+                            // to every other frame: the pass adds two GPU waits, and
+                            // ~30 Hz is plenty for the hit region — keeping it off the
+                            // every-frame path steadies frame timing (no billboard
+                            // stutter).
+                            static uint32_t s_silFrame = 0;
+                            if (hasGsScene && (s_silFrame++ & 1u) == 0u)
+                                UpdateSilhouette(vkDevice, physDevice, graphicsQueue, renderCmdPool,
+                                    xr, windowW, windowH, viewMat[0], projMat[0], clipFar[0]);
                         } else {
                             rendered = false;
                         }
@@ -1773,6 +2028,15 @@ static void RenderThreadFunc(
             Sleep(100);
         }
     }
+
+    // Silhouette scratch resources (render-thread-owned).
+    if (g_silReadback.buffer != VK_NULL_HANDLE) {
+        if (g_silMapped) vkUnmapMemory(vkDevice, g_silReadback.memory);
+        modelDestroyBuffer(vkDevice, g_silReadback);
+        g_silMapped = nullptr;
+    }
+    if (g_silImage.image != VK_NULL_HANDLE)
+        modelDestroyImage(vkDevice, g_silImage);
 
     if (renderCmdPool != VK_NULL_HANDLE)
         vkDestroyCommandPool(vkDevice, renderCmdPool, nullptr);
@@ -2118,6 +2382,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     ShowWindow(hwnd, nCmdShow);
     UpdateWindow(hwnd);
+
+    // ~60 Hz poll that toggles WS_EX_TRANSPARENT for shaped click-through
+    // (cursor over the avatar → opaque to input; off it → pass-through).
+    SetTimer(hwnd, kClickThroughTimerId, 16, nullptr);
 
     LOG_INFO("");
     LOG_INFO("=== Entering main loop ===");
