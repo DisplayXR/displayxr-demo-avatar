@@ -31,8 +31,7 @@
 #include "display3d_view.h"
 #include "projection_depth.h"
 
-#include "hud_renderer.h"
-#include "text_overlay.h"
+#include "hud_renderer.h"   // HudRenderer / RenderHudAndMap / HudButton — reused for the speech-bubble pill
 #include "atlas_capture.h"
 #include <dwrite.h>
 #pragma comment(lib, "dwrite.lib")
@@ -57,41 +56,6 @@ static const char* APP_NAME = "avatar_handle_vk_win";
 
 static const wchar_t* WINDOW_CLASS = L"DisplayXRAvatarClass";
 static const wchar_t* WINDOW_TITLE = L"DisplayXR 3D Avatar";
-
-// HUD overlay fractions. Layer spans full window height so chrome buttons
-// can sit at the window top while the info panel anchors to the bottom-left
-// (matching the macOS demo's split). The vk_native compositor now uses an
-// alpha-blended draw pass for window-space layers, so the empty middle of
-// the texture stays invisible. Font sizing is anchored to the legacy
-// 0.5-fraction so text doesn't grow with the taller texture.
-static const float HUD_WIDTH_FRACTION = 0.30f;
-static const float HUD_HEIGHT_FRACTION = 1.0f;
-static const float HUD_FONT_BASE_FRACTION = 0.50f;
-
-// ── Top button bar ────────────────────────────────────────────────────────
-// All chrome buttons live in ONE full-width window-space layer at the top:
-// Open + Mode packed at the left, the Animation pill pinned to the right, and a
-// transparent center so the model shows through. This replaces the old split
-// (Open/Mode baked into the HUD layer + Animation on its own separate layer) —
-// per runtime issue #389: group co-planar controls into a single layer and keep
-// the HUD info panel as its own (toggleable) layer. Positions below are absolute
-// window-fractions, used both for hit-testing and for placing the pills inside
-// the bar texture (the bar layer spans the full window width, so window-x maps
-// straight onto bar-texture-x).
-static const float OPEN_BTN_X_FRACTION = 0.010f;
-static const float OPEN_BTN_WIDTH_FRACTION  = 0.060f;
-
-static const float MODE_BTN_X_FRACTION = 0.075f;
-static const float MODE_BTN_WIDTH_FRACTION  = 0.140f;
-
-// Animation pill — right-aligned within the bar. Only drawn/clickable when the
-// model has clips. Label = current clip name, or "Paused"; click = next clip
-// (same as 'N').
-static const float ANIM_BTN_WIDTH_FRACTION  = 0.140f;
-static const float ANIM_BTN_MARGIN_FRACTION = 0.010f;
-static inline float AnimBtnXFraction() {
-    return 1.0f - ANIM_BTN_WIDTH_FRACTION - ANIM_BTN_MARGIN_FRACTION;
-}
 
 // Speech-bubble swapchain texture. Chunky (~5:1) so the rounded pill reads as a
 // proper speech bubble / nameplate filling the top ~30% band of the window
@@ -160,14 +124,6 @@ static float ComputeBubbleFit(const std::wstring& text, float maxW, float maxH,
     else { outWrapW = balW; outTextH = maxH; }
     return best;
 }
-static const float    BTN_BAR_Y_FRACTION = 0.008f;
-static inline float BtnBarHeightFraction(uint32_t windowW, uint32_t windowH) {
-    if (windowW == 0 || windowH == 0) return 0.05f;
-    const float windowAR = (float)windowW / (float)windowH;
-    const float texAR = (float)BTN_BAR_TEX_W / (float)BTN_BAR_TEX_H;
-    return windowAR / texAR;  // layer width fraction = 1.0
-}
-
 
 // sim_display output mode switching (legacy — replaced by unified rendering mode)
 typedef void (*PFN_sim_display_set_output_mode)(int mode);
@@ -190,16 +146,6 @@ static UINT g_windowHeight = 720;
 
 // 3DGS state
 static ModelRenderer g_modelRenderer;
-// Cross-thread scene-load queue: the file dialog runs on the main (message-pump)
-// thread, but the actual ModelRenderer::loadScene() submits Vulkan work on the
-// graphics queue and so MUST run on the same thread that drives per-frame
-// rendering — otherwise concurrent vkQueueSubmit/vkQueueWaitIdle from two
-// threads on a single VkQueue is undefined behaviour and crashes some drivers
-// (NVIDIA in particular). Main thread posts the picked path here; the render
-// thread picks it up between frames.
-static std::atomic<bool> g_loadRequested{false};
-static std::string g_pendingLoadPath;
-static std::mutex g_pendingLoadPathMutex;
 // 'I' key: capture the multi-view atlas region (cols × rows × renderW × renderH)
 // of the swapchain to a PNG in %USERPROFILE%\Pictures\DisplayXR\. Skipped for
 // 1×1 (mono) layouts. Helper lives in test_apps/common/atlas_capture*.
@@ -213,15 +159,13 @@ static std::atomic<bool> g_captureAtlasRequested{false};
 static std::atomic<bool> g_transparentBg{true};
 static std::string g_loadedFileName;
 static std::mutex g_sceneMutex;
-// True when the loaded model has animation clips — gates the animation button
-// layer + its click hit-test (read on the UI thread, set on load).
-static std::atomic<bool> g_hasAnimations{false};
 
-// Animation-button window-space layer resources: created in main() (when the
-// HUD swapchain — i.e. window-space layers — is available), used by the render
-// thread. The swapchain is app-owned state (displayxr::common's
-// XrSessionManager carries no app-named fields, #396 W4) — created via the
-// lib's CreateWindowSpaceSwapchain generic, destroyed before CleanupOpenXR.
+// Speech-bubble window-space layer resources: created in main() (when the
+// runtime advertises Local2D), used by the render thread. The swapchain is
+// app-owned state (displayxr::common's XrSessionManager carries no app-named
+// fields, #396 W4) — created via the lib's CreateWindowSpaceSwapchain generic,
+// destroyed before CleanupOpenXR. The g_animBtn* slot names predate the strip
+// of the old chrome buttons; they now drive only the bubble pill.
 static SwapchainInfo  g_animBtnSwapchain;                // app-owned window-space swapchain
 static bool           g_hasAnimBtnSwapchain = false;
 static HudRenderer    g_animBtnHud = {};                 // own D3D11 text renderer (256×80)
@@ -255,8 +199,6 @@ static std::atomic<bool> g_fitValid{false};
 // with mouse drag from a predictable starting pose.
 // Caller must hold g_sceneMutex (we read pickData_ from the renderer).
 static void ApplyAutoFitForLoadedScene_locked() {
-    // Gate the right-justified animation button on whether this model has clips.
-    g_hasAnimations.store(g_modelRenderer.hasAnimations());
     float center[3], extent[3];
     // Full model AABB: center for the rig position, extent[1] for the height fit.
     bool ok = g_modelRenderer.getRobustSceneBounds(0.05f, 0.95f, center, extent);
@@ -382,37 +324,6 @@ static void ToggleDecoration(HWND hwnd) {
     LOG_INFO("Window decoration: %s (B)", g_decorated ? "ON (move/resize)" : "OFF (borderless)");
 }
 
-static bool PointInFractionRect(int mouseX, int mouseY, int windowW, int windowH,
-                                float xf, float yf, float wf, float hf) {
-    if (windowW <= 0 || windowH <= 0) return false;
-    float fx = (float)mouseX / (float)windowW;
-    float fy = (float)mouseY / (float)windowH;
-    return (fx >= xf && fx <= xf + wf && fy >= yf && fy <= yf + hf);
-}
-
-// All three buttons share the top bar's vertical band [BTN_BAR_Y, +barHeight];
-// each owns its own x-column. Keeps hit-testing aligned with the rendered pills.
-static bool IsClickOnLoadButton(int mouseX, int mouseY, int windowW, int windowH) {
-    return PointInFractionRect(mouseX, mouseY, windowW, windowH,
-        OPEN_BTN_X_FRACTION, BTN_BAR_Y_FRACTION,
-        OPEN_BTN_WIDTH_FRACTION, BtnBarHeightFraction(windowW, windowH));
-}
-
-static bool IsClickOnModeButton(int mouseX, int mouseY, int windowW, int windowH) {
-    return PointInFractionRect(mouseX, mouseY, windowW, windowH,
-        MODE_BTN_X_FRACTION, BTN_BAR_Y_FRACTION,
-        MODE_BTN_WIDTH_FRACTION, BtnBarHeightFraction(windowW, windowH));
-}
-
-static bool IsClickOnAnimButton(int mouseX, int mouseY, int windowW, int windowH) {
-    // Only live when the model actually has clips (else the top-right corner
-    // stays a normal scene-rotate region).
-    if (!g_hasAnimations.load()) return false;
-    return PointInFractionRect(mouseX, mouseY, windowW, windowH,
-        AnimBtnXFraction(), BTN_BAR_Y_FRACTION,
-        ANIM_BTN_WIDTH_FRACTION, BtnBarHeightFraction(windowW, windowH));
-}
-
 // Atlas capture is runtime-owned via xrCaptureAtlasEXT (XR_EXT_atlas_capture).
 // App-side helpers (filename numbering + flash overlay) live in
 // common/atlas_capture* — see dxr_capture::MakeCaptureAtlasPrefix /
@@ -453,97 +364,6 @@ static void TryAutoLoadBundledScene(const std::string& overridePath = std::strin
         ApplyAutoFitForLoadedScene_locked();
     } else {
         LOG_WARN("Auto-load failed for %s", path.c_str());
-    }
-}
-
-// Hand a picked path off to the render thread for scene load. Validates the
-// extension first; on failure pops a MessageBox and returns false. Used by
-// both the Win32 GetOpenFileNameA path and the #228 spatial picker result
-// drained in the main loop.
-static bool QueueSceneLoad(HWND hwnd, const std::string& path) {
-    if (!model_validate_file(path)) {
-        MessageBoxA(hwnd, "Invalid model file. Supported formats: .glb, .gltf", "Load Error", MB_OK | MB_ICONERROR);
-        return false;
-    }
-    {
-        std::lock_guard<std::mutex> lock(g_pendingLoadPathMutex);
-        g_pendingLoadPath = path;
-    }
-    g_loadRequested.store(true, std::memory_order_release);
-    LOG_INFO("Queued model load: %s", path.c_str());
-    return true;
-}
-
-// Open a file dialog and load a .ply or .spz scene (called from main thread).
-//
-// Path A — workspace + Tier 1 picker available:
-//     xrRequestFilePickerEXT fires async. The completion event is drained
-//     by PollEvents (common/xr_session_common.cpp) into xr.filePickerLast*;
-//     the main loop dispatches to QueueSceneLoad on result arrival.
-//
-// Path B — workspace mode but no controller / no Tier 1 picker, OR running
-// outside a workspace (standalone window), OR running on a non-DisplayXR
-// OpenXR runtime: xrRequestFilePickerEXT either returns
-// XR_FILE_PICKER_FALLBACK_TIER0_EXT (workspace fallback) or the PFN is
-// null (extension absent). Either way fall through to GetOpenFileNameA
-// and keep the existing standalone UX.
-static void OpenLoadDialog(HWND hwnd) {
-    // Already showing a spatial picker — second click on Open is a
-    // no-op. Without this guard the prior "filePickerInFlight" check
-    // would skip Path A and fall through to GetOpenFileNameA, opening
-    // BOTH the spatial picker AND a flat Win32 dialog stacked on top.
-    if (g_xr != nullptr && g_xr->filePickerInFlight) {
-        LOG_INFO("[#228] OpenLoadDialog: spatial picker already in flight, ignoring");
-        return;
-    }
-
-    // Path A: spatial picker, when available + not already in flight.
-    if (g_xr != nullptr && g_xr->pfnRequestFilePickerEXT != nullptr &&
-        !g_xr->filePickerInFlight) {
-        XrFilePickerInfoEXT info = {XR_TYPE_FILE_PICKER_INFO_EXT};
-        info.mode = XR_FILE_PICKER_MODE_OPEN_EXT;
-        strncpy(info.title, "Load 3D Model",
-                sizeof(info.title) - 1);
-        info.filterCount = 3;
-        strncpy(info.filters[0].description, "3D Models",
-                sizeof(info.filters[0].description) - 1);
-        strncpy(info.filters[0].extensions, "*.glb;*.gltf;*.stl;*.obj;*.fbx;*.usdz;*.usd;*.usda;*.usdc",
-                sizeof(info.filters[0].extensions) - 1);
-        strncpy(info.filters[1].description, "Binary glTF",
-                sizeof(info.filters[1].description) - 1);
-        strncpy(info.filters[1].extensions, "*.glb",
-                sizeof(info.filters[1].extensions) - 1);
-        strncpy(info.filters[2].description, "glTF",
-                sizeof(info.filters[2].description) - 1);
-        strncpy(info.filters[2].extensions, "*.gltf",
-                sizeof(info.filters[2].extensions) - 1);
-
-        XrAsyncRequestIdEXT rid = 0;
-        XrResult r = g_xr->pfnRequestFilePickerEXT(g_xr->session, &info, &rid);
-        if (r == XR_SUCCESS) {
-            g_xr->filePickerInFlight = true;
-            g_xr->filePickerRequestId = rid;
-            LOG_INFO("[#228] xrRequestFilePickerEXT -> rc=0x%x requestId=%llu",
-                r, (unsigned long long)rid);
-            return; // wait for completion event in the main loop
-        }
-        // r == XR_FILE_PICKER_FALLBACK_TIER0_EXT or an error → fall through.
-        LOG_INFO("[#228] xrRequestFilePickerEXT -> rc=0x%x (falling back to Win32)", r);
-    }
-
-    // Path B: existing Win32 file dialog (unchanged behavior).
-    OPENFILENAMEA ofn = {};
-    char filePath[MAX_PATH] = {};
-    ofn.lStructSize = sizeof(ofn);
-    ofn.hwndOwner = hwnd;
-    ofn.lpstrFilter = "3D Models (glb;gltf;stl;obj;fbx;usd*)\0*.glb;*.gltf;*.stl;*.obj;*.fbx;*.usdz;*.usd;*.usda;*.usdc\0glTF (*.glb;*.gltf)\0*.glb;*.gltf\0STL (*.stl)\0*.stl\0OBJ (*.obj)\0*.obj\0FBX (*.fbx)\0*.fbx\0USD (*.usd*)\0*.usdz;*.usd;*.usda;*.usdc\0All Files (*.*)\0*.*\0";
-    ofn.lpstrFile = filePath;
-    ofn.nMaxFile = MAX_PATH;
-    ofn.lpstrTitle = "Load 3D Model";
-    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
-
-    if (GetOpenFileNameA(&ofn)) {
-        QueueSceneLoad(hwnd, std::string(filePath));
     }
 }
 
@@ -687,49 +507,13 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         if (!g_decorated) return HTCLIENT;
         break;
     }
-    case WM_LBUTTONDOWN: {
-        int mx = LOWORD(lParam);
-        int my = HIWORD(lParam);
-        // UpdateInputState above already set leftButton/dragging=true. For
-        // button clicks (which post a message to run a modal dialog or change
-        // mode), clear that drag state — otherwise the modal eats the
-        // matching WM_LBUTTONUP and subsequent mouse motion is interpreted as
-        // a scene drag.
-        if (IsClickOnLoadButton(mx, my, g_windowWidth, g_windowHeight)) {
-            {
-                std::lock_guard<std::mutex> lock(g_inputMutex);
-                g_inputState.leftButton = false;
-                g_inputState.dragging = false;
-            }
-            PostMessage(hwnd, WM_USER + 1, 0, 0);
-            return 0;
-        }
-        if (IsClickOnModeButton(mx, my, g_windowWidth, g_windowHeight)) {
-            std::lock_guard<std::mutex> lock(g_inputMutex);
-            g_inputState.leftButton = false;
-            g_inputState.dragging = false;
-            // Mode button = cycle request (V-key equivalent). Main loop
-            // reads runtime's current mode and computes the target.
-            g_inputState.cycleRenderingModeRequested = true;
-            return 0;
-        }
-        if (IsClickOnAnimButton(mx, my, g_windowWidth, g_windowHeight)) {
-            std::lock_guard<std::mutex> lock(g_inputMutex);
-            g_inputState.leftButton = false;
-            g_inputState.dragging = false;
-            // Animation button = next clip (N-key equivalent).
-            g_inputState.cycleClipRequested = true;
-            return 0;
-        }
+    case WM_LBUTTONDOWN:
+        // The avatar has no on-screen buttons — a left press just starts a
+        // scene-rotate drag (UpdateInputState above set leftButton/dragging).
         SetCapture(hwnd);
         return 0;
-    }
     case WM_LBUTTONUP:
         ReleaseCapture();
-        return 0;
-
-    case WM_USER + 1:
-        OpenLoadDialog(hwnd);
         return 0;
 
     case dxr_capture::kFlashUserMsg:
@@ -761,11 +545,6 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         // B key = toggle window decoration (borderless ⇄ title bar for move/resize)
         if (wParam == 'B') {
             ToggleDecoration(hwnd);
-            return 0;
-        }
-        // L key = load shortcut
-        if (wParam == 'L') {
-            PostMessage(hwnd, WM_USER + 1, 0, 0);
             return 0;
         }
         // I key = capture multi-view atlas
@@ -1043,18 +822,7 @@ static void RenderThreadFunc(
     uint32_t queueFamilyIndex,
     VkInstance vkInstance,
     VkPhysicalDevice physDevice,
-    std::vector<VkImage>* swapchainVkImages,
-    HudRenderer* hud,
-    uint32_t hudWidth,
-    uint32_t hudHeight,
-    VkBuffer hudStagingBuffer,
-    void* hudStagingMapped,
-    VkCommandPool hudCmdPool,
-    std::vector<XrSwapchainImageVulkanKHR>* hudSwapchainImages,
-    VkCommandPool loadBtnCmdPool,
-    std::vector<XrSwapchainImageVulkanKHR>* loadBtnSwapchainImages,
-    uint32_t loadBtnWidth,
-    uint32_t loadBtnHeight)
+    std::vector<VkImage>* swapchainVkImages)
 {
     LOG_INFO("[RenderThread] Started");
 
@@ -1074,7 +842,6 @@ static void RenderThreadFunc(
         InputState inputSnapshot;
         bool resetRequested = false;
         bool animateToggle = false;
-        bool loadReq = false;
         bool cycleModeRequested = false;
         bool cycleClip = false;
         bool playPause = false;
@@ -1097,7 +864,6 @@ static void RenderThreadFunc(
             std::lock_guard<std::mutex> lock(g_inputMutex);
             resetRequested = g_inputState.resetViewRequested;
             animateToggle = g_inputState.animateToggleRequested;
-            loadReq = g_inputState.loadRequested;
             g_inputState.resetViewRequested = false;
             g_inputState.teleportRequested = false;
             g_inputState.fullscreenToggleRequested = false;
@@ -1113,7 +879,6 @@ static void RenderThreadFunc(
                 LOG_INFO("Transparent background: %s (Ctrl+T)", now ? "ON" : "OFF");
             }
             g_inputState.animateToggleRequested = false;
-            g_inputState.loadRequested = false;
             cycleClip = g_inputState.cycleClipRequested;
             g_inputState.cycleClipRequested = false;
             playPause = g_inputState.playPauseRequested;
@@ -1124,38 +889,6 @@ static void RenderThreadFunc(
             }
             windowW = g_windowWidth;
             windowH = g_windowHeight;
-        }
-
-        // Request main thread to open file dialog when L key or Load button was pressed.
-        if (loadReq) {
-            PostMessage(hwnd, WM_USER + 1, 0, 0);
-        }
-
-        // Drain a queued scene load (set by OpenLoadDialog on the main
-        // thread). We must run loadScene here because it submits Vulkan work
-        // on the graphics queue, and that queue is exclusively driven by this
-        // (render) thread for per-frame submissions — see g_pendingLoadPath.
-        if (g_loadRequested.exchange(false, std::memory_order_acquire)) {
-            std::string path;
-            {
-                std::lock_guard<std::mutex> lock(g_pendingLoadPathMutex);
-                path = std::move(g_pendingLoadPath);
-                g_pendingLoadPath.clear();
-            }
-            if (!path.empty()) {
-                LOG_INFO("Loading model: %s", path.c_str());
-                std::lock_guard<std::mutex> lock(g_sceneMutex);
-                if (g_modelRenderer.loadModel(path.c_str())) {
-                    g_loadedFileName = model_basename(path);
-                    LOG_INFO("Scene loaded: %s (%s)", g_loadedFileName.c_str(),
-                        model_filesize_str(path).c_str());
-                    ApplyAutoFitForLoadedScene_locked();
-                } else {
-                    LOG_ERROR("Failed to load scene: %s", path.c_str());
-                    MessageBoxA(hwnd, "Failed to load scene file.\nThe file may be corrupt or unsupported.",
-                        "Load Error", MB_OK | MB_ICONERROR);
-                }
-            }
         }
 
         // Rendering mode requests (V/mode-button=cycle, 0-8=absolute). Single
@@ -1241,28 +974,6 @@ static void RenderThreadFunc(
 
         PollEvents(*xr);
 
-        // #228 Tier 1: drain a spatial-picker result if one arrived this
-        // tick. PollEvents wrote the path + result code onto the session
-        // manager; we route it through the same QueueSceneLoad path the
-        // Win32 GetOpenFileNameA branch uses. The render thread picks the
-        // queued path up via g_pendingLoadPath.
-        if (xr->filePickerHasResult) {
-            xr->filePickerHasResult = false;
-            if (xr->filePickerLastResult == XR_FILE_PICKER_RESULT_SUCCESS_EXT &&
-                xr->filePickerLastPath[0] != '\0') {
-                QueueSceneLoad(hwnd, std::string(xr->filePickerLastPath));
-            } else if (xr->filePickerLastResult == XR_FILE_PICKER_RESULT_CANCELLED_EXT) {
-                LOG_INFO("[#228] User cancelled spatial picker — no scene load");
-            } else {
-                // PICKER_FAILED / INVALID_PATH — log and silently drop.
-                // Don't auto-fall-back to Win32: the user already cancelled
-                // out of the spatial flow, surfacing another dialog would
-                // feel like a bug. They can click Load again if needed.
-                LOG_WARN("[#228] Spatial picker delivered result=%d (no load)",
-                    (int)xr->filePickerLastResult);
-            }
-        }
-
         if (xr->sessionRunning) {
             XrFrameState frameState;
             if (BeginFrame(*xr, frameState)) {
@@ -1270,33 +981,6 @@ static void RenderThreadFunc(
                 // Active mode's view count drives how many slots are actually filled and submitted.
                 XrCompositionLayerProjectionView projectionViews[8] = {};
                 bool rendered = false;
-                bool hudSubmitted = false;
-                bool loadBtnSubmitted = false;
-
-                // Aspect-preserving HUD layer footprint (fixes demo-gs#8).
-                // The HUD swapchain has a fixed pixel aspect (hudWidth × hudHeight,
-                // sized once at session create). When the workspace tile is
-                // resized to a different aspect, the runtime stretches the
-                // swapchain per-axis to fit the layer rect — which distorts
-                // glyphs and button shapes. Fix: pick layer-rect fractions
-                // (layerFracW × layerFracH, in HWND fractions) that match the
-                // swapchain aspect so both axes stretch by the same factor
-                // (uniform scaling, no distortion). Same pattern as the runtime
-                // test apps (test_apps/cube_handle_d3d11_win/main.cpp ~L800).
-                // Prefer layerFracH = 1.0 (full window height, keeps the info
-                // panel anchored to the window bottom); on extremely tall tiles
-                // where that would push layerFracW past 1.0, clamp width and
-                // shrink height instead.
-                const float hudAR = (hudHeight > 0)
-                    ? (float)hudWidth / (float)hudHeight : 1.0f;
-                const float windowAR = (windowW > 0 && windowH > 0)
-                    ? (float)windowW / (float)windowH : 1.0f;
-                float layerFracH = 1.0f;
-                float layerFracW = hudAR / windowAR;
-                if (layerFracW > 1.0f) {
-                    layerFracW = 1.0f;
-                    layerFracH = windowAR / hudAR;
-                }
 
                 if (frameState.shouldRender) {
                     if (LocateViews(*xr, frameState.predictedDisplayTime,
@@ -1807,182 +1491,20 @@ static void RenderThreadFunc(
                             rendered = false;
                         }
 
-                        // Render the HUD info-panel window-space layer. Body-only
-                        // now (chrome buttons moved to the top-bar layer below).
-                        // The TAB toggle hides the body via the `drawBody` flag;
-                        // the layer footprint stays the aspect-locked left strip.
-                        // Only render/acquire the HUD swapchain when the panel is
-                        // visible — when hidden the layer is dropped entirely (true
-                        // toggle), so we must NOT acquire its image this frame.
-                        if (rendered && hud && xr->hasHudSwapchain && hudSwapchainImages &&
-                            inputSnapshot.hudVisible) {
-                            uint32_t hudImageIndex;
-                            if (AcquireHudSwapchainImage(*xr, hudImageIndex)) {
-                                std::wstring sessionText(xr->systemName, xr->systemName + strlen(xr->systemName));
-                                sessionText += L"\nSession: ";
-                                sessionText += FormatSessionState((int)xr->sessionState);
-                                std::wstring modeText = xr->hasWin32WindowBindingExt ?
-                                    L"XR_EXT_win32_window_binding: ACTIVE (Vulkan + glTF)" :
-                                    L"XR_EXT_win32_window_binding: NOT AVAILABLE";
-
-                                // Scene info
-                                std::wstring sceneText = L"\n--- Model ---";
-                                {
-                                    std::lock_guard<std::mutex> lock(g_sceneMutex);
-                                    if (g_modelRenderer.hasModel()) {
-                                        std::wstring fname(g_loadedFileName.begin(), g_loadedFileName.end());
-                                        sceneText += L"\nLoaded: " + fname;
-                                    } else {
-                                        sceneText += L"\nNo scene loaded (press L or click Load)";
-                                    }
-                                }
-                                modeText += sceneText;
-
-                                // Per-view extent for HUD display — same formula as the
-                                // render path (window × view_scale of the current mode).
-                                float dispScaleX, dispScaleY;
-                                if (xr->renderingModeCount > 0) {
-                                    uint32_t mode = xr->currentModeIndex;
-                                    dispScaleX = xr->renderingModeScaleX[mode];
-                                    dispScaleY = xr->renderingModeScaleY[mode];
-                                } else {
-                                    dispScaleX = xr->recommendedViewScaleX;
-                                    dispScaleY = xr->recommendedViewScaleY;
-                                }
-                                uint32_t dispRenderW = (uint32_t)((double)windowW * dispScaleX);
-                                uint32_t dispRenderH = (uint32_t)((double)windowH * dispScaleY);
-                                if (dispRenderW == 0) dispRenderW = 1;
-                                if (dispRenderH == 0) dispRenderH = 1;
-                                std::wstring perfText = FormatPerformanceInfo(perfStats.fps, perfStats.frameTimeMs,
-                                    dispRenderW, dispRenderH, windowW, windowH);
-                                std::wstring dispText = FormatDisplayInfo(xr->displayWidthM, xr->displayHeightM,
-                                    xr->nominalViewerX, xr->nominalViewerY, xr->nominalViewerZ);
-                                dispText += L"\n" + FormatScaleInfo(xr->recommendedViewScaleX, xr->recommendedViewScaleY);
-                                dispText += L"\n" + FormatMode(xr->currentModeIndex, xr->pfnRequestDisplayRenderingModeEXT != nullptr,
-                                    (xr->renderingModeCount > 0 && xr->currentModeIndex < xr->renderingModeCount) ? xr->renderingModeNames[xr->currentModeIndex] : nullptr,
-                                    xr->renderingModeCount,
-                                    xr->renderingModeCount > 0 ? xr->renderingModeDisplay3D[xr->currentModeIndex] : true,
-                                    xr->renderingModeCount > 0 ? xr->renderingModeIsRequestable[xr->currentModeIndex] : true);
-                                std::wstring eyeText = FormatEyeTrackingInfo(
-                                    xr->eyePositions, (uint32_t)eyeCount,
-                                    xr->eyeTrackingActive, xr->isEyeTracking,
-                                    xr->activeEyeTrackingMode, xr->supportedEyeTrackingModes);
-
-                                float fwdX = -sinf(inputSnapshot.yaw) * cosf(renderPitch);
-                                float fwdY =  sinf(renderPitch);
-                                float fwdZ = -cosf(inputSnapshot.yaw) * cosf(renderPitch);
-                                std::wstring cameraText = FormatCameraInfo(
-                                    inputSnapshot.cameraPosX, inputSnapshot.cameraPosY, inputSnapshot.cameraPosZ,
-                                    fwdX, fwdY, fwdZ);
-                                float hudM2v = 1.0f;
-                                if (inputSnapshot.viewParams.virtualDisplayHeight > 0.0f && xr->displayHeightM > 0.0f)
-                                    hudM2v = inputSnapshot.viewParams.virtualDisplayHeight / xr->displayHeightM;
-                                std::wstring stereoText = FormatViewParams(
-                                    inputSnapshot.viewParams.ipdFactor, inputSnapshot.viewParams.parallaxFactor,
-                                    inputSnapshot.viewParams.perspectiveFactor, inputSnapshot.viewParams.scaleFactor);
-                                {
-                                    wchar_t vhBuf[96];
-                                    int depthPct = (int)(inputSnapshot.viewParams.ipdFactor * 100.0f + 0.5f);
-                                    const wchar_t* orbitLbl = inputSnapshot.animateEnabled
-                                        ? (inputSnapshot.animationActive ? L"ON (running)" : L"ON (idle countdown)")
-                                        : L"OFF";
-                                    swprintf(vhBuf, 96, L"\nvHeight: %.3f  m2v: %.3f\nDepth/IPD: %d%%  Auto-Orbit: %s",
-                                        inputSnapshot.viewParams.virtualDisplayHeight, hudM2v, depthPct, orbitLbl);
-                                    stereoText += vhBuf;
-                                }
-                                std::wstring helpText = L"[WASDEQ] Move | [LMB-drag] Rotate | [Scroll] Zoom\n"
-                                    L"[DblClick] Focus | [-/=] Depth | [Space] Reset | [N] Clip | [K] Play/Pause\n"
-                                    L"[M] Auto-Orbit | [V] Mode | [L] Load | [Tab] HUD | [ESC] Quit";
-
-                                // Chrome buttons no longer live here — they are a
-                                // separate full-width top-bar window-space layer
-                                // (see the button-bar block below). This layer is
-                                // the info panel only, toggled by Tab via drawBody.
-                                uint32_t srcRowPitch = 0;
-                                const void* pixels = RenderHudAndMap(*hud, &srcRowPitch, sessionText, modeText, perfText, dispText, eyeText,
-                                    cameraText, stereoText, helpText, {},
-                                    /*drawBody=*/true,
-                                    /*bodyAtBottom=*/true);
-                                if (pixels) {
-                                    const uint8_t* src = (const uint8_t*)pixels;
-                                    uint8_t* dst = (uint8_t*)hudStagingMapped;
-                                    for (uint32_t row = 0; row < hudHeight; row++) {
-                                        memcpy(dst + row * hudWidth * 4, src + row * srcRowPitch, hudWidth * 4);
-                                    }
-                                    UnmapHud(*hud);
-                                }
-
-                                // Copy staging buffer to HUD swapchain image
-                                VkCommandBufferAllocateInfo cmdAllocInfo = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-                                cmdAllocInfo.commandPool = hudCmdPool;
-                                cmdAllocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-                                cmdAllocInfo.commandBufferCount = 1;
-
-                                VkCommandBuffer cmdBuf;
-                                vkAllocateCommandBuffers(vkDevice, &cmdAllocInfo, &cmdBuf);
-
-                                VkCommandBufferBeginInfo beginInfo = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-                                beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-                                vkBeginCommandBuffer(cmdBuf, &beginInfo);
-
-                                VkImage hudImg = (*hudSwapchainImages)[hudImageIndex].image;
-
-                                VkImageMemoryBarrier barrier = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-                                barrier.srcAccessMask = 0;
-                                barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-                                barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-                                barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-                                barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-                                barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-                                barrier.image = hudImg;
-                                barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-                                vkCmdPipelineBarrier(cmdBuf,
-                                    VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                                    VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                    0, 0, nullptr, 0, nullptr, 1, &barrier);
-
-                                VkBufferImageCopy region = {};
-                                region.bufferRowLength = hudWidth;
-                                region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-                                region.imageOffset = {0, 0, 0};
-                                region.imageExtent = {hudWidth, hudHeight, 1};
-                                vkCmdCopyBufferToImage(cmdBuf, hudStagingBuffer, hudImg,
-                                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
-
-                                barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-                                barrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-                                barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-                                barrier.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-                                vkCmdPipelineBarrier(cmdBuf,
-                                    VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-                                    0, 0, nullptr, 0, nullptr, 1, &barrier);
-
-                                vkEndCommandBuffer(cmdBuf);
-
-                                VkSubmitInfo submitInfo = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
-                                submitInfo.commandBufferCount = 1;
-                                submitInfo.pCommandBuffers = &cmdBuf;
-                                vkQueueSubmit(graphicsQueue, 1, &submitInfo, VK_NULL_HANDLE);
-                                vkQueueWaitIdle(graphicsQueue);
-
-                                vkFreeCommandBuffers(vkDevice, hudCmdPool, 1, &cmdBuf);
-
-                                ReleaseHudSwapchainImage(*xr);
-                                hudSubmitted = true;
-                            }
-                        }
+                        // The developer HUD info-panel was stripped from the avatar
+                        // demo — see git history if a frame/mode/eye-tracking readout
+                        // is needed again. The window-space-layer machinery it shared
+                        // now drives only the speech-bubble (the Local2D block below).
 
                     }
                 }
 
-                // ── Top button bar: ONE full-width window-space layer holding all
-                //    chrome buttons — Open + Mode packed left, Animation pinned
-                //    right, transparent center. Always submitted (decoupled from
-                //    the Tab-toggled HUD panel); the Animation pill is only added
-                //    when the model has clips. Reuses the window-space-layer
-                //    machinery (own swapchain / text renderer / staging) widened
-                //    to a bar — see runtime issue #389. ──
+                // ── Speech bubble: a flat 2D nameplate pill in the top ~30% band,
+                //    submitted as a Local2D layer (implicit M=0 mask) so the tiger
+                //    keeps weaving in the bottom 70%. Renders one centred rounded
+                //    pill into its own window-space swapchain (g_animBtnSwapchain —
+                //    named before the chrome buttons were stripped) via the HUD
+                //    text renderer, then composites it post-weave. ──
                 XrCompositionLayerLocal2DEXT bubbleLayer = {(XrStructureType)XR_TYPE_COMPOSITION_LAYER_LOCAL_2D_EXT};
                 // Transparent backer spanning the FULL top 30%: extends the implicit
                 // mask (M=0) across the whole band so the untouched top-30% weave is
@@ -2360,101 +1882,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         }
     }
 
-    // Initialize HUD renderer
-    uint32_t hudWidth = (uint32_t)(xr.swapchain.width * HUD_WIDTH_FRACTION);
-    uint32_t hudHeight = (uint32_t)(xr.swapchain.height * HUD_HEIGHT_FRACTION);
-
-    HudRenderer hudRenderer = {};
-    uint32_t hudFontBaseHeight = (uint32_t)(xr.swapchain.height * HUD_FONT_BASE_FRACTION);
-    bool hudOk = InitializeHudRenderer(hudRenderer, hudWidth, hudHeight, hudFontBaseHeight);
-    if (!hudOk) {
-        LOG_WARN("HUD renderer init failed - HUD will not be displayed");
-    }
-
-    // Create HUD swapchain
-    std::vector<XrSwapchainImageVulkanKHR> hudSwapImages;
-    if (hudOk) {
-        if (CreateHudSwapchain(xr, hudWidth, hudHeight)) {
-            uint32_t count = xr.hudSwapchain.imageCount;
-            hudSwapImages.resize(count, {XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR});
-            xrEnumerateSwapchainImages(xr.hudSwapchain.swapchain, count, &count,
-                (XrSwapchainImageBaseHeader*)hudSwapImages.data());
-            LOG_INFO("HUD swapchain: enumerated %u Vulkan images", count);
-        } else {
-            LOG_WARN("HUD swapchain creation failed - HUD will not be displayed");
-            hudOk = false;
-        }
-    }
-
-    // Create HUD staging buffer
-    VkBuffer hudStagingBuffer = VK_NULL_HANDLE;
-    VkDeviceMemory hudStagingMemory = VK_NULL_HANDLE;
-    void* hudStagingMapped = nullptr;
-    VkCommandPool hudCmdPool = VK_NULL_HANDLE;
-
-    if (hudOk) {
-        VkBufferCreateInfo bufInfo = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-        bufInfo.size = (VkDeviceSize)hudWidth * hudHeight * 4;
-        bufInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-        bufInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-
-        if (vkCreateBuffer(vkDevice, &bufInfo, nullptr, &hudStagingBuffer) != VK_SUCCESS) {
-            LOG_WARN("Failed to create HUD staging buffer");
-            hudOk = false;
-        }
-
-        if (hudOk) {
-            VkMemoryRequirements memReqs;
-            vkGetBufferMemoryRequirements(vkDevice, hudStagingBuffer, &memReqs);
-
-            VkPhysicalDeviceMemoryProperties memProps;
-            vkGetPhysicalDeviceMemoryProperties(physDevice, &memProps);
-
-            uint32_t memTypeIndex = UINT32_MAX;
-            for (uint32_t i = 0; i < memProps.memoryTypeCount; i++) {
-                if ((memReqs.memoryTypeBits & (1 << i)) &&
-                    (memProps.memoryTypes[i].propertyFlags &
-                        (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) ==
-                        (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
-                    memTypeIndex = i;
-                    break;
-                }
-            }
-
-            if (memTypeIndex == UINT32_MAX) {
-                LOG_WARN("No suitable memory type for HUD staging buffer");
-                hudOk = false;
-            } else {
-                VkMemoryAllocateInfo allocInfo = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-                allocInfo.allocationSize = memReqs.size;
-                allocInfo.memoryTypeIndex = memTypeIndex;
-                vkAllocateMemory(vkDevice, &allocInfo, nullptr, &hudStagingMemory);
-                vkBindBufferMemory(vkDevice, hudStagingBuffer, hudStagingMemory, 0);
-                vkMapMemory(vkDevice, hudStagingMemory, 0, bufInfo.size, 0, &hudStagingMapped);
-            }
-        }
-
-        if (hudOk) {
-            VkCommandPoolCreateInfo poolInfo = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
-            poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-            poolInfo.queueFamilyIndex = queueFamilyIndex;
-            if (vkCreateCommandPool(vkDevice, &poolInfo, nullptr, &hudCmdPool) != VK_SUCCESS) {
-                LOG_WARN("Failed to create HUD command pool");
-                hudOk = false;
-            }
-        }
-
-        if (hudOk) {
-            LOG_INFO("HUD Vulkan resources created (%ux%u)", hudWidth, hudHeight);
-        }
-    }
-
-    // ── Top button-bar window-space layer resources ──────────────────────────
-    // Own swapchain + text renderer + staging + cmd pool for the full-width top
-    // button bar (Open + Mode + Animation in one layer). Reuses the
-    // g_animBtnSwapchain / g_animBtn* slots (named before the buttons were
-    // unified into a bar). Only when window-space layers are available.
-    if (hudOk && xr.hasHudSwapchain) {
+    // ── Speech-bubble window-space layer resources ───────────────────────────
+    // Own swapchain + text renderer + staging + cmd pool for the flat 2D speech
+    // bubble. The g_animBtnSwapchain / g_animBtn* slot names predate the strip of
+    // the old chrome buttons; the bubble reuses that window-space-layer machinery
+    // (its own HudRenderer renders the rounded pill). Only meaningful when the
+    // runtime advertises Local2D (otherwise the bubble layer is never submitted).
+    if (g_hasLocal3DZone) {
         // Auto-fit the greeting: largest balanced multi-line layout that fits the
         // available area of the (fixed) bubble texture; derive the snug pill rect.
         {
@@ -2507,9 +1941,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                 ok = vkCreateCommandPool(vkDevice, &pci, nullptr, &g_animBtnCmdPool) == VK_SUCCESS;
             }
             g_animBtnReady = ok;
-            LOG_INFO("Animation-button layer resources %s", ok ? "created" : "FAILED");
+            LOG_INFO("Speech-bubble layer resources %s", ok ? "created" : "FAILED");
         } else {
-            LOG_WARN("Animation-button layer init failed — button will not show");
+            LOG_WARN("Speech-bubble layer init failed — bubble will not show");
         }
     }
 
@@ -2522,9 +1956,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     LOG_INFO("");
     LOG_INFO("=== Entering main loop ===");
-    LOG_INFO("Controls: WASDEQ=Move  LMB-drag=Rotate  Scroll=Zoom  DblClick=Focus");
-    LOG_INFO("          -/= Depth  Space=Reset  M=Auto-Orbit  V=Mode");
-    LOG_INFO("          L=Load  Tab=HUD  F11=Fullscreen  ESC=Quit");
+    LOG_INFO("Controls: W/S=Dolly depth  LMB-drag=Rotate  Ctrl+T=Transparency");
+    LOG_INFO("          Space=Reset  V=Mode  N=Clip  K=Play/Pause");
+    LOG_INFO("          B=Decoration(move/resize)  I=Capture  F11=Fullscreen  ESC=Quit");
     LOG_INFO("");
 
     g_inputState.viewParams.virtualDisplayHeight = kFallbackVirtualDisplayHeightM;
@@ -2533,7 +1967,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     // The main loop's dispatch picks this up on the first frame and calls
     // xrRequestDisplayRenderingModeEXT(1); the runtime event drives xr.currentModeIndex.
     g_inputState.absoluteRenderingModeRequested = 1;
-    g_inputState.hudVisible = false;     // hidden by default; toggle with Tab
     g_inputState.animateEnabled = false; // no auto-orbit — avatar faces the viewer
     {
         using namespace std::chrono;
@@ -2543,12 +1976,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     std::thread renderThread(RenderThreadFunc, hwnd, &xr, vkDevice, graphicsQueue,
         queueFamilyIndex, vkInstance, physDevice,
-        &swapchainVkImages,
-        hudOk ? &hudRenderer : nullptr, hudWidth, hudHeight,
-        hudStagingBuffer, hudStagingMapped, hudCmdPool,
-        hudOk ? &hudSwapImages : nullptr,
-        (VkCommandPool)VK_NULL_HANDLE, (std::vector<XrSwapchainImageVulkanKHR>*)nullptr,
-        (uint32_t)0, (uint32_t)0);
+        &swapchainVkImages);
 
     MSG msg = {};
     while (GetMessage(&msg, nullptr, 0, 0) > 0) {
@@ -2566,15 +1994,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     g_modelRenderer.cleanup();
 
-    if (hudCmdPool != VK_NULL_HANDLE) vkDestroyCommandPool(vkDevice, hudCmdPool, nullptr);
-    if (hudStagingBuffer != VK_NULL_HANDLE) {
-        vkUnmapMemory(vkDevice, hudStagingMemory);
-        vkDestroyBuffer(vkDevice, hudStagingBuffer, nullptr);
-    }
-    if (hudStagingMemory != VK_NULL_HANDLE) vkFreeMemory(vkDevice, hudStagingMemory, nullptr);
-    if (hudOk) CleanupHudRenderer(hudRenderer);
-
-    // Animation-button layer resources.
+    // Speech-bubble window-space layer resources.
     if (g_animBtnCmdPool != VK_NULL_HANDLE) vkDestroyCommandPool(vkDevice, g_animBtnCmdPool, nullptr);
     if (g_animBtnStaging != VK_NULL_HANDLE) {
         if (g_animBtnStagingMapped) vkUnmapMemory(vkDevice, g_animBtnStagingMem);
@@ -2583,7 +2003,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     if (g_animBtnStagingMem != VK_NULL_HANDLE) vkFreeMemory(vkDevice, g_animBtnStagingMem, nullptr);
     if (g_animBtnReady) CleanupHudRenderer(g_animBtnHud);
 
-    // App-owned animation-button swapchain: destroy before CleanupOpenXR tears
+    // App-owned speech-bubble swapchain: destroy before CleanupOpenXR tears
     // the session down (used to live in the vendored XrSessionManager cleanup).
     if (g_animBtnSwapchain.swapchain != XR_NULL_HANDLE) {
         xrDestroySwapchain(g_animBtnSwapchain.swapchain);
