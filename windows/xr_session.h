@@ -12,6 +12,10 @@
 #define XR_USE_GRAPHICS_API_VULKAN
 #include "xr_session_common.h"
 
+// True when the runtime advertises XR_EXT_local_3d_zone (set in InitializeOpenXR).
+// Gates the avatar's 2D speech-bubble Local2D layer.
+extern bool g_hasLocal3DZone;
+
 // Initialize OpenXR instance with Vulkan + win32_window_binding extensions
 bool InitializeOpenXR(XrSessionManager& xr);
 

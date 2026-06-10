@@ -7,7 +7,13 @@
 
 #include "xr_session.h"
 #include "logging.h"
+#include <openxr/XR_EXT_local_3d_zone.h>  // Local2D speech-bubble layer
 #include <cstring>
+
+// App-side availability flag (XrSessionManager carries no app-named fields).
+// True when the runtime advertises XR_EXT_local_3d_zone, which the avatar uses
+// to composite the 2D speech bubble as a mask-gated post-weave layer.
+bool g_hasLocal3DZone = false;
 
 #define XR_CHECK(call) \
     do { \
@@ -56,6 +62,9 @@ bool InitializeOpenXR(XrSessionManager& xr) {
         if (strcmp(ext.extensionName, XR_EXT_ATLAS_CAPTURE_EXTENSION_NAME) == 0) {
             xr.hasAtlasCaptureExt = true;
         }
+        if (strcmp(ext.extensionName, XR_EXT_LOCAL_3D_ZONE_EXTENSION_NAME) == 0) {
+            g_hasLocal3DZone = true;
+        }
     }
 
     LOG_INFO("XR_KHR_vulkan_enable: %s", hasVulkan ? "AVAILABLE" : "NOT FOUND");
@@ -63,6 +72,7 @@ bool InitializeOpenXR(XrSessionManager& xr) {
     LOG_INFO("XR_EXT_display_info: %s", xr.hasDisplayInfoExt ? "AVAILABLE" : "NOT FOUND");
     LOG_INFO("XR_EXT_workspace_file_dialog: %s", xr.hasFileDialogExt ? "AVAILABLE" : "NOT FOUND");
     LOG_INFO("XR_EXT_atlas_capture: %s", xr.hasAtlasCaptureExt ? "AVAILABLE" : "NOT FOUND");
+    LOG_INFO("XR_EXT_local_3d_zone: %s", g_hasLocal3DZone ? "AVAILABLE" : "NOT FOUND");
 
     if (!hasVulkan) {
         LOG_ERROR("XR_KHR_vulkan_enable extension not available");
@@ -82,6 +92,9 @@ bool InitializeOpenXR(XrSessionManager& xr) {
     }
     if (xr.hasAtlasCaptureExt) {
         enabledExtensions.push_back(XR_EXT_ATLAS_CAPTURE_EXTENSION_NAME);
+    }
+    if (g_hasLocal3DZone) {
+        enabledExtensions.push_back(XR_EXT_LOCAL_3D_ZONE_EXTENSION_NAME);
     }
 
     XrInstanceCreateInfo createInfo = {XR_TYPE_INSTANCE_CREATE_INFO};
