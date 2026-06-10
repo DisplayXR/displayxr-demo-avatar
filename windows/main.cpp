@@ -134,11 +134,13 @@ static std::mutex g_pendingLoadPathMutex;
 // of the swapchain to a PNG in %USERPROFILE%\Pictures\DisplayXR\. Skipped for
 // 1×1 (mono) layouts. Helper lives in test_apps/common/atlas_capture*.
 static std::atomic<bool> g_captureAtlasRequested{false};
-// Ctrl+T: opaque ⇄ transparent background. Always-on session-level
-// transparency is wired at xrCreateSession; this flag only flips the
-// renderer's output alpha (1 → 1-T) so background-uncovered pixels
-// punch through to the desktop.
-static std::atomic<bool> g_transparentBg{false};
+// Transparent background. The avatar app is transparent by DEFAULT — the whole
+// point is a character floating over the desktop. Always-on session-level
+// transparency is wired at xrCreateSession; this flag flips the renderer's
+// output alpha (1 → 1-T) so background-uncovered pixels punch through to the
+// desktop, and (when set) enables per-eye foreground clipping at the display
+// plane. Ctrl+T still toggles it for debugging the opaque path.
+static std::atomic<bool> g_transparentBg{true};
 static std::string g_loadedFileName;
 static std::mutex g_sceneMutex;
 // True when the loaded model has animation clips — gates the animation button
@@ -271,6 +273,41 @@ static void ToggleFullscreen(HWND hwnd) {
         g_fullscreen = true;
         LOG_INFO("Entered fullscreen mode");
     }
+}
+
+// Borderless ⇄ decorated toggle (B key). The avatar floats chrome-free
+// (WS_POPUP) by default so nothing but the character is visible over the
+// desktop. Toggling decoration on (WS_OVERLAPPEDWINDOW) restores the title bar
+// + sizing border so the user can drag/resize the window with the OS, then
+// toggle back to borderless — this replaces the Unity build's in-app
+// Ctrl+Shift+L virtual-window editor. The client rect is preserved across the
+// toggle (AdjustWindowRect compensates for the added/removed non-client frame)
+// so the avatar doesn't jump or rescale.
+static bool g_decorated = false;  // false = borderless (default)
+
+static void ToggleDecoration(HWND hwnd) {
+    if (g_fullscreen) return;  // decoration is meaningless in fullscreen
+
+    // Current client rect in screen space — what we want to keep fixed.
+    RECT client = {};
+    GetClientRect(hwnd, &client);
+    POINT topLeft = { client.left, client.top };
+    ClientToScreen(hwnd, &topLeft);
+    const int clientW = client.right - client.left;
+    const int clientH = client.bottom - client.top;
+
+    g_decorated = !g_decorated;
+    const DWORD style = (g_decorated ? WS_OVERLAPPEDWINDOW : WS_POPUP) | WS_VISIBLE;
+    SetWindowLong(hwnd, GWL_STYLE, style);
+
+    // Expand the desired client rect by the new frame so the client area stays
+    // put at the same screen position and size.
+    RECT want = { topLeft.x, topLeft.y, topLeft.x + clientW, topLeft.y + clientH };
+    AdjustWindowRect(&want, style, FALSE);
+    SetWindowPos(hwnd, HWND_TOP, want.left, want.top,
+        want.right - want.left, want.bottom - want.top,
+        SWP_FRAMECHANGED | SWP_NOZORDER);
+    LOG_INFO("Window decoration: %s (B)", g_decorated ? "ON (move/resize)" : "OFF (borderless)");
 }
 
 static bool PointInFractionRect(int mouseX, int mouseY, int windowW, int windowH,
@@ -512,6 +549,11 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             ToggleFullscreen(hwnd);
             return 0;
         }
+        // B key = toggle window decoration (borderless ⇄ title bar for move/resize)
+        if (wParam == 'B') {
+            ToggleDecoration(hwnd);
+            return 0;
+        }
         // L key = load shortcut
         if (wParam == 'L') {
             PostMessage(hwnd, WM_USER + 1, 0, 0);
@@ -568,13 +610,26 @@ static HWND CreateAppWindow(HINSTANCE hInstance, int width, int height) {
         }
     }
 
-    RECT rect = { 0, 0, width, height };
-    AdjustWindowRect(&rect, WS_OVERLAPPEDWINDOW, FALSE);
+    // Borderless by default (WS_POPUP): the avatar floats chrome-free over the
+    // desktop. The B key toggles decoration back on for move/resize. Center the
+    // client rect on the primary monitor so the borderless window isn't stranded
+    // at (0,0) with no title bar to grab.
+    int posX = CW_USEDEFAULT, posY = CW_USEDEFAULT;
+    {
+        HMONITOR hMon = MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
+        MONITORINFO mi = { sizeof(mi) };
+        if (GetMonitorInfo(hMon, &mi)) {
+            const int monW = mi.rcWork.right - mi.rcWork.left;
+            const int monH = mi.rcWork.bottom - mi.rcWork.top;
+            posX = mi.rcWork.left + (monW - width) / 2;
+            posY = mi.rcWork.top + (monH - height) / 2;
+        }
+    }
 
     HWND hwnd = CreateWindowEx(WS_EX_NOREDIRECTIONBITMAP, WINDOW_CLASS, WINDOW_TITLE,
-        WS_OVERLAPPEDWINDOW,
-        CW_USEDEFAULT, CW_USEDEFAULT,
-        rect.right - rect.left, rect.bottom - rect.top,
+        WS_POPUP | WS_VISIBLE,
+        posX, posY,
+        width, height,
         nullptr, nullptr, hInstance, nullptr);
 
     if (!hwnd) {
@@ -1715,7 +1770,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         MessageBox(nullptr, L"Failed to initialize logging", L"Warning", MB_OK | MB_ICONWARNING);
     }
 
-    LOG_INFO("=== DisplayXR 3D Model Viewer (Vulkan) ===");
+    LOG_INFO("=== DisplayXR 3D Avatar (Vulkan) ===");
 
     HWND hwnd = CreateAppWindow(hInstance, g_windowWidth, g_windowHeight);
     if (!hwnd) {
