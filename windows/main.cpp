@@ -34,6 +34,8 @@
 #include "hud_renderer.h"
 #include "text_overlay.h"
 #include "atlas_capture.h"
+#include <dwrite.h>
+#pragma comment(lib, "dwrite.lib")
 
 #include <atomic>
 #include <algorithm>
@@ -98,6 +100,66 @@ static inline float AnimBtnXFraction() {
 static const uint32_t BTN_BAR_TEX_W = 1280;
 static const uint32_t BTN_BAR_TEX_H = 216;   // full top-30% band aspect (1280:216 ≈ 1280×0.30·720)
 static const uint32_t BTN_BAR_FONT_BASE = 1300;
+
+// Speech-bubble text + auto-fit layout (computed once for the fixed bubble
+// texture). The greeting wraps across several balanced lines at the LARGEST
+// font that fits the available area.
+static const std::wstring g_bubbleText =
+    L"Hi there! I'm Leo, your friendly 3D desktop avatar.";
+static float    g_pillX = 0, g_pillY = 0, g_pillW = 0, g_pillH = 0;  // pill rect, texture px
+static uint32_t g_bubbleFontBase = BTN_BAR_FONT_BASE;                // computed at bubble init
+
+// Largest Consolas font (px) whose word-wrapped `text` fits within maxW×maxH,
+// then the smallest wrap width that still yields that many lines (balanced).
+// Returns the font px; fills outWrapW/outTextH with the balanced text extents.
+static float ComputeBubbleFit(const std::wstring& text, float maxW, float maxH,
+                              float& outWrapW, float& outTextH) {
+    outWrapW = maxW; outTextH = maxH;
+    Microsoft::WRL::ComPtr<IDWriteFactory> dw;
+    if (FAILED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory),
+            reinterpret_cast<IUnknown**>(dw.GetAddressOf())))) return maxH * 0.5f;
+
+    auto measure = [&](float fontPx, float wrapW, uint32_t& lines, float& w, float& h) -> bool {
+        Microsoft::WRL::ComPtr<IDWriteTextFormat> fmt;
+        if (FAILED(dw->CreateTextFormat(L"Consolas", nullptr, DWRITE_FONT_WEIGHT_NORMAL,
+                DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, fontPx, L"en-us", &fmt)))
+            return false;
+        fmt->SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
+        Microsoft::WRL::ComPtr<IDWriteTextLayout> layout;
+        if (FAILED(dw->CreateTextLayout(text.c_str(), (UINT32)text.size(), fmt.Get(),
+                wrapW, 100000.0f, &layout))) return false;
+        DWRITE_TEXT_METRICS m = {};
+        layout->GetMetrics(&m);
+        lines = m.lineCount;
+        w = m.widthIncludingTrailingWhitespace;
+        h = m.height;
+        return true;
+    };
+
+    // (1) Largest font that fits maxW × maxH (greedy wrap at maxW).
+    float lo = 6.0f, hi = maxH, best = lo; uint32_t bestLines = 1;
+    for (int i = 0; i < 22; ++i) {
+        float mid = 0.5f * (lo + hi);
+        uint32_t lines; float w, h;
+        if (measure(mid, maxW, lines, w, h) && h <= maxH && w <= maxW) {
+            best = mid; bestLines = lines; lo = mid;
+        } else hi = mid;
+    }
+
+    // (2) Balance: smallest wrap width that still yields `bestLines` lines.
+    float wlo = 1.0f, whi = maxW, balW = maxW;
+    for (int i = 0; i < 22; ++i) {
+        float midW = 0.5f * (wlo + whi);
+        uint32_t lines; float w, h;
+        if (measure(best, midW, lines, w, h) && lines <= bestLines && w <= midW + 1.0f && h <= maxH) {
+            balW = midW; whi = midW;
+        } else wlo = midW;
+    }
+    uint32_t lines; float w, h;
+    if (measure(best, balW, lines, w, h)) { outWrapW = w; outTextH = h; }
+    else { outWrapW = balW; outTextH = maxH; }
+    return best;
+}
 static const float    BTN_BAR_Y_FRACTION = 0.008f;
 static inline float BtnBarHeightFraction(uint32_t windowW, uint32_t windowH) {
     if (windowW == 0 || windowH == 0) return 0.05f;
@@ -553,7 +615,11 @@ static void UpdateClickRegion(HWND hwnd) {
         const int cw = g_silCoverage.covW, ch = g_silCoverage.covH;
         winW = g_silCoverage.winW; winH = g_silCoverage.winH;
         // One client-space RECT per horizontal run of covered coverage-pixels.
-        for (int y = 0; y < ch; ++y) {
+        // Skip the top 30%: the avatar is confined to the bottom 70%, and the
+        // top-30% silhouette pixels are stale/untouched (the bubble rect is added
+        // to the region separately below).
+        const int yStart = (ch * 3) / 10;
+        for (int y = yStart; y < ch; ++y) {
             int x = 0;
             while (x < cw) {
                 if (!g_silCoverage.bits[(size_t)y * cw + x]) { ++x; continue; }
@@ -1918,6 +1984,10 @@ static void RenderThreadFunc(
                 //    machinery (own swapchain / text renderer / staging) widened
                 //    to a bar — see runtime issue #389. ──
                 XrCompositionLayerLocal2DEXT bubbleLayer = {(XrStructureType)XR_TYPE_COMPOSITION_LAYER_LOCAL_2D_EXT};
+                // Transparent backer spanning the FULL top 30%: extends the implicit
+                // mask (M=0) across the whole band so the untouched top-30% weave is
+                // hidden even when the visible bubble is letterboxed (aspect-preserved).
+                XrCompositionLayerLocal2DEXT bubbleBgLayer = {(XrStructureType)XR_TYPE_COMPOSITION_LAYER_LOCAL_2D_EXT};
                 bool bubbleReady = false;
                 if (g_animBtnReady && g_hasAnimBtnSwapchain && g_hasLocal3DZone) {
                     // One centred "speech bubble" pill filling the bubble texture.
@@ -1927,11 +1997,9 @@ static void RenderThreadFunc(
                     std::vector<HudButton> barButtons;
                     {
                         HudButton b;
-                        b.label = L"Hi there! I'm Leo, your friendly 3D desktop avatar.";
-                        b.x = (float)BTN_BAR_TEX_W * 0.04f;
-                        b.y = (float)BTN_BAR_TEX_H * 0.12f;
-                        b.width  = (float)BTN_BAR_TEX_W * 0.92f;
-                        b.height = (float)BTN_BAR_TEX_H * 0.76f;
+                        b.label = g_bubbleText;          // auto-fit, balanced, wrapped
+                        b.x = g_pillX;  b.y = g_pillY;
+                        b.width = g_pillW;  b.height = g_pillH;
                         b.hovered = false;
                         barButtons.push_back(b);
                     }
@@ -1995,10 +2063,17 @@ static void RenderThreadFunc(
                         // mask of M=0 inside this rect (flat, crisp 2D) and M=1
                         // elsewhere (the avatar keeps weaving) — exactly the 2D/3D
                         // split we want.
-                        const int bubW = windowW;
-                        const int bubH = (int)(windowH * 0.30f);
-                        const int bubX = 0;
-                        const int bubY = 0;
+                        // Letterbox the visible bubble inside the top-30% band so it
+                        // PRESERVES the texture aspect (no stretch on a non-proportional
+                        // resize). On a proportional resize the band aspect equals the
+                        // texture aspect, so it fills the full width. Centred in the band.
+                        const float texAR = (float)BTN_BAR_TEX_W / (float)BTN_BAR_TEX_H;
+                        const int bandH = (int)(windowH * 0.30f);
+                        int bubW = (int)(bandH * texAR);
+                        int bubH = bandH;
+                        if (bubW > windowW) { bubW = windowW; bubH = (int)((float)windowW / texAR); }
+                        const int bubX = (windowW - bubW) / 2;
+                        const int bubY = (bandH - bubH) / 2;
                         bubbleLayer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
                         bubbleLayer.subImage.swapchain = g_animBtnSwapchain.swapchain;
                         bubbleLayer.subImage.imageRect.offset = {0, 0};
@@ -2006,8 +2081,21 @@ static void RenderThreadFunc(
                         bubbleLayer.subImage.imageArrayIndex = 0;
                         bubbleLayer.rect.offset = {bubX, bubY};
                         bubbleLayer.rect.extent = {bubW, bubH};
+
+                        // Transparent backer: sample a transparent corner of the bubble
+                        // texture (outside the pill → alpha 0) and stretch it across the
+                        // full top 30% so M=0 covers the whole band.
+                        bubbleBgLayer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+                        bubbleBgLayer.subImage.swapchain = g_animBtnSwapchain.swapchain;
+                        bubbleBgLayer.subImage.imageRect.offset = {0, 0};
+                        bubbleBgLayer.subImage.imageRect.extent = {2, 2};
+                        bubbleBgLayer.subImage.imageArrayIndex = 0;
+                        bubbleBgLayer.rect.offset = {0, 0};
+                        bubbleBgLayer.rect.extent = {(int32_t)windowW, bandH};
+
                         bubbleReady = true;
-                        // Publish the rect so the click region keeps the bubble.
+                        // Publish the VISIBLE bubble rect so the click region keeps the
+                        // bubble (the transparent margins stay click-through).
                         std::lock_guard<std::mutex> bl(g_bubbleMtx);
                         g_bubbleRect = {bubX, bubY, bubX + bubW, bubY + bubH};
                         g_bubbleVisible = true;
@@ -2030,11 +2118,15 @@ static void RenderThreadFunc(
                     proj.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
                     proj.viewCount = submitViewCount;
                     proj.views = projectionViews;
-                    const XrCompositionLayerBaseHeader* layers[2];
+                    const XrCompositionLayerBaseHeader* layers[3];
                     uint32_t layerN = 0;
                     layers[layerN++] = (const XrCompositionLayerBaseHeader*)&proj;
-                    if (bubbleReady)
+                    if (bubbleReady) {
+                        // Background (full-band transparent) first, then the bubble on
+                        // top — Local2D layers flatten in list order.
+                        layers[layerN++] = (const XrCompositionLayerBaseHeader*)&bubbleBgLayer;
                         layers[layerN++] = (const XrCompositionLayerBaseHeader*)&bubbleLayer;
+                    }
                     XrFrameEndInfo endInfo = {XR_TYPE_FRAME_END_INFO};
                     endInfo.displayTime = frameState.predictedDisplayTime;
                     endInfo.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND;
@@ -2363,7 +2455,22 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     // g_animBtnSwapchain / g_animBtn* slots (named before the buttons were
     // unified into a bar). Only when window-space layers are available.
     if (hudOk && xr.hasHudSwapchain) {
-        if (InitializeHudRenderer(g_animBtnHud, BTN_BAR_TEX_W, BTN_BAR_TEX_H, BTN_BAR_FONT_BASE) &&
+        // Auto-fit the greeting: largest balanced multi-line layout that fits the
+        // available area of the (fixed) bubble texture; derive the snug pill rect.
+        {
+            const float availW = (float)BTN_BAR_TEX_W * 0.90f;
+            const float availH = (float)BTN_BAR_TEX_H * 0.80f;
+            float wrapW = availW, textH = availH;
+            const float fontPx = ComputeBubbleFit(g_bubbleText, availW, availH, wrapW, textH);
+            g_bubbleFontBase = (uint32_t)(fontPx * 470.0f / 15.0f);
+            const float pad = fontPx * 0.55f;
+            g_pillW = wrapW + 2.0f * pad; if (g_pillW > (float)BTN_BAR_TEX_W) g_pillW = (float)BTN_BAR_TEX_W;
+            g_pillH = textH + 1.2f * pad; if (g_pillH > (float)BTN_BAR_TEX_H) g_pillH = (float)BTN_BAR_TEX_H;
+            g_pillX = ((float)BTN_BAR_TEX_W - g_pillW) * 0.5f;
+            g_pillY = ((float)BTN_BAR_TEX_H - g_pillH) * 0.5f;
+            LOG_INFO("Bubble auto-fit: font=%.1fpx base=%u pill=%.0fx%.0f", fontPx, g_bubbleFontBase, g_pillW, g_pillH);
+        }
+        if (InitializeHudRenderer(g_animBtnHud, BTN_BAR_TEX_W, BTN_BAR_TEX_H, g_bubbleFontBase) &&
             CreateWindowSpaceSwapchain(xr, g_animBtnSwapchain, BTN_BAR_TEX_W, BTN_BAR_TEX_H)) {
             g_hasAnimBtnSwapchain = true;
             uint32_t c = g_animBtnSwapchain.imageCount;
