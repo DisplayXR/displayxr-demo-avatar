@@ -896,26 +896,27 @@ static void RenderThreadFunc(
             g_inputState.animationActive = inputSnapshot.animationActive;
             if (resetRequested) {
                 g_inputState.viewParams = inputSnapshot.viewParams;
-                // Auto-orbit always on; reset only clears the in-flight
-                // transition. The shared UpdateCameraMovement may set
-                // animateEnabled=false on Space — re-assert true here.
-                g_inputState.animateEnabled = true;
+                // Auto-orbit stays OFF: the avatar's heading is driven by the
+                // face-the-viewer billboard, not idle orbit.
+                g_inputState.animateEnabled = false;
                 g_inputState.transitioning = false;
             }
         }
 
-        // Bind the virtual-display rig to a moving/skinned subject: center the
-        // convergence plane on the smoothed skeleton centroid so the subject
-        // stays framed and at the ZDP as it animates. Position-only — yaw/pitch
-        // (orbit) and vHeight (zoom) stay user-driven. No-op for static models
-        // (getAnimatedAnchor returns false). Applied to inputSnapshot only, so
-        // g_inputState keeps the user's intended pose for when no model is bound.
+        // Bind the virtual-display rig to a moving/skinned subject — but only in
+        // X/Y. We center the avatar horizontally/vertically on the smoothed
+        // skeleton centroid (so A/D/Q/E strafe and the animation's own drift
+        // don't slide it off-screen), while leaving Z under the user's control.
+        // That makes W/S the single depth lever: it dollies the avatar toward /
+        // away from the viewer THROUGH the display-plane clip (foreground-only),
+        // which is exactly the avatar UX (only W/S, clip at the screen plane).
+        // Applied to inputSnapshot only, so g_inputState keeps the full pose.
         {
             float anchor[3];
             if (g_fitValid.load() && g_modelRenderer.getAnimatedAnchor(anchor)) {
                 inputSnapshot.cameraPosX = anchor[0];
                 inputSnapshot.cameraPosY = anchor[1];
-                inputSnapshot.cameraPosZ = anchor[2];
+                // cameraPosZ intentionally left as the user's W/S-driven value.
             }
         }
 
@@ -1087,6 +1088,55 @@ static void RenderThreadFunc(
                                     e.y = -e.y;
                                     rawEyes[i] = e;
                                 }
+                            }
+
+                            // ── Face-the-viewer billboard (yaw + pitch) ────────
+                            // Aim the avatar's forward axis along the line from the
+                            // tiger to the viewer's head. rawEyes is the window-
+                            // relative head position (it already has the eye minus
+                            // the window-centre offset), so the heading updates BOTH
+                            // as the viewer moves their head (eye tracking changes
+                            // rawViews) AND as the window moves (the Kooima eyeOffset
+                            // changes). Computed in the renderer's frame; the SIGN
+                            // constants absorb the renderer Y-mirror — FACE_YAW_SIGN
+                            // is validated (the viewer confirmed -1 turns the right
+                            // way); FACE_PITCH_SIGN is the analogous vertical flip.
+                            {
+                                static constexpr float FACE_YAW_SIGN   = -1.0f;
+                                static constexpr float FACE_PITCH_SIGN =  1.0f;  // viewer-confirmed
+                                float hx, hy, hz;
+                                if (eyeCount <= 1) {
+                                    hx = rawEyes[0].x; hy = rawEyes[0].y; hz = rawEyes[0].z;
+                                } else {
+                                    hx = (rawEyes[0].x + rawEyes[1].x) * 0.5f;
+                                    hy = (rawEyes[0].y + rawEyes[1].y) * 0.5f;
+                                    hz = (rawEyes[0].z + rawEyes[1].z) * 0.5f;
+                                }
+                                // hz ≈ viewer distance in front of the display (~0.6 m).
+                                const float hzAbs = fabsf(hz) > 1e-3f ? fabsf(hz) : 1e-3f;
+                                const float horiz = sqrtf(hx * hx + hzAbs * hzAbs);
+                                float targetYaw   = FACE_YAW_SIGN   * atan2f(hx, hzAbs);
+                                float targetPitch = FACE_PITCH_SIGN * atan2f(hy, horiz);
+                                // Exponential, shortest-angle smoothing to damp eye-
+                                // tracking jitter (~0.18/frame settle).
+                                static float s_faceYaw = 0.0f, s_facePitch = 0.0f;
+                                static bool  s_faceInit = false;
+                                if (!s_faceInit) { s_faceYaw = targetYaw; s_facePitch = targetPitch; s_faceInit = true; }
+                                float dy = targetYaw - s_faceYaw;
+                                while (dy >  3.14159265f) dy -= 6.28318531f;
+                                while (dy < -3.14159265f) dy += 6.28318531f;
+                                s_faceYaw   += dy * 0.18f;
+                                s_facePitch += (targetPitch - s_facePitch) * 0.18f;
+                                // Override the render heading; auto-orbit + manual LMB
+                                // are superseded by the face-the-viewer behaviour.
+                                // displayPose below consumes inputSnapshot.yaw and the
+                                // renderPitch local directly.
+                                inputSnapshot.yaw = s_faceYaw;
+                                // Pitch look-at disabled by request — yaw-only billboard
+                                // (the avatar stays upright). FACE_PITCH_SIGN above is the
+                                // viewer-confirmed sign; re-enable by uncommenting:
+                                // renderPitch    = s_facePitch;
+                                (void)s_facePitch;
                             }
 
                             Display3DTunables tunables;
@@ -2083,7 +2133,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     // xrRequestDisplayRenderingModeEXT(1); the runtime event drives xr.currentModeIndex.
     g_inputState.absoluteRenderingModeRequested = 1;
     g_inputState.hudVisible = false;     // hidden by default; toggle with Tab
-    g_inputState.animateEnabled = true;  // auto-orbit always on after 10 s idle
+    g_inputState.animateEnabled = false; // no auto-orbit — avatar faces the viewer
     {
         using namespace std::chrono;
         g_inputState.lastInputTimeSec = (double)duration_cast<microseconds>(
