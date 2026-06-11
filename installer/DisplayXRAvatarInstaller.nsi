@@ -1,11 +1,11 @@
-; DisplayXR Model Viewer Demo — Windows Installer
+; DisplayXR 3D Avatar Demo — Windows Installer
 ; Copyright 2026, DisplayXR
 ; SPDX-License-Identifier: BSL-1.0
 ;
-; Build: makensis /DVERSION=1.2.0 /DBIN_DIR=<demo-build-dir> /DSOURCE_DIR=<demo-repo-root> /DOUTPUT_DIR=<output-dir> DisplayXRModelViewerInstaller.nsi
+; Build: makensis /DVERSION=1.2.0 /DBIN_DIR=<demo-build-dir> /DSOURCE_DIR=<demo-repo-root> /DOUTPUT_DIR=<output-dir> DisplayXRAvatarInstaller.nsi
 ;
 ; Hard-prereqs the DisplayXR runtime (HKLM\Software\DisplayXR\Runtime\InstallPath).
-; Installs the demo exe + bundled scene to Program Files\DisplayXR\Demos\ModelViewer\.
+; Installs the demo exe + bundled avatar to Program Files\DisplayXR\Demos\Avatar\.
 ; Drops a registered-mode app manifest + icons under %ProgramData%\DisplayXR\apps\
 ; so the DisplayXR Shell launcher discovers the tile (system-wide, since the
 ; installer runs elevated). See docs/specs/displayxr-app-manifest.md.
@@ -36,10 +36,10 @@
 ;--------------------------------
 ; General
 
-Name "DisplayXR Model Viewer Demo ${VERSION}"
-OutFile "${OUTPUT_DIR}\DisplayXRModelViewerSetup-${VERSION}.exe"
-InstallDir "$PROGRAMFILES64\DisplayXR\Demos\ModelViewer"
-InstallDirRegKey HKLM "Software\DisplayXR\Demos\ModelViewer" "InstallPath"
+Name "DisplayXR 3D Avatar Demo ${VERSION}"
+OutFile "${OUTPUT_DIR}\DisplayXRAvatarSetup-${VERSION}.exe"
+InstallDir "$PROGRAMFILES64\DisplayXR\Demos\Avatar"
+InstallDirRegKey HKLM "Software\DisplayXR\Demos\Avatar" "InstallPath"
 RequestExecutionLevel admin
 ShowInstDetails show
 ShowUninstDetails show
@@ -51,19 +51,21 @@ ShowUninstDetails show
 !include "WordFunc.nsh"
 !insertmacro VersionCompare
 
-; Minimum runtime version. Bumped to 1.3.0 with the Ctrl+T transparent-bg
-; toggle: the demo now creates the HWND with WS_EX_NOREDIRECTIONBITMAP and the
-; session with transparentBackgroundEnabled=XR_TRUE unconditionally, which
-; only render correctly against runtime ≥ 1.3.0's VK→D3D11 KMT-shared-texture
-; / DComp bridge (PR #215). Older runtimes produce a broken/black window.
-!define MIN_RUNTIME_VERSION "1.3.0"
+; Minimum runtime version. The avatar floats transparent over the desktop: it
+; creates the HWND with WS_EX_NOREDIRECTIONBITMAP and the session with
+; transparentBackgroundEnabled=XR_TRUE unconditionally, which only render
+; correctly against runtime >= 1.9.1's VK->D3D11 KMT-shared-texture / DComp
+; bridge + in-place resize. Older runtimes produce a broken/black window. The
+; speech bubble additionally uses XR_EXT_local_3d_zone (Local2D) but degrades
+; gracefully (no bubble) when the runtime doesn't advertise it.
+!define MIN_RUNTIME_VERSION "1.9.1"
 
 ;--------------------------------
 ; UI
 
 !define MUI_ABORTWARNING
-!define MUI_WELCOMEPAGE_TITLE "DisplayXR Model Viewer Demo Setup"
-!define MUI_WELCOMEPAGE_TEXT "This will install the Model Viewer reference demo for the DisplayXR runtime.$\r$\n$\r$\nThe DisplayXR runtime must be installed first."
+!define MUI_WELCOMEPAGE_TITLE "DisplayXR 3D Avatar Demo Setup"
+!define MUI_WELCOMEPAGE_TEXT "This will install the 3D Avatar demo for the DisplayXR runtime.$\r$\n$\r$\nThe DisplayXR runtime must be installed first."
 
 !insertmacro MUI_PAGE_WELCOME
 !insertmacro MUI_PAGE_DIRECTORY
@@ -98,9 +100,9 @@ Function .onInit
     ${EndIf}
 
     ; Enforce the minimum runtime version for the Vulkan transparent-window
-    ; bridge (PR #215) this demo relies on. The Leia SR Vulkan weaver DLL is
-    ; the Leia plug-in's concern (it ships + loads SimulatedRealityVulkanBeta.dll
-    ; itself) — the demo neither bundles nor depends on it being on PATH.
+    ; bridge this demo relies on. The Leia SR Vulkan weaver DLL is the Leia
+    ; plug-in's concern (it ships + loads SimulatedRealityVulkanBeta.dll itself)
+    ; — the demo neither bundles nor depends on it being on PATH.
     ${VersionCompare} "$1" "${MIN_RUNTIME_VERSION}" $2
     ${If} $2 == 2
         MessageBox MB_ICONSTOP "DisplayXR runtime $1 is too old.$\r$\n$\r$\nThis demo requires runtime ${MIN_RUNTIME_VERSION} or later.$\r$\n$\r$\nUpdate from:$\r$\nhttps://github.com/DisplayXR/displayxr-runtime/releases"
@@ -111,7 +113,7 @@ FunctionEnd
 ;--------------------------------
 ; Install
 
-Section "Model Viewer Demo" SecDemo
+Section "3D Avatar Demo" SecDemo
     SectionIn RO
 
     ; Match the runtime installer's 64-bit registry view so HKLM keys land
@@ -122,18 +124,20 @@ Section "Model Viewer Demo" SecDemo
     SetShellVarContext all
 
     ; Kill any running instance so we can overwrite the exe.
-    nsExec::ExecToLog 'taskkill /f /im model_viewer_handle_vk_win.exe'
+    nsExec::ExecToLog 'taskkill /f /im avatar_handle_vk_win.exe'
     Pop $0
 
     SetOutPath "$INSTDIR"
-    File "${BIN_DIR}\model_viewer_handle_vk_win.exe"
-    File "${BIN_DIR}\sample.glb"
+    File "${BIN_DIR}\avatar_handle_vk_win.exe"
+    ; Bundled avatar — the FBX references its texture by basename, so ship both.
+    File "${BIN_DIR}\avatar.fbx"
+    File "${BIN_DIR}\rgb.jpg"
 
     ; OpenXR loader — an OpenXR app must carry its own openxr_loader.dll next
     ; to the exe. The runtime ships a copy in its install dir, but that dir is
     ; intentionally not on PATH and is not part of an app's DLL search order
     ; (app exe dir → System32 → cwd → PATH), so a demo installed under
-    ; Demos\ModelViewer\ can't find it there. Without this the demo fails to
+    ; Demos\Avatar\ can't find it there. Without this the demo fails to
     ; launch with "openxr_loader.dll not found". The Windows build stages it
     ; next to the exe (windows/CMakeLists.txt POST_BUILD + the CI loader-stage
     ; step), mirroring the macOS bundle which already ships libopenxr_loader.
@@ -151,72 +155,73 @@ Section "Model Viewer Demo" SecDemo
     ; Per-app icon names — the apps dir is shared by all registered demos, so
     ; generic icon.png/icon_sbs.png would collide (e.g. with the gaussiansplat
     ; demo). Keep these prefixed and unique.
-    File "${SOURCE_DIR}\windows\displayxr\model_viewer_icon.png"
-    File "${SOURCE_DIR}\windows\displayxr\model_viewer_icon_sbs.png"
+    File "${SOURCE_DIR}\windows\displayxr\avatar_icon.png"
+    File "${SOURCE_DIR}\windows\displayxr\avatar_icon_sbs.png"
 
     ; Generate the manifest with an absolute exe_path pointing at the
     ; install dir we just populated. We can't reuse the in-tree sidecar
     ; (which omits exe_path) because that's sidecar-mode; here we need
     ; registered-mode.
-    FileOpen $0 "$APPDATA\DisplayXR\apps\model_viewer.displayxr.json" w
+    FileOpen $0 "$APPDATA\DisplayXR\apps\avatar.displayxr.json" w
     FileWrite $0 '{$\r$\n'
     FileWrite $0 '  "schema_version": 1,$\r$\n'
-    FileWrite $0 '  "name": "3D Model Viewer",$\r$\n'
+    FileWrite $0 '  "id": "avatar",$\r$\n'
+    FileWrite $0 '  "name": "3D Avatar",$\r$\n'
     FileWrite $0 '  "type": "3d",$\r$\n'
     FileWrite $0 '  "category": "demo",$\r$\n'
     FileWrite $0 '  "display_mode": "auto",$\r$\n'
-    FileWrite $0 '  "description": "Interactive PBR viewer for 3D models (.glb / .gltf). Drag-and-drop a model or press L to load. Bundled with a demo model.",$\r$\n'
-    FileWrite $0 '  "icon": "model_viewer_icon.png",$\r$\n'
-    FileWrite $0 '  "icon_3d": "model_viewer_icon_sbs.png",$\r$\n'
+    FileWrite $0 '  "description": "A transparent, click-through 3D avatar that floats over your desktop. The character is weaved in 3D with a flat 2D speech bubble above it; clicks pass through to whatever is behind.",$\r$\n'
+    FileWrite $0 '  "icon": "avatar_icon.png",$\r$\n'
+    FileWrite $0 '  "icon_3d": "avatar_icon_sbs.png",$\r$\n'
     FileWrite $0 '  "icon_3d_layout": "sbs-lr",$\r$\n'
     ; Use forward slashes in exe_path so the JSON parses with any strict
     ; library — the manifest spec accepts either separator and normalizes.
     ${WordReplace} "$INSTDIR" "\" "/" "+" $1
-    FileWrite $0 '  "exe_path": "$1/model_viewer_handle_vk_win.exe"$\r$\n'
+    FileWrite $0 '  "exe_path": "$1/avatar_handle_vk_win.exe"$\r$\n'
     FileWrite $0 '}$\r$\n'
     FileClose $0
 
     ; Registry breadcrumbs.
     SetRegView 64
-    WriteRegStr HKLM "Software\DisplayXR\Demos\ModelViewer" "InstallPath" "$INSTDIR"
-    WriteRegStr HKLM "Software\DisplayXR\Demos\ModelViewer" "Version" "${VERSION}"
+    WriteRegStr HKLM "Software\DisplayXR\Demos\Avatar" "InstallPath" "$INSTDIR"
+    WriteRegStr HKLM "Software\DisplayXR\Demos\Avatar" "Version" "${VERSION}"
 
     ; Add/Remove Programs entry.
     WriteUninstaller "$INSTDIR\Uninstall.exe"
-    WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\DisplayXRModelViewer" \
-        "DisplayName" "DisplayXR Model Viewer Demo"
-    WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\DisplayXRModelViewer" \
+    WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\DisplayXRAvatar" \
+        "DisplayName" "DisplayXR 3D Avatar Demo"
+    WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\DisplayXRAvatar" \
         "UninstallString" "$\"$INSTDIR\Uninstall.exe$\""
-    WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\DisplayXRModelViewer" \
+    WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\DisplayXRAvatar" \
         "QuietUninstallString" "$\"$INSTDIR\Uninstall.exe$\" /S"
-    WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\DisplayXRModelViewer" \
+    WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\DisplayXRAvatar" \
         "InstallLocation" "$INSTDIR"
-    WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\DisplayXRModelViewer" \
-        "DisplayIcon" "$INSTDIR\model_viewer_handle_vk_win.exe"
-    WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\DisplayXRModelViewer" \
+    WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\DisplayXRAvatar" \
+        "DisplayIcon" "$INSTDIR\avatar_handle_vk_win.exe"
+    WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\DisplayXRAvatar" \
         "Publisher" "DisplayXR"
-    WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\DisplayXRModelViewer" \
+    WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\DisplayXRAvatar" \
         "DisplayVersion" "${VERSION}"
-    WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\DisplayXRModelViewer" \
+    WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\DisplayXRAvatar" \
         "VersionMajor" ${VERSION_MAJOR}
-    WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\DisplayXRModelViewer" \
+    WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\DisplayXRAvatar" \
         "VersionMinor" ${VERSION_MINOR}
-    WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\DisplayXRModelViewer" \
+    WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\DisplayXRAvatar" \
         "NoModify" 1
-    WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\DisplayXRModelViewer" \
+    WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\DisplayXRAvatar" \
         "NoRepair" 1
     ${GetSize} "$INSTDIR" "/S=0K" $0 $1 $2
     IntFmt $0 "0x%08X" $0
-    WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\DisplayXRModelViewer" \
+    WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\DisplayXRAvatar" \
         "EstimatedSize" "$0"
 SectionEnd
 
 Section "Start Menu Shortcut" SecShortcut
     SetShellVarContext all
     CreateDirectory "$SMPROGRAMS\DisplayXR"
-    CreateShortCut "$SMPROGRAMS\DisplayXR\3D Model Viewer.lnk" \
-        "$INSTDIR\model_viewer_handle_vk_win.exe" "" \
-        "$INSTDIR\model_viewer_handle_vk_win.exe" 0
+    CreateShortCut "$SMPROGRAMS\DisplayXR\3D Avatar.lnk" \
+        "$INSTDIR\avatar_handle_vk_win.exe" "" \
+        "$INSTDIR\avatar_handle_vk_win.exe" 0
 SectionEnd
 
 ;--------------------------------
@@ -226,13 +231,13 @@ Section "Uninstall"
     SetRegView 64
     SetShellVarContext all
 
-    nsExec::ExecToLog 'taskkill /f /im model_viewer_handle_vk_win.exe'
+    nsExec::ExecToLog 'taskkill /f /im avatar_handle_vk_win.exe'
     Pop $0
 
     ; The DisplayXR Shell periodically scans %ProgramData%\DisplayXR\apps\
-    ; and may hold an open handle to model_viewer.displayxr.json, which
-    ; makes the Delete below silently fail (issue #10). Kill it first; the
-    ; user re-invokes the shell to get it back. Sleep 500 gives Windows a
+    ; and may hold an open handle to avatar.displayxr.json, which makes the
+    ; Delete below silently fail (issue #10). Kill it first; the user
+    ; re-invokes the shell to get it back. Sleep 500 gives Windows a
     ; moment to release the handle.
     DetailPrint "Stopping DisplayXR Shell to release manifest handles..."
     nsExec::ExecToLog 'taskkill /f /im displayxr-shell.exe'
@@ -242,36 +247,37 @@ Section "Uninstall"
     ; Remove the registered-mode manifest + icons.
     ; /REBOOTOK schedules deletion on next reboot if the file is still locked
     ; at uninstall time (belt-and-suspenders on top of the taskkill above).
-    Delete /REBOOTOK "$APPDATA\DisplayXR\apps\model_viewer.displayxr.json"
-    Delete /REBOOTOK "$APPDATA\DisplayXR\apps\model_viewer_icon.png"
-    Delete /REBOOTOK "$APPDATA\DisplayXR\apps\model_viewer_icon_sbs.png"
+    Delete /REBOOTOK "$APPDATA\DisplayXR\apps\avatar.displayxr.json"
+    Delete /REBOOTOK "$APPDATA\DisplayXR\apps\avatar_icon.png"
+    Delete /REBOOTOK "$APPDATA\DisplayXR\apps\avatar_icon_sbs.png"
     RMDir "$APPDATA\DisplayXR\apps"
 
     ; Remove install dir contents.
-    Delete "$INSTDIR\model_viewer_handle_vk_win.exe"
-    Delete "$INSTDIR\sample.glb"
+    Delete "$INSTDIR\avatar_handle_vk_win.exe"
+    Delete "$INSTDIR\avatar.fbx"
+    Delete "$INSTDIR\rgb.jpg"
     Delete "$INSTDIR\openxr_loader.dll"
     Delete "$INSTDIR\Uninstall.exe"
     RMDir "$INSTDIR"
     RMDir "$PROGRAMFILES64\DisplayXR\Demos"
 
     ; Start menu shortcut.
-    Delete "$SMPROGRAMS\DisplayXR\3D Model Viewer.lnk"
+    Delete "$SMPROGRAMS\DisplayXR\3D Avatar.lnk"
     ; Don't RMDir $SMPROGRAMS\DisplayXR — the runtime's own shortcuts may
     ; still live there.
 
-    DeleteRegKey HKLM "Software\DisplayXR\Demos\ModelViewer"
+    DeleteRegKey HKLM "Software\DisplayXR\Demos\Avatar"
     DeleteRegKey /ifempty HKLM "Software\DisplayXR\Demos"
-    DeleteRegKey HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\DisplayXRModelViewer"
+    DeleteRegKey HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\DisplayXRAvatar"
 SectionEnd
 
 ;--------------------------------
 ; Version metadata
 
 VIProductVersion "${VERSION_MAJOR}.${VERSION_MINOR}.${VERSION_PATCH}.0"
-VIAddVersionKey "ProductName" "DisplayXR Model Viewer Demo"
+VIAddVersionKey "ProductName" "DisplayXR 3D Avatar Demo"
 VIAddVersionKey "CompanyName" "DisplayXR"
 VIAddVersionKey "LegalCopyright" "Copyright (c) 2026 DisplayXR"
-VIAddVersionKey "FileDescription" "DisplayXR Model Viewer Demo Installer"
+VIAddVersionKey "FileDescription" "DisplayXR 3D Avatar Demo Installer"
 VIAddVersionKey "FileVersion" "${VERSION}"
 VIAddVersionKey "ProductVersion" "${VERSION}"

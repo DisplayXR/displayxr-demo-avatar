@@ -1,26 +1,17 @@
 name: Build macOS
 
-# macOS .pkg build. Mirrors the BuildInstaller job in displayxr-runtime's
-# build-macos.yml. The demo's release cadence is manual — devs build locally
-# and push a v* tag when ready; on a v* tag this workflow produces
-# `DisplayXRModelViewer-<version>.pkg` and attaches it to the GitHub Release.
+# macOS .pkg build — currently MANUAL-ONLY (workflow_dispatch).
 #
-# PR + push-to-main runs are validation only: they build the app + .pkg and
-# assert its payload to catch breakage before a release. The release-attach
-# step stays gated on a v* ref, so it only fires on tags.
-#
-# The DetectChanges job + docs_only step gating let this workflow be a required
-# status check (the "Build macOS" job always runs and reports success in ~30s
-# on doc-only PRs, skipping the heavy build) without blocking doc PRs. Mirrors
-# the sentinel pattern in displayxr-runtime + displayxr-leia-plugin.
+# The avatar shell's macOS (Cocoa/MoltenVK) port is still in progress: the
+# macos/ target + manifest are not yet retargeted from the modelviewer
+# scaffold, so this workflow would build a non-existent target and fail. To
+# keep the Windows-only v0.x releases green it does NOT run on push/PR/tags.
+# Re-enable the `pull_request` / `push` (branches+tags) triggers below once the
+# macOS port lands (and retarget the ModelViewer/.pkg names in this file +
+# macos/CMakeLists.txt + installer/macos/). The pattern mirrors the modelviewer
+# demo's build-macos.yml.
 
 on:
-  pull_request: {}
-  push:
-    branches:
-      - main
-    tags:
-      - 'v*'
   workflow_dispatch: {}
 
 concurrency:

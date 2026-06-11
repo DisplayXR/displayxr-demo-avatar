@@ -16,13 +16,13 @@ if "%VERSION_MAJOR%"=="" set "VERSION_MAJOR=1"
 if "%VERSION_MINOR%"=="" set "VERSION_MINOR=0"
 if "%VERSION_PATCH%"=="" set "VERSION_PATCH=0"
 
-if not exist "%BIN_DIR%\model_viewer_handle_vk_win.exe" (
-    echo ERROR: demo binary not found at %BIN_DIR%\model_viewer_handle_vk_win.exe
+if not exist "%BIN_DIR%\avatar_handle_vk_win.exe" (
+    echo ERROR: demo binary not found at %BIN_DIR%\avatar_handle_vk_win.exe
     echo Run scripts\build-with-deps.bat first.
     exit /b 1
 )
 
-"C:\Program Files (x86)\NSIS\makensis.exe" /DVERSION=%VERSION% /DVERSION_MAJOR=%VERSION_MAJOR% /DVERSION_MINOR=%VERSION_MINOR% /DVERSION_PATCH=%VERSION_PATCH% "/DBIN_DIR=%BIN_DIR%" "/DSOURCE_DIR=%REPO%" "/DOUTPUT_DIR=%OUT_DIR%" "%~dp0DisplayXRModelViewerInstaller.nsi" || exit /b 1
+"C:\Program Files (x86)\NSIS\makensis.exe" /DVERSION=%VERSION% /DVERSION_MAJOR=%VERSION_MAJOR% /DVERSION_MINOR=%VERSION_MINOR% /DVERSION_PATCH=%VERSION_PATCH% "/DBIN_DIR=%BIN_DIR%" "/DSOURCE_DIR=%REPO%" "/DOUTPUT_DIR=%OUT_DIR%" "%~dp0DisplayXRAvatarInstaller.nsi" || exit /b 1
 
 echo === DONE ===
-echo Installer: %OUT_DIR%DisplayXRModelViewerSetup-%VERSION%.exe
+echo Installer: %OUT_DIR%DisplayXRAvatarSetup-%VERSION%.exe

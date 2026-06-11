@@ -3,7 +3,7 @@ name: Build Windows
 # Windows installer build. Mirrors build-macos.yml (and the BuildInstaller
 # job in displayxr-runtime's build-windows.yml). The demo's release cadence
 # is manual — devs push a v* tag when ready; on a v* tag this workflow builds
-# DisplayXRModelViewerSetup-<version>.exe and attaches it to the GitHub
+# DisplayXRAvatarSetup-<version>.exe and attaches it to the GitHub
 # Release. workflow_dispatch lets the build be exercised without cutting a tag.
 #
 # PR + push-to-main runs are validation only: they compile the app + installer
@@ -167,7 +167,7 @@ jobs:
         if: needs.DetectChanges.outputs.docs_only != 'true'
         shell: pwsh
         run: |
-          $exe = Get-ChildItem installer\DisplayXRModelViewerSetup-*.exe | Select-Object -First 1
+          $exe = Get-ChildItem installer\DisplayXRAvatarSetup-*.exe | Select-Object -First 1
           if (-not $exe) { Write-Host "::error::installer .exe not produced"; exit 1 }
           Write-Host "Installer: $($exe.FullName)"
           # NSIS payloads are listable by 7-Zip (preinstalled on the runner).
@@ -194,9 +194,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           retention-days: 3
-          name: DisplayXRModelViewer-Windows
+          name: DisplayXRAvatar-Windows
           if-no-files-found: error
-          path: installer/DisplayXRModelViewerSetup-*.exe
+          path: installer/DisplayXRAvatarSetup-*.exe
 
       # softprops/action-gh-release@v2 create-or-updates the GitHub Release on
       # a v* tag and attaches the .exe. If the macOS workflow races on the same
@@ -205,42 +205,14 @@ jobs:
         if: needs.DetectChanges.outputs.docs_only != 'true' && startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: installer/DisplayXRModelViewerSetup-*.exe
+          files: installer/DisplayXRAvatarSetup-*.exe
           fail_on_unmatched_files: true
           draft: false
           prerelease: false
 
-  # On v* tag push, after BuildInstaller succeeds, tell
-  # displayxr-runtime to bump versions.json[modelviewer_demo] to
-  # this tag. Only the Windows workflow dispatches — the macOS
-  # workflow racing on the same tag would just no-op against the
-  # idempotent handler, but a single dispatch is cleaner.
-  #
-  # Spec: DisplayXR/displayxr-runtime
-  # docs/specs/runtime/versions-json-autobump.md.
-  DispatchVersionsBump:
-    if: ${{ startsWith(github.ref, 'refs/tags/v') && github.repository == 'DisplayXR/displayxr-demo-modelviewer' }}
-    needs: [BuildInstaller]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Mint dispatch token
-        id: dispatch-token
-        uses: actions/create-github-app-token@v1
-        with:
-          app-id: ${{ secrets.DISPLAYXR_APP_ID }}
-          private-key: ${{ secrets.DISPLAYXR_APP_PRIVATE_KEY }}
-          owner: DisplayXR
-          repositories: displayxr-runtime
-
-      - name: Dispatch versions.json bump
-        uses: peter-evans/repository-dispatch@v3
-        with:
-          token: ${{ steps.dispatch-token.outputs.token }}
-          repository: DisplayXR/displayxr-runtime
-          event-type: versions-bump
-          client-payload: |
-            {
-              "field":       "modelviewer_demo",
-              "tag":         "${{ github.ref_name }}",
-              "source_repo": "${{ github.repository }}"
-            }
+  # NOTE: versions.json autobump + meta-installer bundle wiring is DEFERRED for
+  # the avatar demo (no avatar_demo field in displayxr-runtime/versions.json
+  # yet). When wired, re-add a DispatchVersionsBump job here gated on
+  # github.repository == 'DisplayXR/displayxr-demo-avatar' that dispatches a
+  # versions-bump event with "field": "avatar_demo". See the modelviewer demo
+  # for the template.
