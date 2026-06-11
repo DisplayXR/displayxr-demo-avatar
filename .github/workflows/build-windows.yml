@@ -55,6 +55,13 @@ jobs:
           else
             BASE=${{ github.event.before }}
           fi
+          # First push to a new repo/branch (or any push with no parent): the
+          # before-SHA is all-zeros / not a real object, so there is nothing to
+          # diff against — treat as a full (non-doc) build instead of erroring.
+          if [ "$BASE" = "0000000000000000000000000000000000000000" ] || ! git cat-file -e "$BASE^{commit}" 2>/dev/null; then
+            echo "docs_only=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           CHANGED=$(git diff --name-only "$BASE" HEAD)
           NON_DOC=$(echo "$CHANGED" | grep -vE '^(docs/|.*\.md$|LICENSE$|\.github/ISSUE_TEMPLATE/)' || true)
           if [ -n "$CHANGED" ] && [ -z "$NON_DOC" ]; then
