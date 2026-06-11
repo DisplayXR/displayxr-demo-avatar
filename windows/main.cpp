@@ -225,8 +225,9 @@ static XrSessionManager* g_xr = nullptr;
 // Portrait default: a standing full-body avatar wants a tall window (the
 // bottom 75% is the tiger zone, top 25% the speech bubble). Physical pixels
 // (the app is PerMonitorV2 DPI-aware); B toggles decoration for move/resize.
-static UINT g_windowWidth = 960;
-static UINT g_windowHeight = 1920;
+// Size = user-tuned on the 3840x2160 Leia panel (measured client area).
+static UINT g_windowWidth = 811;
+static UINT g_windowHeight = 1421;
 
 // 3DGS state
 static ModelRenderer g_modelRenderer;
