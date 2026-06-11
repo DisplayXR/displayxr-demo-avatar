@@ -23,11 +23,16 @@ extern "C" {
 #endif
 
 #define XR_EXT_macos_gl_binding 1
-#define XR_EXT_macos_gl_binding_SPEC_VERSION 1
+// SPEC_VERSION 2: XrStructureType value relocated 1000999010 -> 1000999180
+// (the old value collided with XR_EXT_display_info's
+// XR_TYPE_EVENT_DATA_RENDERING_MODE_CHANGED_EXT). No struct/field changes;
+// consumers only need a header re-sync + rebuild.
+#define XR_EXT_macos_gl_binding_SPEC_VERSION 2
 #define XR_EXT_MACOS_GL_BINDING_EXTENSION_NAME "XR_EXT_macos_gl_binding"
 
-// Structure type in the vendor extension range
-#define XR_TYPE_GRAPHICS_BINDING_OPENGL_MACOS_EXT ((XrStructureType)1000999010)
+// Structure type in the extension type-value range. Allocation registry:
+// README.md in this directory.
+#define XR_TYPE_GRAPHICS_BINDING_OPENGL_MACOS_EXT ((XrStructureType)1000999180)
 
 /*!
  * @brief OpenGL graphics binding for macOS (CGL context).

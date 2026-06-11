@@ -40,23 +40,28 @@ extern "C" {
 #endif
 
 #define XR_EXT_local_3d_zone 1
-#define XR_EXT_local_3d_zone_SPEC_VERSION 3
+// SPEC_VERSION 4: XrStructureType values relocated 1000999130..136 ->
+// 1000999160..166 (the 130..132 block collided with XR_EXT_mcp_tools, which
+// reserved it first). No struct/field/entry-point changes; consumers only
+// need a header re-sync + rebuild. See README.md (allocation registry) in
+// this directory.
+#define XR_EXT_local_3d_zone_SPEC_VERSION 4
 #define XR_EXT_LOCAL_3D_ZONE_EXTENSION_NAME "XR_EXT_local_3d_zone"
 
-// Vendor extension range (1000999xxx); replace with a Khronos-assigned value
-// if standardized. (XR_EXT_atlas_capture uses ...120/121.)
-#define XR_TYPE_LOCAL_3D_ZONE_CAPABILITIES_EXT      ((XrStructureType)1000999130)
-#define XR_TYPE_LOCAL_3D_ZONE_MASK_CREATE_INFO_EXT  ((XrStructureType)1000999131)
-#define XR_TYPE_LOCAL_3D_ZONE_RENDER_TARGET_D3D11_EXT ((XrStructureType)1000999132)
+// Extension type-value range (1000999xxx); replace with a Khronos-assigned
+// value if standardized. Allocation registry: README.md in this directory.
+#define XR_TYPE_LOCAL_3D_ZONE_CAPABILITIES_EXT      ((XrStructureType)1000999160)
+#define XR_TYPE_LOCAL_3D_ZONE_MASK_CREATE_INFO_EXT  ((XrStructureType)1000999161)
+#define XR_TYPE_LOCAL_3D_ZONE_RENDER_TARGET_D3D11_EXT ((XrStructureType)1000999162)
 // Spec v2 additions — D3D12 + Vulkan Tier-3 bindings. (No Metal Tier-3
 // binding yet — Tier 1/2 are API-agnostic and fully supported on Metal;
 // xrAcquireLocal3DZoneRenderTargetEXT reports XR_ERROR_FEATURE_UNSUPPORTED.)
-#define XR_TYPE_LOCAL_3D_ZONE_RENDER_TARGET_D3D12_EXT  ((XrStructureType)1000999133)
-#define XR_TYPE_LOCAL_3D_ZONE_RENDER_TARGET_VULKAN_EXT ((XrStructureType)1000999134)
+#define XR_TYPE_LOCAL_3D_ZONE_RENDER_TARGET_D3D12_EXT  ((XrStructureType)1000999163)
+#define XR_TYPE_LOCAL_3D_ZONE_RENDER_TARGET_VULKAN_EXT ((XrStructureType)1000999164)
 // Spec v3 additions — the post-weave 2D composition layer + the view-size
 // renegotiation event (#439 Phase 3).
-#define XR_TYPE_COMPOSITION_LAYER_LOCAL_2D_EXT                  ((XrStructureType)1000999135)
-#define XR_TYPE_EVENT_DATA_LOCAL_3D_ZONE_VIEW_SIZE_CHANGED_EXT ((XrStructureType)1000999136)
+#define XR_TYPE_COMPOSITION_LAYER_LOCAL_2D_EXT                  ((XrStructureType)1000999165)
+#define XR_TYPE_EVENT_DATA_LOCAL_3D_ZONE_VIEW_SIZE_CHANGED_EXT ((XrStructureType)1000999166)
 
 XR_DEFINE_HANDLE(XrLocal3DZoneMaskEXT)
 

@@ -30,6 +30,7 @@
 #include "brdf_lut.frag.h"
 #include "irradiance.frag.h"
 #include "prefilter.frag.h"
+#include "edge_fade.frag.h"
 
 #include <glm/glm.hpp>
 #include <glm/gtc/type_ptr.hpp>
@@ -454,6 +455,63 @@ bool ModelRenderer::createPipeline() {
         vkDestroyShaderModule(device_, svs, nullptr);
         vkDestroyShaderModule(device_, sfs, nullptr);
         if (spr != VK_SUCCESS) { std::fprintf(stderr, "ModelRenderer: failed to create skybox pipeline (%d)\n", spr); return false; }
+    }
+
+    // Edge-fade pipeline (ADR-027 rule 4 content-alpha feather): fullscreen.vert
+    // + edge_fade.frag, blend (ZERO, ONE_MINUS_SRC_ALPHA) on color AND alpha so
+    // the (0,0,0,1-f) output multiplies the premultiplied dst by f. ALL state
+    // this pass needs is set in ITS pipeline — cull off, depth test/write off —
+    // never inherited from the scene draw (the D3D11 reference's fade triangle
+    // was silently culled by leftover scene raster state). Own minimal layout:
+    // push constants only, no descriptor sets.
+    {
+        VkPushConstantRange fpcr = {};
+        fpcr.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        fpcr.offset = 0;
+        fpcr.size = 3 * sizeof(float);   // vec2 tilePx + float featherPx
+        VkPipelineLayoutCreateInfo fplci = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        fplci.pushConstantRangeCount = 1;
+        fplci.pPushConstantRanges = &fpcr;
+        if (vkCreatePipelineLayout(device_, &fplci, nullptr, &fadePipelineLayout_) != VK_SUCCESS) return false;
+
+        VkShaderModule fvs = createShaderModule(device_, fullscreen_vert_data, sizeof(fullscreen_vert_data));
+        VkShaderModule ffs = createShaderModule(device_, edge_fade_frag_data, sizeof(edge_fade_frag_data));
+        VkPipelineShaderStageCreateInfo st3[2] = {};
+        st3[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO; st3[0].stage = VK_SHADER_STAGE_VERTEX_BIT;   st3[0].module = fvs; st3[0].pName = "main";
+        st3[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO; st3[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; st3[1].module = ffs; st3[1].pName = "main";
+        VkPipelineVertexInputStateCreateInfo vi3 = {VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+        VkPipelineRasterizationStateCreateInfo rs3 = {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+        rs3.polygonMode = VK_POLYGON_MODE_FILL;
+        rs3.cullMode = VK_CULL_MODE_NONE;
+        rs3.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+        rs3.lineWidth = 1.0f;
+        VkPipelineDepthStencilStateCreateInfo ds3 = {VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+        ds3.depthTestEnable = VK_FALSE;
+        ds3.depthWriteEnable = VK_FALSE;
+        VkPipelineColorBlendAttachmentState cba3 = {};
+        cba3.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                              VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+        cba3.blendEnable = VK_TRUE;
+        cba3.srcColorBlendFactor = VK_BLEND_FACTOR_ZERO;
+        cba3.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+        cba3.colorBlendOp = VK_BLEND_OP_ADD;
+        cba3.srcAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+        cba3.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+        cba3.alphaBlendOp = VK_BLEND_OP_ADD;
+        VkPipelineColorBlendStateCreateInfo cb3 = {VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+        cb3.attachmentCount = 1;
+        cb3.pAttachments = &cba3;
+        VkGraphicsPipelineCreateInfo gp3 = gpci;   // reuse ia/vp/ms/dyn/renderPass
+        gp3.pStages = st3;
+        gp3.pVertexInputState = &vi3;
+        gp3.pRasterizationState = &rs3;
+        gp3.pDepthStencilState = &ds3;
+        gp3.pColorBlendState = &cb3;
+        gp3.layout = fadePipelineLayout_;
+        VkResult fpr = vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &gp3, nullptr, &fadePipeline_);
+        vkDestroyShaderModule(device_, fvs, nullptr);
+        vkDestroyShaderModule(device_, ffs, nullptr);
+        if (fpr != VK_SUCCESS) { std::fprintf(stderr, "ModelRenderer: failed to create edge-fade pipeline (%d)\n", fpr); return false; }
     }
 
     // Descriptor pool + set + the host-visible uniform buffer.
@@ -972,15 +1030,23 @@ float ModelRenderer::findBestYaw(const float[3], const float[3], uint32_t) const
 
 void ModelRenderer::updateUniforms(const float viewMatrix[16], const float projMatrix[16],
                                    float clipFar) {
-    // Mirror gs_renderer: flip world Y at the view stage (right-multiply by
-    // diag(1,-1,1,1) → negate view column 1) so the model is upright and
-    // consistent with the demo's Y-mirrored display-pose contract.
+    // Legacy convention (default): flip world Y at the view stage (right-
+    // multiply by diag(1,-1,1,1) → negate view column 1) so the model is
+    // upright with the demo's Y-mirrored display-pose contract.
+    // Plain convention (setPlainViewConvention): consume the view matrix
+    // un-reflected (e.g. the render-ready XR_EXT_view_rig XrView pose) —
+    // Vulkan Y-down is handled at the RASTER stage via a negative-height
+    // viewport in renderEye, which keeps rotational handedness intact and
+    // the off-axis projection in its native +Y-up frame. -R^T·t below
+    // recovers the true world camera for lighting/skybox either way.
     float vmFlipped[16];
     std::memcpy(vmFlipped, viewMatrix, sizeof(vmFlipped));
-    vmFlipped[4] = -vmFlipped[4];
-    vmFlipped[5] = -vmFlipped[5];
-    vmFlipped[6] = -vmFlipped[6];
-    vmFlipped[7] = -vmFlipped[7];
+    if (!plainViewConvention_) {
+        vmFlipped[4] = -vmFlipped[4];
+        vmFlipped[5] = -vmFlipped[5];
+        vmFlipped[6] = -vmFlipped[6];
+        vmFlipped[7] = -vmFlipped[7];
+    }
 
     UniformBlock ub{};
     mat4Mul(projMatrix, vmFlipped, ub.viewProj);
@@ -1468,7 +1534,8 @@ void ModelRenderer::renderEye(VkImage swapchainImage,
                               const float viewMatrix[16],
                               const float projMatrix[16],
                               bool transparentBg,
-                              float clipFarViewSpace) {
+                              float clipFarViewSpace,
+                              float edgeFadePx) {
     if (!initialized_ || !modelLoaded_) return;
 
     // Size the internal targets to the SWAPCHAIN (stable), not the per-eye
@@ -1511,7 +1578,11 @@ void ModelRenderer::renderEye(VkImage swapchainImage,
     rpbi.pClearValues = clears;
     vkCmdBeginRenderPass(cmd, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
 
-    VkViewport vpRect = {0.0f, 0.0f, (float)viewportWidth, (float)viewportHeight, 0.0f, 1.0f};
+    // Plain convention: negative-height viewport flips Vulkan Y-down at the
+    // rasterizer so the view matrix stays un-reflected (see updateUniforms).
+    VkViewport vpRect = plainViewConvention_
+        ? VkViewport{0.0f, (float)viewportHeight, (float)viewportWidth, -(float)viewportHeight, 0.0f, 1.0f}
+        : VkViewport{0.0f, 0.0f, (float)viewportWidth, (float)viewportHeight, 0.0f, 1.0f};
     VkRect2D scissor = {{0, 0}, {viewportWidth, viewportHeight}};
     vkCmdSetViewport(cmd, 0, 1, &vpRect);
     vkCmdSetScissor(cmd, 0, 1, &scissor);
@@ -1570,15 +1641,29 @@ void ModelRenderer::renderEye(VkImage swapchainImage,
         vkCmdDrawIndexed(cmd, p.indexCount, 1, p.firstIndex, 0, 0);
     }
 
+    // Content-alpha edge feather: multiplicative fullscreen pass, dst *= f.
+    // Last draw of the pass — fades whatever the scene produced, including
+    // the clear (premultiplied, so RGB and A fade together).
+    if (edgeFadePx > 0.0f && fadePipeline_ != VK_NULL_HANDLE) {
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, fadePipeline_);
+        const float fadePush[3] = {(float)viewportWidth, (float)viewportHeight, edgeFadePx};
+        vkCmdPushConstants(cmd, fadePipelineLayout_, VK_SHADER_STAGE_FRAGMENT_BIT,
+                           0, sizeof(fadePush), fadePush);
+        vkCmdDraw(cmd, 3, 1, 0, 0);
+    }
+
     vkCmdEndRenderPass(cmd);
     // colorImage_ is now in TRANSFER_SRC_OPTIMAL (render-pass finalLayout).
 
-    // Swapchain → TRANSFER_DST. First eye (vpX==0): UNDEFINED ok. Second eye:
-    // preserve the first by treating the prior contents as COLOR_ATTACHMENT.
+    // Swapchain → TRANSFER_DST. First view of the image (top-left tile):
+    // UNDEFINED ok. Later views: preserve the prior tiles by treating the
+    // contents as COLOR_ATTACHMENT. (vpX alone misfires on row-tiled 2x2
+    // quad layouts, where view 2 starts a new row at vpX==0.)
+    const bool firstViewInImage = (viewportX == 0 && viewportY == 0);
     VkImageMemoryBarrier toDst = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-    toDst.srcAccessMask = (viewportX == 0) ? 0 : VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    toDst.srcAccessMask = firstViewInImage ? 0 : VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
     toDst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    toDst.oldLayout = (viewportX == 0) ? VK_IMAGE_LAYOUT_UNDEFINED
+    toDst.oldLayout = firstViewInImage ? VK_IMAGE_LAYOUT_UNDEFINED
                                        : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
     toDst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     toDst.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -1686,6 +1771,8 @@ void ModelRenderer::cleanup() {
     if (descriptorPool_ != VK_NULL_HANDLE) { vkDestroyDescriptorPool(device_, descriptorPool_, nullptr); descriptorPool_ = VK_NULL_HANDLE; }
     if (pipeline_ != VK_NULL_HANDLE) { vkDestroyPipeline(device_, pipeline_, nullptr); pipeline_ = VK_NULL_HANDLE; }
     if (skyboxPipeline_ != VK_NULL_HANDLE) { vkDestroyPipeline(device_, skyboxPipeline_, nullptr); skyboxPipeline_ = VK_NULL_HANDLE; }
+    if (fadePipeline_ != VK_NULL_HANDLE) { vkDestroyPipeline(device_, fadePipeline_, nullptr); fadePipeline_ = VK_NULL_HANDLE; }
+    if (fadePipelineLayout_ != VK_NULL_HANDLE) { vkDestroyPipelineLayout(device_, fadePipelineLayout_, nullptr); fadePipelineLayout_ = VK_NULL_HANDLE; }
     if (pipelineLayout_ != VK_NULL_HANDLE) { vkDestroyPipelineLayout(device_, pipelineLayout_, nullptr); pipelineLayout_ = VK_NULL_HANDLE; }
     if (dsLayout_ != VK_NULL_HANDLE) { vkDestroyDescriptorSetLayout(device_, dsLayout_, nullptr); dsLayout_ = VK_NULL_HANDLE; }
     if (jointSetLayout_ != VK_NULL_HANDLE) { vkDestroyDescriptorSetLayout(device_, jointSetLayout_, nullptr); jointSetLayout_ = VK_NULL_HANDLE; }

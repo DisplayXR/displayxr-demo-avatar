@@ -148,14 +148,21 @@ XRAPI_ATTR XrResult XRAPI_CALL xrSetSharedTextureOutputRectEXT(
 // ---- 2D Surround Texture (Spec v6) ----
 
 /*!
- * @brief Register a full-view 2D IOSurface whose pixels OUTSIDE the canvas
+ * @brief Register a window-sized 2D IOSurface whose pixels OUTSIDE the canvas
  *        sub-rect are blitted into the target swapchain each frame.
  *
- * macOS counterpart to the Win32 version. Signature, lifecycle, and semantics
- * are identical except: sharedTextureHandle is an IOSurfaceRef (cast to void*),
- * synchronization uses Metal fences + IOSurface use-count rather than
- * IDXGIKeyedMutex, and pixel format must be MTLPixelFormatRGBA8Unorm or
- * MTLPixelFormatRGBA8Unorm_sRGB.
+ * macOS counterpart to the Win32 version. Signature and lifecycle are
+ * identical except: sharedTextureHandle is an IOSurfaceRef (cast to void*),
+ * the runtime holds a CFRetain on it for the registration's lifetime (the
+ * IOSurface is cache-coherent between app CPU writes and runtime GPU reads,
+ * so no fence/keyed-mutex handshake is needed in-process), and the pixel
+ * format must match the multiview shared IOSurface's format.
+ *
+ * The fill is window-clamped (#464): the runtime blits only the registered
+ * window rect minus the canvas, anchored top-left in the worst-case shared
+ * surface — never the full worst-case extent. Re-register on window resize
+ * (the surround is window-sized; replacing a registration atomically
+ * releases the previous one).
  *
  * See XR_EXT_win32_window_binding.h for the full semantic description.
  *
@@ -164,14 +171,18 @@ XRAPI_ATTR XrResult XRAPI_CALL xrSetSharedTextureOutputRectEXT(
  * @param sharedTextureHandle IOSurfaceRef for the 2D surround texture, or NULL
  *                            to clear.
  * @param width               Texture width in physical (post-Retina) pixels.
- *                            Must equal the NSView backing-store width.
+ *                            Must equal the IOSurface's own width (== the
+ *                            NSView backing-store width at registration time).
  * @param height              Texture height in physical pixels. Must equal
- *                            the NSView backing-store height.
+ *                            the IOSurface's own height (== the NSView
+ *                            backing-store height at registration time).
  *
  * @return XR_SUCCESS on success.
  *         XR_ERROR_FUNCTION_UNSUPPORTED if the extension is not enabled.
  *         XR_ERROR_VALIDATION_FAILURE if the dimensions do not match the
- *         current NSView backing size.
+ *         IOSurface's own dimensions. (A later window resize never errors:
+ *         the frame-time blit clamps to the registered rect until the app
+ *         re-registers.)
  *         XR_ERROR_HANDLE_INVALID if the IOSurface cannot be referenced.
  */
 #ifndef PFN_xrSetSharedTextureSurround2DEXT_DEFINED

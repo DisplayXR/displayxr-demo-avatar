@@ -28,6 +28,8 @@
 #include "model_renderer.h"
 #include "model_vulkan_utils.h"   // scratch image/buffer for the click-through silhouette
 #include <openxr/XR_EXT_local_3d_zone.h>  // XrCompositionLayerLocal2DEXT (speech bubble)
+#include <openxr/XR_EXT_display_zones.h>  // XrDisplayZoneEXT — the tiger zone (ADR-027)
+#include <openxr/XR_EXT_view_rig.h>       // XrDisplayRigEXT locate + XrViewDisplayRawEXT readback
 #include "display3d_view.h"
 #include "projection_depth.h"
 
@@ -815,10 +817,11 @@ static bool EnsureSilhouetteTargets(VkDevice dev, VkPhysicalDevice phys, uint32_
 // Render one mono eye of the avatar into the scratch image, read the alpha back,
 // and publish the coverage bitmap consumed by WM_NCHITTEST. Cheap (downscaled to
 // ~1/3 the window). Runs on the render thread right after the main eye render so
-// it reuses the renderer's internal targets (no resize thrash — imageWidth/Height
-// passed here match the main swapchain).
+// it reuses the renderer's internal targets (no resize thrash — imgW/imgH must
+// match the swapchain dims the main eye render passed, else ensureTargets churns
+// every frame as the two callers alternate sizes).
 static void UpdateSilhouette(VkDevice dev, VkPhysicalDevice phys, VkQueue queue, VkCommandPool pool,
-                            XrSessionManager* xr, uint32_t winW, uint32_t winH,
+                            uint32_t imgW, uint32_t imgH, uint32_t winW, uint32_t winH,
                             const float viewMat[16], const float projMat[16], float clipFar) {
     if (winW == 0 || winH == 0) return;
     uint32_t w = winW / 3; if (w < 64) w = 64; if (w > 640) w = 640;
@@ -829,12 +832,13 @@ static void UpdateSilhouette(VkDevice dev, VkPhysicalDevice phys, VkQueue queue,
         std::lock_guard<std::mutex> lock(g_sceneMutex);
         if (!g_modelRenderer.hasModel()) return;
         // Render the avatar into the bottom 75% of the silhouette image too, so the
-        // hit mask matches the confined on-screen avatar. The top 25% is left as-is
+        // hit mask matches the confined on-screen avatar (the zone-framed views map
+        // 1:1 onto this sub-viewport — same aspect). The top 25% is left as-is
         // (covered by the full-top-25% bubble rect in the click region).
         const uint32_t silAvH = (h * 3u) / 4u;
         const uint32_t silAvY = h - silAvH;
         g_modelRenderer.renderEye(g_silImage.image, VK_FORMAT_R8G8B8A8_UNORM,
-            xr->swapchain.width, xr->swapchain.height,
+            imgW, imgH,
             0, silAvY, w, silAvH, viewMat, projMat, /*transparentBg=*/true, clipFar);
     }
     // renderEye leaves the scratch image in COLOR_ATTACHMENT_OPTIMAL → copy to host.
@@ -891,6 +895,207 @@ static void UpdateSilhouette(VkDevice dev, VkPhysicalDevice phys, VkQueue queue,
         std::string path = std::string(tmp) + "avatar_silhouette.png";
         stbi_write_png(path.c_str(), (int)w, (int)h, 1, a.data(), (int)w);
     }
+}
+
+// ── Display-zones path (ADR-027 / XR_EXT_display_zones, P6 migration) ───────
+// The tiger renders through ONE 3D zone (zoneId 1, rect = bottom 75% of the
+// client window) with the runtime rig (XR_EXT_view_rig) chained on the zone
+// locate — the app consumes render-ready XrView pose/fov framed to the rect
+// and the app-side Kooima is gone. The speech bubble stays a plain Local2D
+// layer in the top 25% (in a zones frame Local2D is pure 2D content; the
+// wish auto-derives from the zone rect, no mask object).
+
+// Column-major float[16] helpers for consuming XrView pose/fov, ported from
+// the runtime's cube_zones_vk_macos reference consumer.
+static void mat4_identity(float* m) {
+    memset(m, 0, 16 * sizeof(float));
+    m[0] = m[5] = m[10] = m[15] = 1.0f;
+}
+
+static void mat4_translation(float* m, float x, float y, float z) {
+    mat4_identity(m);
+    m[12] = x; m[13] = y; m[14] = z;
+}
+
+static void mat4_multiply(float* out, const float* a, const float* b) {
+    float r[16];
+    for (int c = 0; c < 4; c++)
+        for (int rw = 0; rw < 4; rw++)
+            r[c * 4 + rw] = a[0 * 4 + rw] * b[c * 4 + 0] + a[1 * 4 + rw] * b[c * 4 + 1] +
+                            a[2 * 4 + rw] * b[c * 4 + 2] + a[3 * 4 + rw] * b[c * 4 + 3];
+    memcpy(out, r, sizeof(r));
+}
+
+// Asymmetric frustum from the runtime-returned fov. GL convention ([-1,1]
+// clip-z) — remap with convert_projection_gl_to_zero_to_one for Vulkan.
+static void mat4_from_xr_fov(float* m, XrFovf fov, float nearZ, float farZ) {
+    float tanL = tanf(fov.angleLeft);
+    float tanR = tanf(fov.angleRight);
+    float tanU = tanf(fov.angleUp);
+    float tanD = tanf(fov.angleDown);
+    float w = tanR - tanL;
+    float h = tanU - tanD;
+    memset(m, 0, 16 * sizeof(float));
+    m[0]  = 2.0f / w;
+    m[5]  = 2.0f / h;
+    m[8]  = (tanR + tanL) / w;
+    m[9]  = (tanU + tanD) / h;
+    m[10] = -(farZ + nearZ) / (farZ - nearZ);
+    m[11] = -1.0f;
+    m[14] = -(2.0f * farZ * nearZ) / (farZ - nearZ);
+}
+
+// view = inverse(pose): R^T * translate(-p). Plain +Y-up world — the renderer
+// runs in the plain view convention on the zones path (negative-height
+// viewport handles the Vulkan Y-flip, see ModelRenderer::setPlainViewConvention).
+static void mat4_view_from_xr_pose(float* viewMat, const XrPosef& pose) {
+    float qx = pose.orientation.x, qy = pose.orientation.y;
+    float qz = pose.orientation.z, qw = pose.orientation.w;
+
+    float rot[16];
+    mat4_identity(rot);
+    rot[0]  = 1 - 2*(qy*qy + qz*qz);
+    rot[1]  = 2*(qx*qy + qz*qw);
+    rot[2]  = 2*(qx*qz - qy*qw);
+    rot[4]  = 2*(qx*qy - qz*qw);
+    rot[5]  = 1 - 2*(qx*qx + qz*qz);
+    rot[6]  = 2*(qy*qz + qx*qw);
+    rot[8]  = 2*(qx*qz + qy*qw);
+    rot[9]  = 2*(qy*qz - qx*qw);
+    rot[10] = 1 - 2*(qx*qx + qy*qy);
+
+    float invRot[16];
+    mat4_identity(invRot);
+    for (int i = 0; i < 3; i++)
+        for (int j = 0; j < 3; j++)
+            invRot[j*4+i] = rot[i*4+j];
+
+    float invTrans[16];
+    mat4_translation(invTrans, -pose.position.x, -pose.position.y, -pose.position.z);
+    mat4_multiply(viewMat, invRot, invTrans);
+}
+
+// Rotate vec3 by quaternion: v' = q * v * q^-1
+static void quat_rotate_vec3(XrQuaternionf q, float vx, float vy, float vz,
+    float* ox, float* oy, float* oz) {
+    float tx = 2.0f * (q.y * vz - q.z * vy);
+    float ty = 2.0f * (q.z * vx - q.x * vz);
+    float tz = 2.0f * (q.x * vy - q.y * vx);
+    *ox = vx + q.w * tx + (q.y * tz - q.z * ty);
+    *oy = vy + q.w * ty + (q.z * tx - q.x * tz);
+    *oz = vz + q.w * tz + (q.x * ty - q.y * tx);
+}
+
+// Display-local eye distance for the ZDP-anchored clip: z of (rigPose^-1 *
+// eyeWorld). Same quantity the app-side Kooima reported as eye_display.z.
+static float RigLocalEyeZ(const XrPosef& rig, const XrVector3f& eyeWorld) {
+    XrQuaternionf inv = {-rig.orientation.x, -rig.orientation.y,
+                         -rig.orientation.z, rig.orientation.w};
+    float ox, oy, oz;
+    quat_rotate_vec3(inv,
+                     eyeWorld.x - rig.position.x,
+                     eyeWorld.y - rig.position.y,
+                     eyeWorld.z - rig.position.z,
+                     &ox, &oy, &oz);
+    return oz;
+}
+
+// Zone state (render-thread-owned). The zone swapchain is pre-sized once at
+// activation for the fullscreen worst case so live resize never recreates it
+// (same philosophy as the main swapchain's largest-atlas pre-size); per-frame
+// tile dims come from xrGetDisplayZoneRecommendedViewSizeEXT clamped to the
+// capacity.
+static SwapchainInfo        g_zoneSwapchain;
+static std::vector<VkImage> g_zoneSwapImages;
+static bool g_zonesActive = false;
+static bool g_zonesTried  = false;
+
+// DXR_ZONES_FADE_PX: tiger-zone edge feather width in px (content alpha, ADR-027
+// rule 4). Default 16; 0 disables. DXR_ZONES_VALIDATE=1 chains the frame-end
+// validate bit (locate/submit pairing diagnostics) — bring-up only.
+static float EnvFadePx() {
+    char buf[16] = {};
+    if (GetEnvironmentVariableA("DXR_ZONES_FADE_PX", buf, sizeof(buf)) > 0)
+        return (float)atof(buf);
+    return 16.0f;
+}
+static bool EnvZonesValidate() {
+    char buf[8] = {};
+    return GetEnvironmentVariableA("DXR_ZONES_VALIDATE", buf, sizeof(buf)) > 0 &&
+           buf[0] != '0';
+}
+
+// One-time zones activation: caps query + zone swapchain creation. Returns on
+// the first call with valid window dims; sets g_zonesActive on success. On an
+// old runtime (extension absent / unsupported) the app falls back to the
+// raw-views path — degraded flat rendering, one-shot WARN.
+static void TryActivateZones(XrSessionManager* xr) {
+    if (g_zonesTried) return;
+    g_zonesTried = true;
+
+    if (!g_hasDisplayZonesExt || !g_hasViewRigExt ||
+        !g_pfnGetDisplayZoneCaps || !g_pfnGetDisplayZoneViewSize) {
+        LOG_WARN("Display zones unavailable (display_zones=%d view_rig=%d) — "
+                 "falling back to raw views (flat rendering)",
+                 (int)g_hasDisplayZonesExt, (int)g_hasViewRigExt);
+        return;
+    }
+
+    XrDisplayZoneCapabilitiesEXT caps = {XR_TYPE_DISPLAY_ZONE_CAPABILITIES_EXT};
+    XrResult cr = g_pfnGetDisplayZoneCaps(xr->session, &caps);
+    if (XR_FAILED(cr) || !caps.supported || caps.maxZones3D < 1) {
+        LOG_WARN("Display zones not supported by this session (result=0x%x "
+                 "supported=%d maxZones3D=%u) — falling back to raw views",
+                 (unsigned)cr, (int)caps.supported, caps.maxZones3D);
+        return;
+    }
+
+    // Fullscreen worst case: widest mode tiling × native display resolution
+    // (the zone rect can grow to the full window ≤ the panel; recommended view
+    // size is rect-extent-sized). Height capacity covers the bottom-75% zone
+    // of a fullscreen window.
+    uint32_t maxCols = 2, maxRows = 2;
+    for (uint32_t m = 0; m < xr->renderingModeCount; m++) {
+        if (xr->renderingModeTileColumns[m] > maxCols) maxCols = xr->renderingModeTileColumns[m];
+        if (xr->renderingModeTileRows[m]    > maxRows) maxRows = xr->renderingModeTileRows[m];
+    }
+    uint32_t dispW = xr->displayPixelWidth  ? xr->displayPixelWidth  : xr->swapchain.width;
+    uint32_t dispH = xr->displayPixelHeight ? xr->displayPixelHeight : xr->swapchain.height;
+    uint32_t capW = maxCols * dispW;
+    uint32_t capH = maxRows * ((dispH * 3u) / 4u);
+
+    XrSwapchainCreateInfo ci = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
+    ci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT |
+                    XR_SWAPCHAIN_USAGE_SAMPLED_BIT |
+                    XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
+    ci.format = xr->swapchain.format;   // reuse the negotiated main format
+    ci.sampleCount = 1;
+    ci.width = capW;
+    ci.height = capH;
+    ci.faceCount = 1;
+    ci.arraySize = 1;
+    ci.mipCount = 1;
+    if (XR_FAILED(xrCreateSwapchain(xr->session, &ci, &g_zoneSwapchain.swapchain))) {
+        LOG_WARN("Zone swapchain creation failed (%ux%u) — falling back to raw views",
+                 capW, capH);
+        g_zoneSwapchain.swapchain = XR_NULL_HANDLE;
+        return;
+    }
+    g_zoneSwapchain.format = xr->swapchain.format;
+    g_zoneSwapchain.width = capW;
+    g_zoneSwapchain.height = capH;
+    uint32_t n = 0;
+    xrEnumerateSwapchainImages(g_zoneSwapchain.swapchain, 0, &n, nullptr);
+    g_zoneSwapchain.imageCount = n;
+    std::vector<XrSwapchainImageVulkanKHR> imgs(n, {XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR});
+    xrEnumerateSwapchainImages(g_zoneSwapchain.swapchain, n, &n,
+        (XrSwapchainImageBaseHeader*)imgs.data());
+    g_zoneSwapImages.resize(n);
+    for (uint32_t i = 0; i < n; i++) g_zoneSwapImages[i] = imgs[i].image;
+
+    g_zonesActive = true;
+    LOG_WARN("Display zones ACTIVE: maxZones3D=%u, zone swapchain %ux%u (%u images)",
+             caps.maxZones3D, capW, capH, n);
 }
 
 static void RenderThreadFunc(
@@ -1061,12 +1266,26 @@ static void RenderThreadFunc(
                 XrCompositionLayerProjectionView projectionViews[8] = {};
                 bool rendered = false;
 
+                // Display zones: the SAME XrDisplayZoneEXT instance chains on the
+                // zone-scoped locate (with the rig) AND on the submitted projection
+                // layer (next reset to NULL) — one variable, both chain points.
+                XrDisplayZoneEXT tigerZone = {XR_TYPE_DISPLAY_ZONE_EXT};
+                XrDisplayRigEXT  tigerRig  = {XR_TYPE_DISPLAY_RIG_EXT};
+                bool zonesFrame = false;
+
                 if (frameState.shouldRender) {
                     if (LocateViews(*xr, frameState.predictedDisplayTime,
                         inputSnapshot.cameraPosX, -inputSnapshot.cameraPosY, inputSnapshot.cameraPosZ,
                         inputSnapshot.yaw, renderPitch,
                         inputSnapshot.viewParams)) {
 
+                        // One-time zones bring-up (caps query + zone swapchain).
+                        TryActivateZones(xr);
+
+                        // Raw locate: with nothing chained, XrView.pose carries the
+                        // raw display-space eyes (external-window transport). Feeds
+                        // the billboard head centroid and the no-zones fallback;
+                        // the zones path locates AGAIN below, zone-scoped.
                         XrViewLocateInfo locateInfo = {XR_TYPE_VIEW_LOCATE_INFO};
                         locateInfo.viewConfigurationType = xr->viewConfigType;
                         locateInfo.displayTime = frameState.predictedDisplayTime;
@@ -1085,7 +1304,7 @@ static void RenderThreadFunc(
 
                         // View count for the active rendering mode (1=mono, 2=stereo, 4=quad).
                         // Sized off the runtime's per-mode advertisement so the eye-loop and
-                        // per-view buffers (rawEyes / stereoViews / viewMat / projectionViews)
+                        // per-view buffers (zoneViews / viewMat / projectionViews)
                         // all line up with what xrEndFrame expects.
                         uint32_t activeViewCount = (xr->renderingModeCount > 0)
                             ? xr->renderingModeViewCounts[xr->currentModeIndex] : 2u;
@@ -1120,227 +1339,188 @@ static void RenderThreadFunc(
                         if (renderW == 0) renderW = 1;
                         if (renderH == 0) renderH = 1;
 
-                        // App-side Kooima projection (per-view, sized to active mode)
-                        Display3DView stereoViews[8];
-                        bool useAppProjection = (xr->hasDisplayInfoExt && xr->displayWidthM > 0.0f);
-                        if (useAppProjection) {
-                            float dispPxW = xr->displayPixelWidth > 0 ? (float)xr->displayPixelWidth : (float)xr->swapchain.width;
-                            float dispPxH = xr->displayPixelHeight > 0 ? (float)xr->displayPixelHeight : (float)xr->swapchain.height;
-                            float pxSizeX = xr->displayWidthM / dispPxW;
-                            float pxSizeY = xr->displayHeightM / dispPxH;
-                            float winW_m = (float)windowW * pxSizeX;
-                            // Confine the 3D rig to the BOTTOM 70% of the window: the
-                            // Kooima canvas is a bottom-70% sub-rect (full width, correct
-                            // aspect, centre lowered), and the per-eye projection is
-                            // remapped into the bottom 75% of the tile (below). The top
-                            // 25% is left for the flat 2D speech bubble. This is the
-                            // handle-app equivalent of a texture app's
-                            // xrSetSharedTextureOutputRectEXT canvas rect.
-                            const float kCanvasH       = 0.75f;  // canvas height / window
-                            const float kCanvasCenterY = 0.625f; // canvas centre / window (0.25 + 0.75/2)
-                            float winH_m = (float)windowH * kCanvasH * pxSizeY;
-
-                            // Window-relative Kooima: compute eye offset from canvas center
-                            float eyeOffsetX = 0.0f, eyeOffsetY = 0.0f;
+                        // ── Zone-scoped locate (runtime rig replaces the app-side
+                        //    Kooima — ADR-027 P6). ONE zone: the tiger, bottom 75%
+                        //    of the client window. The runtime owns the window/canvas
+                        //    geometry (framing follows the window server-side), so the
+                        //    old ClientToScreen/MonitorFromWindow eye-offset math is
+                        //    gone with the Kooima. ──────────────────────────────────
+                        XrView zoneViews[8];
+                        uint32_t zoneViewCount = 0;
+                        uint32_t tileW = 0, tileH = 0;
+                        zonesFrame = g_zonesActive && windowW > 0 && windowH > 0;
+                        if (zonesFrame) {
+                            // ── Face-the-viewer billboard (yaw-only) ───────────
+                            // Head centroid from the raw display-space eyes (the
+                            // un-chained locate above), rebased to the ZONE canvas
+                            // centre using the runtime-reported canvas rect from
+                            // LAST frame's zone locate (raw eyes are panel-relative,
+                            // not canvas-rebased — XR_EXT_view_rig). One frame of
+                            // staleness is invisible under the tau smoothing. First
+                            // frame (no canvas yet): hold facing-forward, exactly
+                            // like the eye-tracking warmup hold.
+                            static XrRect2Di s_zoneCanvasPx = {};
+                            static bool s_zoneCanvasValid = false;
                             {
-                                POINT clientOrigin = {0, 0};
-                                ClientToScreen(hwnd, &clientOrigin);
-                                HMONITOR hMon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
-                                MONITORINFO mi = {sizeof(mi)};
-                                if (GetMonitorInfo(hMon, &mi)) {
-                                    float winCenterX = (float)(clientOrigin.x - mi.rcMonitor.left) + windowW / 2.0f;
-                                    float winCenterY = (float)(clientOrigin.y - mi.rcMonitor.top) + windowH * kCanvasCenterY;
-                                    float dispW = (float)(mi.rcMonitor.right - mi.rcMonitor.left);
-                                    float dispH = (float)(mi.rcMonitor.bottom - mi.rcMonitor.top);
-                                    eyeOffsetX = (winCenterX - dispW / 2.0f) * pxSizeX;
-                                    eyeOffsetY = -((winCenterY - dispH / 2.0f) * pxSizeY);
-                                }
-                            }
-
-                            // Build per-view raw eye positions in render frame.
-                            // ModelRenderer::updateUniforms Y-mirrors the world; displayPose
-                            // below is fed in render frame (cameraPosY negated). The
-                            // rawEyes must live in the same render frame so the asymmetric
-                            // Kooima projection's eye-vs-display geometry stays consistent
-                            // — otherwise vertical eye parallax comes out inverted.
-                            XrVector3f rawEyes[8];
-                            if (monoMode) {
-                                // Mono center = average of left/right raw views (0 and 1).
-                                XrVector3f l = rawViews[0].pose.position;
-                                XrVector3f r = rawViews[1].pose.position;
-                                rawEyes[0].x = (l.x + r.x) * 0.5f - eyeOffsetX;
-                                rawEyes[0].y = -((l.y + r.y) * 0.5f - eyeOffsetY);
-                                rawEyes[0].z = (l.z + r.z) * 0.5f;
-                            } else {
-                                for (int i = 0; i < eyeCount; i++) {
-                                    XrVector3f e = rawViews[i].pose.position;
-                                    e.x -= eyeOffsetX;
-                                    e.y -= eyeOffsetY;
-                                    e.y = -e.y;
-                                    rawEyes[i] = e;
-                                }
-                            }
-
-                            // ── Face-the-viewer billboard (yaw + pitch) ────────
-                            // Aim the avatar's forward axis along the line from the
-                            // tiger to the viewer's head. rawEyes is the window-
-                            // relative head position (it already has the eye minus
-                            // the window-centre offset), so the heading updates BOTH
-                            // as the viewer moves their head (eye tracking changes
-                            // rawViews) AND as the window moves (the Kooima eyeOffset
-                            // changes). Computed in the renderer's frame; the SIGN
-                            // constants absorb the renderer Y-mirror — FACE_YAW_SIGN
-                            // is validated (the viewer confirmed -1 turns the right
-                            // way); FACE_PITCH_SIGN is the analogous vertical flip.
-                            {
-                                static constexpr float FACE_YAW_SIGN   = -1.0f;
-                                static constexpr float FACE_PITCH_SIGN =  1.0f;  // viewer-confirmed
-                                float hx, hy, hz;
-                                if (eyeCount <= 1) {
-                                    hx = rawEyes[0].x; hy = rawEyes[0].y; hz = rawEyes[0].z;
+                                static constexpr float FACE_YAW_SIGN = -1.0f;  // viewer-confirmed
+                                float cx, cy, cz;
+                                if (eyeCount <= 1 || viewCount < 2) {
+                                    cx = rawViews[0].pose.position.x;
+                                    cy = rawViews[0].pose.position.y;
+                                    cz = rawViews[0].pose.position.z;
                                 } else {
-                                    hx = (rawEyes[0].x + rawEyes[1].x) * 0.5f;
-                                    hy = (rawEyes[0].y + rawEyes[1].y) * 0.5f;
-                                    hz = (rawEyes[0].z + rawEyes[1].z) * 0.5f;
+                                    cx = (rawViews[0].pose.position.x + rawViews[1].pose.position.x) * 0.5f;
+                                    cy = (rawViews[0].pose.position.y + rawViews[1].pose.position.y) * 0.5f;
+                                    cz = (rawViews[0].pose.position.z + rawViews[1].pose.position.z) * 0.5f;
                                 }
-                                // hz ≈ viewer distance in front of the display (~0.6 m).
+                                (void)cy;
+                                float hx = cx, hz = cz;
+                                if (s_zoneCanvasValid && xr->displayPixelWidth > 0 &&
+                                    xr->displayWidthM > 0.0f) {
+                                    // Canvas-centre offset from the display centre, in
+                                    // metres, +X right (panel px are y-down; yaw only
+                                    // needs X).
+                                    const float pxSizeX = xr->displayWidthM / (float)xr->displayPixelWidth;
+                                    const float canvasCxPx = (float)s_zoneCanvasPx.offset.x +
+                                                             (float)s_zoneCanvasPx.extent.width * 0.5f;
+                                    hx = cx - (canvasCxPx - (float)xr->displayPixelWidth * 0.5f) * pxSizeX;
+                                }
                                 const float hzAbs = fabsf(hz) > 1e-3f ? fabsf(hz) : 1e-3f;
-                                const float horiz = sqrtf(hx * hx + hzAbs * hzAbs);
-                                float targetYaw   = FACE_YAW_SIGN   * atan2f(hx, hzAbs);
-                                float targetPitch = FACE_PITCH_SIGN * atan2f(hy, horiz);
+                                float targetYaw = FACE_YAW_SIGN * atan2f(hx, hzAbs);
                                 // Exponential shortest-angle smoothing, TIME-BASED so
-                                // it's frame-rate independent: a per-frame factor made
-                                // the billboard stutter once the silhouette pass made
-                                // frame timing uneven. A tight tau also keeps the yaw
-                                // tracking the head as promptly as the motion-parallax
-                                // projection, so the two don't visibly desync.
-                                static float s_faceYaw = 0.0f, s_facePitch = 0.0f;
+                                // it's frame-rate independent (a per-frame factor made
+                                // the billboard stutter under uneven frame timing).
+                                static float s_faceYaw = 0.0f;
                                 const float tau = 0.04f;  // seconds (settle ≈ 3·tau)
                                 float a = 1.0f - expf(-perfStats.deltaTime / tau);
                                 if (a < 0.0f) a = 0.0f; else if (a > 1.0f) a = 1.0f;
-                                // Only chase the head while eye tracking is LOCKED.
-                                // During warmup (the first few seconds, isEyeTracking
-                                // false) the tracker reports unstable positions that
-                                // would jitter the heading — hold facing-forward
-                                // (yaw/pitch 0) until it settles, then ease in.
+                                // Only chase the head while eye tracking is LOCKED —
+                                // warmup positions would jitter the heading.
                                 if (xr->isEyeTracking) {
                                     float dy = targetYaw - s_faceYaw;
                                     while (dy >  3.14159265f) dy -= 6.28318531f;
                                     while (dy < -3.14159265f) dy += 6.28318531f;
-                                    s_faceYaw   += dy * a;
-                                    s_facePitch += (targetPitch - s_facePitch) * a;
+                                    s_faceYaw += dy * a;
                                 }
-                                // Override the render heading; auto-orbit + manual LMB
-                                // are superseded by the face-the-viewer behaviour.
-                                // displayPose below consumes inputSnapshot.yaw and the
-                                // renderPitch local directly.
                                 inputSnapshot.yaw = s_faceYaw;
-                                // Pitch look-at disabled by request — yaw-only billboard
-                                // (the avatar stays upright). FACE_PITCH_SIGN above is the
-                                // viewer-confirmed sign; re-enable by uncommenting:
-                                // renderPitch    = s_facePitch;
-                                (void)s_facePitch;
                             }
 
-                            Display3DTunables tunables;
-                            tunables.ipd_factor = inputSnapshot.viewParams.ipdFactor;
-                            tunables.parallax_factor = inputSnapshot.viewParams.parallaxFactor;
-                            tunables.perspective_factor = inputSnapshot.viewParams.perspectiveFactor;
-                            tunables.virtual_display_height = inputSnapshot.viewParams.virtualDisplayHeight / inputSnapshot.viewParams.scaleFactor;
-
-                            // ZDP-relative clip: near/far are placed at fixed *absolute*
-                            // offsets (in virtual-display-height units) in front of / behind
-                            // the per-eye eye->display distance to the convergence plane
-                            // (ZDP). display3d_compute_view anchors them per-eye from eye.z
-                            // (near = ez - near_offset, far = ez + far_offset), so they scale
-                            // with the virtual display (zoom). Transparent mode clips at the
-                            // ZDP (far_offset = 0); opaque keeps a large recede band.
-                            const float vH = tunables.virtual_display_height;
-                            const float near_offset = vH;
-                            const float far_offset  = g_transparentBg.load() ? 0.0f : 1000.0f * vH;
-
-                            XrPosef displayPose;
+                            // Rig: the ex-app-side Kooima tunables, 1:1. Pose is the
+                            // PLAIN world frame (no Y negation — that existed only to
+                            // match the renderer's view-stage mirror, which the zones
+                            // path retires via setPlainViewConvention).
                             XMVECTOR pOri = XMQuaternionRotationRollPitchYaw(
                                 renderPitch, inputSnapshot.yaw, 0);
                             XMFLOAT4 q;
                             XMStoreFloat4(&q, pOri);
-                            displayPose.orientation = {q.x, q.y, q.z, q.w};
-                            // ModelRenderer Y-mirrors the world inside updateUniforms (see comment
-                            // in gs_renderer.cpp). The off-axis Kooima projection assumes the
-                            // mirror is reflected in the displayPose passed to display3d_compute_views,
-                            // so negate Y here to keep the eye-vs-display geometry consistent.
-                            displayPose.position = {inputSnapshot.cameraPosX, -inputSnapshot.cameraPosY, inputSnapshot.cameraPosZ};
+                            tigerRig.next = nullptr;
+                            tigerRig.pose.orientation = {q.x, q.y, q.z, q.w};
+                            tigerRig.pose.position = {inputSnapshot.cameraPosX,
+                                                      inputSnapshot.cameraPosY,
+                                                      inputSnapshot.cameraPosZ};
+                            tigerRig.virtualDisplayHeight =
+                                inputSnapshot.viewParams.virtualDisplayHeight / inputSnapshot.viewParams.scaleFactor;
+                            tigerRig.ipdFactor         = inputSnapshot.viewParams.ipdFactor;
+                            tigerRig.parallaxFactor    = inputSnapshot.viewParams.parallaxFactor;
+                            tigerRig.perspectiveFactor = inputSnapshot.viewParams.perspectiveFactor;
 
-                            // nominalViewer in render frame too (Y mirrored) — used for
-                            // parallax-factor lerp, must match the eye/displayPose frame.
-                            XrVector3f nominalViewer = {xr->nominalViewerX, -xr->nominalViewerY, xr->nominalViewerZ};
-                            Display3DScreen screen = {winW_m, winH_m};
+                            // Zone rect = bottom 75% of the client window (client px,
+                            // y-down), recomputed every frame so live resize tracks.
+                            tigerZone.zoneId = 1;
+                            tigerZone.rect.offset = {0, (int32_t)(windowH / 4u)};
+                            tigerZone.rect.extent = {(int32_t)windowW,
+                                                     (int32_t)(windowH - windowH / 4u)};
 
-                            display3d_compute_views(
-                                rawEyes, (uint32_t)eyeCount, &nominalViewer,
-                                &screen, &tunables, &displayPose,
-                                near_offset, far_offset, /*vulkan_flip_y=*/0, stereoViews);
-                            // displayxr::math emits a GL ([-1,1] clip-z) projection; this is a
-                            // Vulkan renderer, so remap each per-view projection to [0,1]
-                            // (reproduces modelviewer's prior direct-[0,1] output). [#396 W3]
-                            for (uint32_t _v = 0; _v < (uint32_t)eyeCount; _v++)
-                                convert_projection_gl_to_zero_to_one(stereoViews[_v].projection_matrix);
-                            // NOTE: the bottom-75% confinement is done by rendering into
-                            // the bottom-75% sub-VIEWPORT of the tile (below) with this
-                            // sub-canvas projection — NOT by a clip-space remap (which
-                            // can't reproduce the sub-rect aspect and just cancels the
-                            // sub-canvas scaling).
+                            // Per-zone recommended view size; re-query when the rect
+                            // dims or the rendering mode change (the app-side
+                            // equivalent of XrEventDataDisplayZoneMetricsChangedEXT,
+                            // which displayxr-common's PollEvents drops unseen).
+                            // Clamped to the pre-sized swapchain capacity per tile.
+                            static XrExtent2Di s_zoneViewSize = {0, 0};
+                            static int32_t  s_lastZoneW = -1, s_lastZoneH = -1;
+                            static uint32_t s_lastZoneMode = 0xFFFFFFFFu;
+                            if (tigerZone.rect.extent.width  != s_lastZoneW ||
+                                tigerZone.rect.extent.height != s_lastZoneH ||
+                                xr->currentModeIndex != s_lastZoneMode) {
+                                if (XR_FAILED(g_pfnGetDisplayZoneViewSize(
+                                        xr->session, &tigerZone.rect, &s_zoneViewSize)) ||
+                                    s_zoneViewSize.width <= 0 || s_zoneViewSize.height <= 0) {
+                                    s_zoneViewSize = tigerZone.rect.extent;
+                                }
+                                s_lastZoneW = tigerZone.rect.extent.width;
+                                s_lastZoneH = tigerZone.rect.extent.height;
+                                s_lastZoneMode = xr->currentModeIndex;
+                            }
+                            tileW = (uint32_t)s_zoneViewSize.width;
+                            tileH = (uint32_t)s_zoneViewSize.height;
+                            if (tileW * cols > g_zoneSwapchain.width)  tileW = g_zoneSwapchain.width / cols;
+                            if (tileH * rows > g_zoneSwapchain.height) tileH = g_zoneSwapchain.height / rows;
+                            if (tileW == 0) tileW = 1;
+                            if (tileH == 0) tileH = 1;
+
+                            // Zone-scoped locate: runtime Kooima framed to the rect.
+                            // views[i].pose/fov come back render-ready; the raw
+                            // readback reports the canvas the runtime resolved (the
+                            // zone rect on the panel) for the billboard rebase.
+                            tigerZone.next = &tigerRig;
+                            XrViewLocateInfo zoneLocate = {XR_TYPE_VIEW_LOCATE_INFO};
+                            zoneLocate.next = &tigerZone;
+                            zoneLocate.viewConfigurationType = xr->viewConfigType;
+                            zoneLocate.displayTime = frameState.predictedDisplayTime;
+                            zoneLocate.space = xr->localSpace;
+                            XrViewDisplayRawEXT zoneRaw = {XR_TYPE_VIEW_DISPLAY_RAW_EXT};
+                            XrViewState zoneViewState = {XR_TYPE_VIEW_STATE};
+                            zoneViewState.next = &zoneRaw;
+                            for (uint32_t i = 0; i < 8; i++) zoneViews[i] = {XR_TYPE_VIEW};
+                            XrResult zlr = xrLocateViews(xr->session, &zoneLocate, &zoneViewState,
+                                                         8, &zoneViewCount, zoneViews);
+                            if (XR_SUCCEEDED(zlr) && zoneViewCount > 0) {
+                                if (zoneRaw.canvasRectPx.extent.width > 0) {
+                                    s_zoneCanvasPx = zoneRaw.canvasRectPx;
+                                    s_zoneCanvasValid = true;
+                                }
+                            } else {
+                                static bool s_zoneLocateWarned = false;
+                                if (!s_zoneLocateWarned) {
+                                    s_zoneLocateWarned = true;
+                                    LOG_WARN("Zone-scoped xrLocateViews failed (0x%x) — raw-views fallback",
+                                             (unsigned)zlr);
+                                }
+                                zonesFrame = false;
+                            }
                         }
 
                         // Double-click focus: center-eye ray through mouse, pick splat,
                         // smoothly re-pose the virtual display to face back along the ray.
-                        if (inputSnapshot.teleportRequested && useAppProjection) {
-                            float ndcX = 2.0f * inputSnapshot.teleportMouseX / (float)windowW - 1.0f;
-                            float ndcY = -(2.0f * inputSnapshot.teleportMouseY / (float)windowH - 1.0f);
+                        // The ray comes from the zone-scoped views (already in the plain
+                        // world frame, same frame as pickSurface's geometry); the mouse
+                        // maps over the ZONE rect — clicks in the bubble band don't pick.
+                        if (inputSnapshot.teleportRequested && zonesFrame &&
+                            inputSnapshot.teleportMouseY >= (float)tigerZone.rect.offset.y) {
+                            float ndcX = 2.0f * (inputSnapshot.teleportMouseX - (float)tigerZone.rect.offset.x) /
+                                         (float)tigerZone.rect.extent.width - 1.0f;
+                            float ndcY = -(2.0f * (inputSnapshot.teleportMouseY - (float)tigerZone.rect.offset.y) /
+                                          (float)tigerZone.rect.extent.height - 1.0f);
 
-                            float dispPxW2 = xr->displayPixelWidth > 0 ? (float)xr->displayPixelWidth : (float)xr->swapchain.width;
-                            float dispPxH2 = xr->displayPixelHeight > 0 ? (float)xr->displayPixelHeight : (float)xr->swapchain.height;
-                            float winW_m2 = (float)windowW * (xr->displayWidthM / dispPxW2);
-                            float winH_m2 = (float)windowH * (xr->displayHeightM / dispPxH2);
-                            Display3DScreen screen2 = {winW_m2, winH_m2};
-                            Display3DTunables tunables2;
-                            tunables2.ipd_factor = inputSnapshot.viewParams.ipdFactor;
-                            tunables2.parallax_factor = inputSnapshot.viewParams.parallaxFactor;
-                            tunables2.perspective_factor = inputSnapshot.viewParams.perspectiveFactor;
-                            tunables2.virtual_display_height = inputSnapshot.viewParams.virtualDisplayHeight / inputSnapshot.viewParams.scaleFactor;
-
-                            // Center-eye Display3DView from averaged processed display-space eye.
-                            XrVector3f centerEyeDisp = {
-                                (stereoViews[0].eye_display.x + stereoViews[1].eye_display.x) * 0.5f,
-                                (stereoViews[0].eye_display.y + stereoViews[1].eye_display.y) * 0.5f,
-                                (stereoViews[0].eye_display.z + stereoViews[1].eye_display.z) * 0.5f};
-                            float m2v_post = tunables2.virtual_display_height / winH_m2;
-                            float es = tunables2.perspective_factor * m2v_post;
-                            XrVector3f centerEyeProcessed = (es != 0.0f)
-                                ? XrVector3f{centerEyeDisp.x / es, centerEyeDisp.y / es, centerEyeDisp.z / es}
-                                : centerEyeDisp;
-                            // Use a real-world-frame displayPose for picking — the unproject
-                            // ray needs to be in the same frame as the splats (un-Y-flipped
-                            // world). The render-time displayPose has its Y negated for the
-                            // renderer's view-stage Y mirror; using that here would put
-                            // rayOrigin in a mirror frame and pickGaussian would intersect
-                            // against splats in the wrong frame.
-                            XrPosef displayPoseLocal;
-                            XMVECTOR pOri = XMQuaternionRotationRollPitchYaw(renderPitch, inputSnapshot.yaw, 0);
-                            XMFLOAT4 q;
-                            XMStoreFloat4(&q, pOri);
-                            displayPoseLocal.orientation = {q.x, q.y, q.z, q.w};
-                            displayPoseLocal.position = {inputSnapshot.cameraPosX, inputSnapshot.cameraPosY, inputSnapshot.cameraPosZ};
-                            Display3DView centerView;
-                            const float pick_vH = tunables2.virtual_display_height;
-                            const float pick_near_offset = pick_vH;
-                            const float pick_far_offset  = g_transparentBg.load() ? 0.0f : 1000.0f * pick_vH;
-                            display3d_compute_view(&centerEyeProcessed, &screen2, &tunables2,
-                                                   &displayPoseLocal, pick_near_offset, pick_far_offset, &centerView);
+                            // Center pose = view centroid (views are spread about the rig
+                            // centre), view-0 orientation/fov — close enough for a pick ray.
+                            XrPosef centerPose = zoneViews[0].pose;
+                            if (zoneViewCount >= 2) {
+                                centerPose.position.x = (zoneViews[0].pose.position.x + zoneViews[1].pose.position.x) * 0.5f;
+                                centerPose.position.y = (zoneViews[0].pose.position.y + zoneViews[1].pose.position.y) * 0.5f;
+                                centerPose.position.z = (zoneViews[0].pose.position.z + zoneViews[1].pose.position.z) * 0.5f;
+                            }
+                            float centerViewMat[16], centerProjMat[16];
+                            mat4_view_from_xr_pose(centerViewMat, centerPose);
+                            const float pick_vH = tigerRig.virtualDisplayHeight;
+                            const float pick_ez = RigLocalEyeZ(tigerRig.pose, centerPose.position);
+                            const float pick_near = (pick_ez - pick_vH > 0.001f) ? (pick_ez - pick_vH) : 0.001f;
+                            const float pick_far  = g_transparentBg.load() ? pick_ez : pick_ez + 1000.0f * pick_vH;
+                            mat4_from_xr_fov(centerProjMat, zoneViews[0].fov, pick_near, pick_far);
 
                             XrVector3f rayOriginV, rayDirV;
                             display3d_unproject_ndc_to_ray(ndcX, ndcY,
-                                centerView.view_matrix, centerView.projection_matrix,
+                                centerViewMat, centerProjMat,
                                 &rayOriginV, &rayDirV);
 
                             float rayOrigin[3] = {rayOriginV.x, rayOriginV.y, rayOriginV.z};
@@ -1381,15 +1561,16 @@ static void RenderThreadFunc(
                         rendered = true;
                         // eyeCount already computed above from active mode's view count
 
-                        // Mono center eye
+                        // Mono center eye — FALLBACK path only (the zone-scoped locate
+                        // returns the center view per active mode, no app averaging).
                         XMMATRIX monoViewMatrix, monoProjMatrix;
                         XrPosef monoPose = rawViews[0].pose;
-                        if (monoMode) {
+                        if (monoMode && !zonesFrame) {
                             monoPose.position.x = (rawViews[0].pose.position.x + rawViews[1].pose.position.x) * 0.5f;
                             monoPose.position.y = (rawViews[0].pose.position.y + rawViews[1].pose.position.y) * 0.5f;
                             monoPose.position.z = (rawViews[0].pose.position.z + rawViews[1].pose.position.z) * 0.5f;
 
-                            if (!useAppProjection) {
+                            {
                                 monoProjMatrix = xr->projMatrices[0];
                                 XMVECTOR centerLocalPos = XMVectorSet(
                                     monoPose.position.x, monoPose.position.y, monoPose.position.z, 0.0f);
@@ -1430,15 +1611,28 @@ static void RenderThreadFunc(
                         float viewMat[8][16], projMat[8][16];
                         float clipFar[8] = {0};  // per-eye view-space far cull (0 = off)
                         for (int eye = 0; eye < eyeCount; eye++) {
-                            if (useAppProjection) {
-                                int srcEye = monoMode ? 0 : eye;
-                                memcpy(viewMat[eye], stereoViews[srcEye].view_matrix, sizeof(float) * 16);
-                                memcpy(projMat[eye], stereoViews[srcEye].projection_matrix, sizeof(float) * 16);
-                                // eye_display.z = eye->display-plane forward distance,
-                                // same world units as the shader's p_view.z.
+                            if (zonesFrame) {
+                                // Render-ready zone views: view = inverse(pose),
+                                // projection from the runtime fov. Near/far are
+                                // app-side (the rig is clip-independent), anchored
+                                // exactly like the old Kooima: ZDP-relative offsets
+                                // in virtual-display-height units from the per-eye
+                                // eye->display-plane distance. Transparent mode
+                                // clips at the ZDP (far = ez); opaque keeps a large
+                                // recede band.
+                                const XrView& zv = zoneViews[(uint32_t)eye < zoneViewCount ? eye : zoneViewCount - 1];
+                                const float vH = tigerRig.virtualDisplayHeight;
+                                const float ez = RigLocalEyeZ(tigerRig.pose, zv.pose.position);
+                                const float nearZ = (ez - vH > 0.001f) ? (ez - vH) : 0.001f;
+                                const float farZ  = g_transparentBg.load() ? ez : ez + 1000.0f * vH;
+                                mat4_view_from_xr_pose(viewMat[eye], zv.pose);
+                                mat4_from_xr_fov(projMat[eye], zv.fov, nearZ, farZ);
+                                // GL ([-1,1] clip-z) -> Vulkan [0,1].
+                                convert_projection_gl_to_zero_to_one(projMat[eye]);
+                                // ez = eye->display-plane forward distance, same world
+                                // units as the shader's p_view.z (ex eye_display.z).
                                 if (foregroundClip) {
-                                    float cf = stereoViews[srcEye].eye_display.z;
-                                    clipFar[eye] = (cf > 0.2f) ? cf : 0.0f;  // never cull at/behind near
+                                    clipFar[eye] = (ez > 0.2f) ? ez : 0.0f;  // never cull at/behind near
                                 }
                             } else {
                                 // Fallback: use DirectXMath mono matrices, store as column-major
@@ -1455,15 +1649,34 @@ static void RenderThreadFunc(
                             }
                         }
 
-                        uint32_t imageIndex;
-                        if (AcquireSwapchainImage(*xr, imageIndex)) {
-                            VkFormat colorFormat = (VkFormat)xr->swapchain.format;
+                        // Zones path: render into the dedicated zone swapchain at
+                        // FULL tile size (the zone rect IS the bottom 75% — no
+                        // sub-viewport confinement). Fallback: legacy main-swapchain
+                        // atlas with the bottom-75% sub-viewport.
+                        static const float s_fadePx = EnvFadePx();
+                        uint32_t imageIndex = 0;
+                        const bool imageAcquired = zonesFrame
+                            ? AcquireWindowSpaceImage(g_zoneSwapchain, imageIndex)
+                            : AcquireSwapchainImage(*xr, imageIndex);
+                        if (imageAcquired) {
+                            const VkImage targetImage = zonesFrame
+                                ? g_zoneSwapImages[imageIndex] : (*swapchainVkImages)[imageIndex];
+                            const VkFormat colorFormat = (VkFormat)(zonesFrame
+                                ? g_zoneSwapchain.format : xr->swapchain.format);
+                            const uint32_t targetW = zonesFrame ? g_zoneSwapchain.width  : xr->swapchain.width;
+                            const uint32_t targetH = zonesFrame ? g_zoneSwapchain.height : xr->swapchain.height;
 
                             bool hasGsScene;
                             {
                                 std::lock_guard<std::mutex> lock(g_sceneMutex);
                                 hasGsScene = g_modelRenderer.hasModel();
                             }
+
+                            // Zone views are render-ready (un-mirrored) — the renderer
+                            // runs the plain +Y-up convention (negative-height viewport).
+                            // The fallback's DirectXMath matrices keep the legacy mirror.
+                            // Per-frame so a transient zone-locate failure stays correct.
+                            g_modelRenderer.setPlainViewConvention(zonesFrame);
 
                             if (hasGsScene) {
                                 for (int eye = 0; eye < eyeCount; eye++) {
@@ -1472,25 +1685,38 @@ static void RenderThreadFunc(
                                     // it collapses to (0, 0).
                                     uint32_t col = (uint32_t)eye % cols;
                                     uint32_t row = (uint32_t)eye / cols;
-                                    uint32_t vpX = col * renderW;
-                                    uint32_t vpY = row * renderH;
-                                    // Confine the avatar to the BOTTOM 75% of the tile (→
-                                    // bottom 75% of the window). The top 25% of the tile is
-                                    // left untouched — the full-top-25% Local2D bubble's
-                                    // implicit mask (M=0) replaces the weave there with the
-                                    // flat bubble, so those pixels are never shown.
-                                    const uint32_t avH = (renderH * 3u) / 4u;
-                                    const uint32_t avY = vpY + (renderH - avH);
-                                    g_modelRenderer.renderEye(
-                                        (*swapchainVkImages)[imageIndex], colorFormat,
-                                        xr->swapchain.width, xr->swapchain.height,
-                                        vpX, avY, renderW, avH,
-                                        viewMat[eye], projMat[eye],
-                                        g_transparentBg.load(), clipFar[eye]);
+                                    if (zonesFrame) {
+                                        // Full tile + content-alpha edge feather
+                                        // (ADR-027 rule 4 — the wish mask can't
+                                        // carry per-zone fades).
+                                        g_modelRenderer.renderEye(
+                                            targetImage, colorFormat,
+                                            targetW, targetH,
+                                            col * tileW, row * tileH, tileW, tileH,
+                                            viewMat[eye], projMat[eye],
+                                            g_transparentBg.load(), clipFar[eye],
+                                            s_fadePx);
+                                    } else {
+                                        uint32_t vpX = col * renderW;
+                                        uint32_t vpY = row * renderH;
+                                        // Confine the avatar to the BOTTOM 75% of the tile (→
+                                        // bottom 75% of the window). The top 25% of the tile is
+                                        // left untouched — the full-top-25% Local2D bubble's
+                                        // implicit mask (M=0) replaces the weave there with the
+                                        // flat bubble, so those pixels are never shown.
+                                        const uint32_t avH = (renderH * 3u) / 4u;
+                                        const uint32_t avY = vpY + (renderH - avH);
+                                        g_modelRenderer.renderEye(
+                                            targetImage, colorFormat,
+                                            targetW, targetH,
+                                            vpX, avY, renderW, avH,
+                                            viewMat[eye], projMat[eye],
+                                            g_transparentBg.load(), clipFar[eye]);
+                                    }
                                 }
                             } else {
                                 RenderPlaceholder(vkDevice, graphicsQueue, renderCmdPool,
-                                    (*swapchainVkImages)[imageIndex], xr->swapchain.width, xr->swapchain.height);
+                                    targetImage, targetW, targetH);
                             }
 
                             // 'I' key: snapshot the multi-view atlas the runtime
@@ -1541,18 +1767,30 @@ static void RenderThreadFunc(
                                 uint32_t col = (uint32_t)eye % cols;
                                 uint32_t row = (uint32_t)eye / cols;
                                 projectionViews[eye].type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
-                                projectionViews[eye].subImage.swapchain = xr->swapchain.swapchain;
-                                projectionViews[eye].subImage.imageRect.offset = {
-                                    (int32_t)(col * renderW), (int32_t)(row * renderH)};
-                                projectionViews[eye].subImage.imageRect.extent = {
-                                    (int32_t)renderW, (int32_t)renderH};
                                 projectionViews[eye].subImage.imageArrayIndex = 0;
-                                projectionViews[eye].pose = monoMode ? monoPose : rawViews[eye].pose;
-                                projectionViews[eye].fov = useAppProjection ?
-                                    stereoViews[monoMode ? 0 : eye].fov :
-                                    (monoMode ? rawViews[0].fov : rawViews[eye].fov);
+                                if (zonesFrame) {
+                                    // Zone tiles + the runtime-returned pose/fov,
+                                    // verbatim (core requires pose/fov copied in).
+                                    const XrView& zv = zoneViews[(uint32_t)eye < zoneViewCount ? eye : zoneViewCount - 1];
+                                    projectionViews[eye].subImage.swapchain = g_zoneSwapchain.swapchain;
+                                    projectionViews[eye].subImage.imageRect.offset = {
+                                        (int32_t)(col * tileW), (int32_t)(row * tileH)};
+                                    projectionViews[eye].subImage.imageRect.extent = {
+                                        (int32_t)tileW, (int32_t)tileH};
+                                    projectionViews[eye].pose = zv.pose;
+                                    projectionViews[eye].fov = zv.fov;
+                                } else {
+                                    projectionViews[eye].subImage.swapchain = xr->swapchain.swapchain;
+                                    projectionViews[eye].subImage.imageRect.offset = {
+                                        (int32_t)(col * renderW), (int32_t)(row * renderH)};
+                                    projectionViews[eye].subImage.imageRect.extent = {
+                                        (int32_t)renderW, (int32_t)renderH};
+                                    projectionViews[eye].pose = monoMode ? monoPose : rawViews[eye].pose;
+                                    projectionViews[eye].fov = monoMode ? rawViews[0].fov : rawViews[eye].fov;
+                                }
                             }
-                            ReleaseSwapchainImage(*xr);
+                            if (zonesFrame) ReleaseWindowSpaceImage(g_zoneSwapchain);
+                            else            ReleaseSwapchainImage(*xr);
 
                             // Update the click-through silhouette from the same
                             // left-eye matrices we just drew (so the hit mask
@@ -1561,11 +1799,12 @@ static void RenderThreadFunc(
                             // to every other frame: the pass adds two GPU waits, and
                             // ~30 Hz is plenty for the hit region — keeping it off the
                             // every-frame path steadies frame timing (no billboard
-                            // stutter).
+                            // stutter). imgW/imgH = the dims the eye render used, so
+                            // the renderer's internal targets don't churn.
                             static uint32_t s_silFrame = 0;
                             if (hasGsScene && (s_silFrame++ & 1u) == 0u)
                                 UpdateSilhouette(vkDevice, physDevice, graphicsQueue, renderCmdPool,
-                                    xr, windowW, windowH, viewMat[0], projMat[0], clipFar[0]);
+                                    targetW, targetH, windowW, windowH, viewMat[0], projMat[0], clipFar[0]);
                         } else {
                             rendered = false;
                         }
@@ -1709,12 +1948,26 @@ static void RenderThreadFunc(
                     proj.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
                     proj.viewCount = submitViewCount;
                     proj.views = projectionViews;
+                    if (zonesFrame) {
+                        // Same XrDisplayZoneEXT instance as the locate, rig chain
+                        // cleared — this makes the frame a ZONES frame: the runtime
+                        // weaves the tiger views into the bottom-75% rect, composites
+                        // the bubble flat in the top 25%, and auto-derives the wish
+                        // (feathered bottom-75%) — no mask object, nothing chained
+                        // on xrEndFrame.
+                        tigerZone.next = nullptr;
+                        proj.next = &tigerZone;
+                    }
                     const XrCompositionLayerBaseHeader* layers[3];
                     uint32_t layerN = 0;
                     layers[layerN++] = (const XrCompositionLayerBaseHeader*)&proj;
                     if (bubbleReady) {
                         // Background (full-band transparent) first, then the bubble on
-                        // top — Local2D layers flatten in list order.
+                        // top — Local2D layers flatten in list order. (In a zones
+                        // frame the implicit-mask rule is inert — Local2D is pure 2D
+                        // content — so the backer's mask-extension purpose is moot,
+                        // but it stays harmless: bubble code unchanged per the P6
+                        // migration spec.)
                         layers[layerN++] = (const XrCompositionLayerBaseHeader*)&bubbleBgLayer;
                         layers[layerN++] = (const XrCompositionLayerBaseHeader*)&bubbleLayer;
                     }
@@ -1723,6 +1976,16 @@ static void RenderThreadFunc(
                     endInfo.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND;
                     endInfo.layerCount = layerN;
                     endInfo.layers = layers;
+                    // DXR_ZONES_VALIDATE=1: chain the strict locate/submit pairing
+                    // validation (bring-up diagnostics). Default: nothing chained =
+                    // auto wish.
+                    static const bool s_zonesValidate = EnvZonesValidate();
+                    XrDisplayZonesFrameEndInfoEXT zonesEnd = {XR_TYPE_DISPLAY_ZONES_FRAME_END_INFO_EXT};
+                    if (zonesFrame && s_zonesValidate) {
+                        zonesEnd.flags = XR_DISPLAY_ZONES_FRAME_END_VALIDATE_BIT_EXT;
+                        zonesEnd.wishMask = XR_NULL_HANDLE;  // auto wish either way
+                        endInfo.next = &zonesEnd;
+                    }
                     xrEndFrame(xr->session, &endInfo);
                 } else {
                     XrFrameEndInfo endInfo = {XR_TYPE_FRAME_END_INFO};
@@ -2064,6 +2327,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         xrDestroySwapchain(g_animBtnSwapchain.swapchain);
         g_animBtnSwapchain.swapchain = XR_NULL_HANDLE;
         g_hasAnimBtnSwapchain = false;
+    }
+
+    // App-owned tiger-zone swapchain (display-zones path), same ordering rule.
+    if (g_zoneSwapchain.swapchain != XR_NULL_HANDLE) {
+        xrDestroySwapchain(g_zoneSwapchain.swapchain);
+        g_zoneSwapchain.swapchain = XR_NULL_HANDLE;
+        g_zonesActive = false;
     }
 
     g_xr = nullptr;

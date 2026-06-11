@@ -8,12 +8,21 @@
 #include "xr_session.h"
 #include "logging.h"
 #include <openxr/XR_EXT_local_3d_zone.h>  // Local2D speech-bubble layer
+#include <openxr/XR_EXT_view_rig.h>       // XR_EXT_VIEW_RIG_EXTENSION_NAME
 #include <cstring>
 
 // App-side availability flag (XrSessionManager carries no app-named fields).
 // True when the runtime advertises XR_EXT_local_3d_zone, which the avatar uses
 // to composite the 2D speech bubble as a mask-gated post-weave layer.
 bool g_hasLocal3DZone = false;
+
+// XR_EXT_view_rig + XR_EXT_display_zones: runtime-side framing for the tiger
+// zone (the app chains XrDisplayZoneEXT + XrDisplayRigEXT on xrLocateViews and
+// consumes render-ready XrView pose/fov instead of running app-side Kooima).
+bool g_hasViewRigExt = false;
+bool g_hasDisplayZonesExt = false;
+PFN_xrGetDisplayZoneCapabilitiesEXT g_pfnGetDisplayZoneCaps = nullptr;
+PFN_xrGetDisplayZoneRecommendedViewSizeEXT g_pfnGetDisplayZoneViewSize = nullptr;
 
 #define XR_CHECK(call) \
     do { \
@@ -65,6 +74,12 @@ bool InitializeOpenXR(XrSessionManager& xr) {
         if (strcmp(ext.extensionName, XR_EXT_LOCAL_3D_ZONE_EXTENSION_NAME) == 0) {
             g_hasLocal3DZone = true;
         }
+        if (strcmp(ext.extensionName, XR_EXT_VIEW_RIG_EXTENSION_NAME) == 0) {
+            g_hasViewRigExt = true;
+        }
+        if (strcmp(ext.extensionName, XR_EXT_DISPLAY_ZONES_EXTENSION_NAME) == 0) {
+            g_hasDisplayZonesExt = true;
+        }
     }
 
     LOG_INFO("XR_KHR_vulkan_enable: %s", hasVulkan ? "AVAILABLE" : "NOT FOUND");
@@ -73,6 +88,8 @@ bool InitializeOpenXR(XrSessionManager& xr) {
     LOG_INFO("XR_EXT_workspace_file_dialog: %s", xr.hasFileDialogExt ? "AVAILABLE" : "NOT FOUND");
     LOG_INFO("XR_EXT_atlas_capture: %s", xr.hasAtlasCaptureExt ? "AVAILABLE" : "NOT FOUND");
     LOG_INFO("XR_EXT_local_3d_zone: %s", g_hasLocal3DZone ? "AVAILABLE" : "NOT FOUND");
+    LOG_INFO("XR_EXT_view_rig: %s", g_hasViewRigExt ? "AVAILABLE" : "NOT FOUND");
+    LOG_INFO("XR_EXT_display_zones: %s", g_hasDisplayZonesExt ? "AVAILABLE" : "NOT FOUND");
 
     if (!hasVulkan) {
         LOG_ERROR("XR_KHR_vulkan_enable extension not available");
@@ -95,6 +112,12 @@ bool InitializeOpenXR(XrSessionManager& xr) {
     }
     if (g_hasLocal3DZone) {
         enabledExtensions.push_back(XR_EXT_LOCAL_3D_ZONE_EXTENSION_NAME);
+    }
+    if (g_hasViewRigExt) {
+        enabledExtensions.push_back(XR_EXT_VIEW_RIG_EXTENSION_NAME);
+    }
+    if (g_hasDisplayZonesExt) {
+        enabledExtensions.push_back(XR_EXT_DISPLAY_ZONES_EXTENSION_NAME);
     }
 
     XrInstanceCreateInfo createInfo = {XR_TYPE_INSTANCE_CREATE_INFO};
@@ -184,6 +207,19 @@ bool InitializeOpenXR(XrSessionManager& xr) {
         xrGetInstanceProcAddr(xr.instance, "xrCaptureAtlasEXT",
             (PFN_xrVoidFunction*)&xr.pfnCaptureAtlasEXT);
         LOG_INFO("xrCaptureAtlasEXT: %s", xr.pfnCaptureAtlasEXT ? "resolved" : "NULL");
+    }
+
+    // XR_EXT_display_zones (ADR-027): resolve the zone caps + per-rect
+    // recommended-view-size entries. Both are session-scoped calls used by
+    // the zones frame path in main.cpp.
+    if (g_hasDisplayZonesExt) {
+        xrGetInstanceProcAddr(xr.instance, "xrGetDisplayZoneCapabilitiesEXT",
+            (PFN_xrVoidFunction*)&g_pfnGetDisplayZoneCaps);
+        xrGetInstanceProcAddr(xr.instance, "xrGetDisplayZoneRecommendedViewSizeEXT",
+            (PFN_xrVoidFunction*)&g_pfnGetDisplayZoneViewSize);
+        LOG_INFO("xrGetDisplayZoneCapabilitiesEXT: %s / xrGetDisplayZoneRecommendedViewSizeEXT: %s",
+            g_pfnGetDisplayZoneCaps ? "resolved" : "NULL",
+            g_pfnGetDisplayZoneViewSize ? "resolved" : "NULL");
     }
 
     uint32_t viewCount = 0;

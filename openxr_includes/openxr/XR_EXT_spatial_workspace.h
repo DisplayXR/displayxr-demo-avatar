@@ -25,7 +25,7 @@ extern "C" {
 #endif
 
 #define XR_EXT_spatial_workspace 1
-#define XR_EXT_spatial_workspace_SPEC_VERSION 23
+#define XR_EXT_spatial_workspace_SPEC_VERSION 24
 #define XR_EXT_SPATIAL_WORKSPACE_EXTENSION_NAME "XR_EXT_spatial_workspace"
 
 // Provisional XrStructureType values. The 1000999100..110 range is reserved for
@@ -278,10 +278,11 @@ typedef XrResult (XRAPI_PTR *PFN_xrSetWorkspaceClientFrameRateCapEXT)(
 /*!
  * @brief Set the workspace's focused client.
  *
- * The runtime forwards keyboard input (other than runtime-reserved keys
- * TAB/DELETE/ESC) and click-through events to the focused client's HWND.
- * The workspace controller decides who gets focus from its interpretation
- * of pointer events drained via xrEnumerateWorkspaceInputEventsEXT.
+ * The runtime forwards keyboard input (other than chords the controller has
+ * reserved via xrSetWorkspaceReservedKeysEXT) and click-through events to the
+ * focused client's HWND. The workspace controller decides who gets focus from
+ * its interpretation of pointer events drained via
+ * xrEnumerateWorkspaceInputEventsEXT.
  *
  * @param session   A valid workspace session.
  * @param clientId  The client to focus, or XR_NULL_WORKSPACE_CLIENT_ID
@@ -301,6 +302,52 @@ typedef XrResult (XRAPI_PTR *PFN_xrSetWorkspaceFocusedClientEXT)(
 typedef XrResult (XRAPI_PTR *PFN_xrGetWorkspaceFocusedClientEXT)(
     XrSession            session,
     XrWorkspaceClientId *outClientId);
+
+// ---- Reserved keys (spec_version 24) ----
+
+/*!
+ * @brief One reserved key chord the controller owns.
+ *
+ * A key event matches an entry only when BOTH its vkCode and its modifier
+ * mask equal the entry exactly. The mask uses the same 3-bit convention as
+ * the KEY input event (bit0=SHIFT, bit1=CTRL, bit2=ALT), so {VK_TAB, 0}
+ * reserves bare Tab while {VK_TAB, SHIFT} is a distinct, unreserved chord
+ * that still forwards to the focused client.
+ */
+typedef struct XrWorkspaceReservedKeyEXT {
+    uint32_t vkCode;     // Win32 VK_*
+    uint32_t modifiers;  // bit0=SHIFT, bit1=CTRL, bit2=ALT
+} XrWorkspaceReservedKeyEXT;
+
+#define XR_WORKSPACE_MAX_RESERVED_KEYS_EXT 32
+
+/*!
+ * @brief Declare the set of key chords the controller reserves.
+ *
+ * Reserved chords are still emitted on the input-event queue (so the
+ * controller can act on them) but are NOT forwarded to the focused client's
+ * HWND. This replaces the runtime's hardcoded reserved-key policy: the
+ * controller is the single source of truth for which chords it owns.
+ *
+ * Matching is exact on (vkCode, modifiers) — see XrWorkspaceReservedKeyEXT.
+ * Non-reserved key chords are forwarded to the focused client with their
+ * modifier state preserved.
+ *
+ * @param session   A valid workspace session.
+ * @param keyCount  Number of entries in @p keys (0 restores the runtime's
+ *                  built-in default set; at most
+ *                  XR_WORKSPACE_MAX_RESERVED_KEYS_EXT).
+ * @param keys      Array of reserved chords; may be NULL when keyCount == 0.
+ *
+ * @return XR_SUCCESS on success,
+ *         XR_ERROR_VALIDATION_FAILURE if keyCount exceeds the max or keys is
+ *         NULL with keyCount > 0,
+ *         XR_ERROR_FEATURE_UNSUPPORTED if @p session is not the active workspace.
+ */
+typedef XrResult (XRAPI_PTR *PFN_xrSetWorkspaceReservedKeysEXT)(
+    XrSession                        session,
+    uint32_t                         keyCount,
+    const XrWorkspaceReservedKeyEXT *keys);
 
 // ---- Input event drain + pointer capture (spec_version 4) ----
 
@@ -330,12 +377,12 @@ typedef enum XrWorkspaceInputEventTypeEXT {
  * clientId / region / UV fields itself from its own eye→cursor raycast (the
  * runtime no longer computes them at drain time).
  *
- * Hardcoded MVP key policy (see xrEnumerateWorkspaceInputEventsEXT):
- *   - TAB and DELETE are consumed by the runtime (never delivered to the
- *     focused HWND, but still emitted on this queue for visibility).
- *   - ESC is consumed when any window is maximized.
- *   - Everything else is delivered via this queue AND forwarded to the
- *     focused client's HWND.
+ * Key forwarding policy (spec_version 24): the controller declares the chords
+ * it reserves via xrSetWorkspaceReservedKeysEXT. Reserved chords are emitted
+ * on this queue but NOT forwarded to the focused HWND; every other chord is
+ * both emitted here AND forwarded to the focused client with its modifier
+ * state preserved. Until the controller registers a set, the runtime falls
+ * back to a built-in default (bare TAB/DELETE/ESC/[/]).
  *
  * Pointer motion events (spec_version 6) deliver per-frame WM_MOUSEMOVE while
  * pointer capture is enabled. Controllers wanting hover feedback without

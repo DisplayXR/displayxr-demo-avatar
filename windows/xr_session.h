@@ -11,10 +11,25 @@
 #include <vulkan/vulkan.h>
 #define XR_USE_GRAPHICS_API_VULKAN
 #include "xr_session_common.h"
+#include <openxr/XR_EXT_display_zones.h>  // zone caps/view-size PFN typedefs
 
 // True when the runtime advertises XR_EXT_local_3d_zone (set in InitializeOpenXR).
 // Gates the avatar's 2D speech-bubble Local2D layer.
 extern bool g_hasLocal3DZone;
+
+// True when the runtime advertises XR_EXT_view_rig (set in InitializeOpenXR).
+// Required for the zone-chained XrDisplayRigEXT locate (runtime-side framing).
+extern bool g_hasViewRigExt;
+
+// True when the runtime advertises XR_EXT_display_zones (set in InitializeOpenXR).
+// Together with g_hasViewRigExt this gates the zones frame path: one 3D zone
+// (the tiger, bottom 75%) framed by the runtime rig instead of app-side Kooima.
+extern bool g_hasDisplayZonesExt;
+
+// XR_EXT_display_zones entry points (resolved in InitializeOpenXR; NULL when
+// the extension is absent — callers must check).
+extern PFN_xrGetDisplayZoneCapabilitiesEXT g_pfnGetDisplayZoneCaps;
+extern PFN_xrGetDisplayZoneRecommendedViewSizeEXT g_pfnGetDisplayZoneViewSize;
 
 // Initialize OpenXR instance with Vulkan + win32_window_binding extensions
 bool InitializeOpenXR(XrSessionManager& xr);
