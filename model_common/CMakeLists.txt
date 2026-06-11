@@ -84,6 +84,7 @@ set(SHADER_SOURCES
     shaders/brdf_lut.frag
     shaders/irradiance.frag
     shaders/prefilter.frag
+    shaders/edge_fade.frag
 )
 # GLSL #include dependencies (force recompile when these change).
 set(SHADER_INCLUDES

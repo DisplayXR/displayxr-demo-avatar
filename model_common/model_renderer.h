@@ -85,6 +85,17 @@ struct ModelRenderer {
                       const float viewerOffsetLocal[3],
                       uint32_t numCandidates = 8) const;
 
+    // Opt into the plain +Y-up view convention: the caller feeds an
+    // un-reflected view matrix (e.g. the render-ready XR_EXT_view_rig XrView
+    // pose) and Vulkan Y-down is handled at the RASTER stage via a
+    // negative-height viewport in renderEye. Default off = legacy convention
+    // (view-stage Y mirror, positive viewport) used by the macOS port.
+    void setPlainViewConvention(bool plain) { plainViewConvention_ = plain; }
+
+    // edgeFadePx > 0 fades the rendered CONTENT alpha (premultiplied: RGB and
+    // A together) to 0 over that many pixels at the viewport edges — the
+    // per-zone soft boundary of ADR-027 rule 4 (the union wish mask cannot
+    // express per-zone fades). 0 = off (silhouette pass, legacy callers).
     void renderEye(VkImage swapchainImage,
                    VkFormat swapchainFormat,
                    uint32_t imageWidth,
@@ -96,7 +107,8 @@ struct ModelRenderer {
                    const float viewMatrix[16],
                    const float projMatrix[16],
                    bool transparentBg = false,
-                   float clipFarViewSpace = 0.0f);
+                   float clipFarViewSpace = 0.0f,
+                   float edgeFadePx = 0.0f);
 
     void cleanup();
     ~ModelRenderer();
@@ -153,6 +165,7 @@ private:
     uint32_t height_ = 0;
     bool initialized_ = false;
     bool modelLoaded_ = false;
+    bool plainViewConvention_ = false;   // see setPlainViewConvention
     std::string loadedModelPath_;
     uint32_t numPrimitives_ = 0;
 
@@ -177,6 +190,10 @@ private:
     VkPipelineLayout pipelineLayout_ = VK_NULL_HANDLE;
     VkPipeline pipeline_ = VK_NULL_HANDLE;
     VkPipeline skyboxPipeline_ = VK_NULL_HANDLE;   // analytic-sky background (opaque mode)
+    // Edge-fade post-pass (ADR-027 rule 4): multiplicative dst *= f over the
+    // last draw of the render pass. Own layout (push constants only, no sets).
+    VkPipelineLayout fadePipelineLayout_ = VK_NULL_HANDLE;
+    VkPipeline fadePipeline_ = VK_NULL_HANDLE;
     VkDescriptorPool descriptorPool_ = VK_NULL_HANDLE;
     VkDescriptorSet descriptorSet_ = VK_NULL_HANDLE;
     ModelBuffer uniformBuffer_;   // host-visible UniformBlock
