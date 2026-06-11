@@ -222,8 +222,11 @@ static const bool g_inputInit = [] {
 static std::mutex g_inputMutex;
 static std::atomic<bool> g_running{true};
 static XrSessionManager* g_xr = nullptr;
-static UINT g_windowWidth = 1280;
-static UINT g_windowHeight = 720;
+// Portrait default: a standing full-body avatar wants a tall window (the
+// bottom 75% is the tiger zone, top 25% the speech bubble). Physical pixels
+// (the app is PerMonitorV2 DPI-aware); B toggles decoration for move/resize.
+static UINT g_windowWidth = 960;
+static UINT g_windowHeight = 1920;
 
 // 3DGS state
 static ModelRenderer g_modelRenderer;
