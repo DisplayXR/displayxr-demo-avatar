@@ -58,7 +58,7 @@ static const wchar_t* WINDOW_CLASS = L"DisplayXRAvatarClass";
 static const wchar_t* WINDOW_TITLE = L"DisplayXR 3D Avatar";
 
 // Speech-bubble swapchain texture. Generous + roughly 4:1 so the rounded panel
-// can be rendered into an aspect-matched SUB-RECT of it (sized to the live top-30%
+// can be rendered into an aspect-matched SUB-RECT of it (sized to the live top-25%
 // band each frame) and mapped sub-rect→full-band with no stretch — see the bubble
 // block in the render loop. Sized for resolution headroom across band aspects.
 static const uint32_t BTN_BAR_TEX_W = 2048;
@@ -259,10 +259,10 @@ static std::vector<XrSwapchainImageVulkanKHR> g_animBtnSwapImages;
 // extent. Matches macOS demo's kDefaultVirtualDisplayHeightM (1.5m).
 static constexpr float kFallbackVirtualDisplayHeightM = 1.5f;
 // Initial virtual-display height as a multiple of the avatar's height. The
-// avatar should occupy 80% of the virtual-display (i.e. its bottom-70% canvas)
-// height at start, so vHeight = modelHeight / 0.80 = modelHeight × 1.25 → 10%
+// avatar should occupy 90% of the virtual-display (i.e. its bottom-75% canvas)
+// height at start, so vHeight = modelHeight / 0.90 = modelHeight × 1.111 → 5%
 // headroom top and bottom.
-static constexpr float kAutoFitVerticalComfort = 1.25f;
+static constexpr float kAutoFitVerticalComfort = 1.111f;
 
 // Cached auto-fit pose for the currently loaded scene. Reused by Reset
 // so 'Space' returns to the framed pose rather than world origin.
@@ -514,10 +514,10 @@ static void UpdateClickRegion(HWND hwnd) {
         const int cw = g_silCoverage.covW, ch = g_silCoverage.covH;
         winW = g_silCoverage.winW; winH = g_silCoverage.winH;
         // One client-space RECT per horizontal run of covered coverage-pixels.
-        // Skip the top 30%: the avatar is confined to the bottom 70%, and the
-        // top-30% silhouette pixels are stale/untouched (the bubble rect is added
+        // Skip the top 25%: the avatar is confined to the bottom 75%, and the
+        // top-25% silhouette pixels are stale/untouched (the bubble rect is added
         // to the region separately below).
-        const int yStart = (ch * 3) / 10;
+        const int yStart = (ch * 1) / 4;
         for (int y = yStart; y < ch; ++y) {
             int x = 0;
             while (x < cw) {
@@ -828,10 +828,10 @@ static void UpdateSilhouette(VkDevice dev, VkPhysicalDevice phys, VkQueue queue,
     {
         std::lock_guard<std::mutex> lock(g_sceneMutex);
         if (!g_modelRenderer.hasModel()) return;
-        // Render the avatar into the bottom 70% of the silhouette image too, so the
-        // hit mask matches the confined on-screen avatar. The top 30% is left as-is
-        // (covered by the full-top-30% bubble rect in the click region).
-        const uint32_t silAvH = (h * 7u) / 10u;
+        // Render the avatar into the bottom 75% of the silhouette image too, so the
+        // hit mask matches the confined on-screen avatar. The top 25% is left as-is
+        // (covered by the full-top-25% bubble rect in the click region).
+        const uint32_t silAvH = (h * 3u) / 4u;
         const uint32_t silAvY = h - silAvH;
         g_modelRenderer.renderEye(g_silImage.image, VK_FORMAT_R8G8B8A8_UNORM,
             xr->swapchain.width, xr->swapchain.height,
@@ -930,15 +930,12 @@ static void RenderThreadFunc(
             std::lock_guard<std::mutex> lock(g_inputMutex);
             inputSnapshot = g_inputState;
         }
-        // Pitch sign flip for the GS demo: shared input_handler.cpp mutates
-        // pitch with `-= dy` (cube_handle convention, paired with negative
-        // VkViewport.height Y-flip at rasterization). The GS demo Y-flips
-        // at the *view* stage in gs_renderer.cpp instead — that inverts the
-        // visual response, so we negate here to restore drag-down → look-down.
-        // Only `renderPitch` is used downstream; `inputSnapshot.pitch` itself
-        // stays in shared-handler convention so the writeback at end of frame
-        // doesn't compound.
-        float renderPitch = -inputSnapshot.pitch;
+        // The avatar stays UPRIGHT: mouse-drag must not pitch it (the character
+        // faces the viewer via the yaw billboard; tilting it forward/back looks
+        // wrong). Pin renderPitch to 0 so drag-pitch is ignored everywhere it's
+        // consumed (display pose, mono matrices, pick). The shared input handler
+        // still accumulates inputSnapshot.pitch on drag, but nothing renders it.
+        float renderPitch = 0.0f;
         {
             std::lock_guard<std::mutex> lock(g_inputMutex);
             resetRequested = g_inputState.resetViewRequested;
@@ -1034,18 +1031,21 @@ static void RenderThreadFunc(
             }
         }
 
-        // Bind the virtual-display rig to a moving/skinned subject — but only in
-        // X/Y. We center the avatar horizontally/vertically on the smoothed
-        // skeleton centroid (so A/D/Q/E strafe and the animation's own drift
-        // don't slide it off-screen), while leaving Z under the user's control.
-        // That makes W/S the single depth lever: it dollies the avatar toward /
-        // away from the viewer THROUGH the display-plane clip (foreground-only),
-        // which is exactly the avatar UX (only W/S, clip at the screen plane).
-        // Applied to inputSnapshot only, so g_inputState keeps the full pose.
+        // Bind the virtual-display rig to a moving/skinned subject. We center the
+        // avatar VERTICALLY on the smoothed skeleton centroid (so the animation's
+        // own bob doesn't slide it off-screen), and horizontally on the centroid
+        // PLUS the user's A/D pan — cameraPosX accumulates the A/D strafe from
+        // UpdateCameraMovement, based at g_fitCenter[0], so (cameraPosX - fitCentre)
+        // is the net horizontal pan since the last reset. Z stays the user's W/S
+        // depth dolly. So: A/D = slide left/right, W/S = depth, all on top of the
+        // drift-removing anchor. Applied to inputSnapshot only; g_inputState keeps
+        // the accumulated pose (and the pan resets to 0 on Space, which restores
+        // cameraPosX = g_fitCenter[0]).
         {
             float anchor[3];
             if (g_fitValid.load() && g_modelRenderer.getAnimatedAnchor(anchor)) {
-                inputSnapshot.cameraPosX = anchor[0];
+                const float kPanSign = -1.0f;  // D = avatar right; flip if reversed
+                inputSnapshot.cameraPosX = anchor[0] + kPanSign * (inputSnapshot.cameraPosX - g_fitCenter[0]);
                 inputSnapshot.cameraPosY = anchor[1];
                 // cameraPosZ intentionally left as the user's W/S-driven value.
             }
@@ -1132,12 +1132,12 @@ static void RenderThreadFunc(
                             // Confine the 3D rig to the BOTTOM 70% of the window: the
                             // Kooima canvas is a bottom-70% sub-rect (full width, correct
                             // aspect, centre lowered), and the per-eye projection is
-                            // remapped into the bottom 70% of the tile (below). The top
-                            // 30% is left for the flat 2D speech bubble. This is the
+                            // remapped into the bottom 75% of the tile (below). The top
+                            // 25% is left for the flat 2D speech bubble. This is the
                             // handle-app equivalent of a texture app's
                             // xrSetSharedTextureOutputRectEXT canvas rect.
-                            const float kCanvasH       = 0.70f;  // canvas height / window
-                            const float kCanvasCenterY = 0.65f;  // canvas centre / window (0.30 + 0.70/2)
+                            const float kCanvasH       = 0.75f;  // canvas height / window
+                            const float kCanvasCenterY = 0.625f; // canvas centre / window (0.25 + 0.75/2)
                             float winH_m = (float)windowH * kCanvasH * pxSizeY;
 
                             // Window-relative Kooima: compute eye offset from canvas center
@@ -1285,8 +1285,8 @@ static void RenderThreadFunc(
                             // (reproduces modelviewer's prior direct-[0,1] output). [#396 W3]
                             for (uint32_t _v = 0; _v < (uint32_t)eyeCount; _v++)
                                 convert_projection_gl_to_zero_to_one(stereoViews[_v].projection_matrix);
-                            // NOTE: the bottom-70% confinement is done by rendering into
-                            // the bottom-70% sub-VIEWPORT of the tile (below) with this
+                            // NOTE: the bottom-75% confinement is done by rendering into
+                            // the bottom-75% sub-VIEWPORT of the tile (below) with this
                             // sub-canvas projection — NOT by a clip-space remap (which
                             // can't reproduce the sub-rect aspect and just cancels the
                             // sub-canvas scaling).
@@ -1474,12 +1474,12 @@ static void RenderThreadFunc(
                                     uint32_t row = (uint32_t)eye / cols;
                                     uint32_t vpX = col * renderW;
                                     uint32_t vpY = row * renderH;
-                                    // Confine the avatar to the BOTTOM 70% of the tile (→
-                                    // bottom 70% of the window). The top 30% of the tile is
-                                    // left untouched — the full-top-30% Local2D bubble's
+                                    // Confine the avatar to the BOTTOM 75% of the tile (→
+                                    // bottom 75% of the window). The top 25% of the tile is
+                                    // left untouched — the full-top-25% Local2D bubble's
                                     // implicit mask (M=0) replaces the weave there with the
                                     // flat bubble, so those pixels are never shown.
-                                    const uint32_t avH = (renderH * 7u) / 10u;
+                                    const uint32_t avH = (renderH * 3u) / 4u;
                                     const uint32_t avY = vpY + (renderH - avH);
                                     g_modelRenderer.renderEye(
                                         (*swapchainVkImages)[imageIndex], colorFormat,
@@ -1580,23 +1580,22 @@ static void RenderThreadFunc(
 
                 // ── Speech bubble: a flat 2D nameplate pill in the top ~30% band,
                 //    submitted as a Local2D layer (implicit M=0 mask) so the tiger
-                //    keeps weaving in the bottom 70%. Renders one centred rounded
-                //    pill into its own window-space swapchain (g_animBtnSwapchain —
-                //    named before the chrome buttons were stripped) via the HUD
-                //    text renderer, then composites it post-weave. ──
+                //    keeps weaving in the bottom 75%. RenderBubbleToTexture draws the
+                //    rounded panel + balanced text into g_animBtnSwapchain (slot name
+                //    predates the chrome-button strip); composited post-weave. ──
                 XrCompositionLayerLocal2DEXT bubbleLayer = {(XrStructureType)XR_TYPE_COMPOSITION_LAYER_LOCAL_2D_EXT};
-                // Transparent backer spanning the FULL top 30%: extends the implicit
-                // mask (M=0) across the whole band so the untouched top-30% weave is
-                // hidden even when the visible bubble is letterboxed (aspect-preserved).
+                // Transparent backer spanning the FULL top 25%: extends the implicit
+                // mask (M=0) across the whole band so the untouched top-25% weave is
+                // hidden in the panel's rounded-corner cut-outs.
                 XrCompositionLayerLocal2DEXT bubbleBgLayer = {(XrStructureType)XR_TYPE_COMPOSITION_LAYER_LOCAL_2D_EXT};
                 bool bubbleReady = false;
                 if (g_animBtnReady && g_hasAnimBtnSwapchain && g_hasLocal3DZone) {
-                    // The top-30% band is bandW×bandH; its aspect varies with the
+                    // The top-25% band is bandW×bandH; its aspect varies with the
                     // window. Render the rounded panel into the LARGEST band-aspect
                     // sub-rect of the (fixed) bubble texture, then map that sub-rect
                     // onto the full band below — equal scale on both axes, so corners
                     // stay round and text stays unstretched on any resize.
-                    const int bandH = (windowH > 0) ? (int)(windowH * 0.30f) : 1;
+                    const int bandH = (windowH > 0) ? (int)(windowH * 0.25f) : 1;
                     const int bandW = (int)windowW;
                     const float bandAR = (float)bandW / (float)(bandH > 0 ? bandH : 1);
                     const float texAR  = (float)BTN_BAR_TEX_W / (float)BTN_BAR_TEX_H;
@@ -2012,7 +2011,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     LOG_INFO("");
     LOG_INFO("=== Entering main loop ===");
-    LOG_INFO("Controls: W/S=Dolly depth  LMB-drag=Rotate  Ctrl+T=Transparency");
+    LOG_INFO("Controls: A/D=Move L/R  W/S=Dolly depth  Ctrl+T=Transparency");
     LOG_INFO("          Space=Reset  V=Mode  N=Clip  K=Play/Pause");
     LOG_INFO("          B=Decoration(move/resize)  I=Capture  F11=Fullscreen  ESC=Quit");
     LOG_INFO("");
