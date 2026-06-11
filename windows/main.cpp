@@ -817,73 +817,96 @@ static bool EnsureSilhouetteTargets(VkDevice dev, VkPhysicalDevice phys, uint32_
     return g_silMapped != nullptr;
 }
 
-// Render one mono eye of the avatar into the scratch image, read the alpha back,
+// Render the avatar silhouette into the scratch image, read the alpha back,
 // and publish the coverage bitmap consumed by WM_NCHITTEST. Cheap (downscaled to
 // ~1/3 the window). Runs on the render thread right after the main eye render so
 // it reuses the renderer's internal targets (no resize thrash — imgW/imgH must
 // match the swapchain dims the main eye render passed, else ensureTargets churns
 // every frame as the two callers alternate sizes).
+//
+// The hit mask is the UNION of the FIRST and LAST active views: the weave shows
+// every view at once with horizontal disparity that grows with window size — a
+// single-view mask visibly clips the other view's tiger on a large window. The
+// two outermost views bound the spread (middle views of a quad layout fall
+// between them for the convex-ish tiger).
 static void UpdateSilhouette(VkDevice dev, VkPhysicalDevice phys, VkQueue queue, VkCommandPool pool,
                             uint32_t imgW, uint32_t imgH, uint32_t winW, uint32_t winH,
-                            const float viewMat[16], const float projMat[16], float clipFar) {
-    if (winW == 0 || winH == 0) return;
+                            const float (*viewMats)[16], const float (*projMats)[16],
+                            const float* clipFars, uint32_t numViews) {
+    if (winW == 0 || winH == 0 || numViews == 0) return;
     uint32_t w = winW / 3; if (w < 64) w = 64; if (w > 640) w = 640;
     uint32_t h = winH / 3; if (h < 64) h = 64; if (h > 360) h = 360;
     if (!EnsureSilhouetteTargets(dev, phys, w, h)) return;
 
-    {
-        std::lock_guard<std::mutex> lock(g_sceneMutex);
-        if (!g_modelRenderer.hasModel()) return;
-        // Render the avatar into the bottom 75% of the silhouette image too, so the
-        // hit mask matches the confined on-screen avatar (the zone-framed views map
-        // 1:1 onto this sub-viewport — same aspect). The top 25% is left as-is
-        // (covered by the full-top-25% bubble rect in the click region).
-        const uint32_t silAvH = (h * 3u) / 4u;
-        const uint32_t silAvY = h - silAvH;
-        g_modelRenderer.renderEye(g_silImage.image, VK_FORMAT_R8G8B8A8_UNORM,
-            imgW, imgH,
-            0, silAvY, w, silAvH, viewMat, projMat, /*transparentBg=*/true, clipFar);
-    }
-    // renderEye leaves the scratch image in COLOR_ATTACHMENT_OPTIMAL → copy to host.
-    VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-    ai.commandPool = pool; ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; ai.commandBufferCount = 1;
-    VkCommandBuffer cmd = VK_NULL_HANDLE;
-    vkAllocateCommandBuffers(dev, &ai, &cmd);
-    VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(cmd, &bi);
-    VkImageMemoryBarrier toSrc = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-    toSrc.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-    toSrc.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-    toSrc.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    toSrc.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-    toSrc.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    toSrc.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    toSrc.image = g_silImage.image;
-    toSrc.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-        VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toSrc);
-    VkBufferImageCopy region = {};
-    region.bufferRowLength = w;
-    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    region.imageExtent = {w, h, 1};
-    vkCmdCopyImageToBuffer(cmd, g_silImage.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-        g_silReadback.buffer, 1, &region);
-    vkEndCommandBuffer(cmd);
-    VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
-    si.commandBufferCount = 1; si.pCommandBuffers = &cmd;
-    vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE);
-    vkQueueWaitIdle(queue);
-    vkFreeCommandBuffers(dev, pool, 1, &cmd);
+    const uint32_t silIdx[2] = {0, numViews - 1};
+    const uint32_t silPasses = (numViews > 1) ? 2u : 1u;
+    std::vector<uint8_t> unionAlpha((size_t)w * h, 0);
 
-    const uint8_t* px = (const uint8_t*)g_silMapped;
-    if (!px) return;
-    std::lock_guard<std::mutex> lock(g_silCoverage.mtx);
-    g_silCoverage.bits.resize((size_t)w * h);
-    for (uint32_t i = 0; i < w * h; ++i) g_silCoverage.bits[i] = (px[i * 4 + 3] > 40) ? 1 : 0;
-    g_silCoverage.covW = (int)w; g_silCoverage.covH = (int)h;
-    g_silCoverage.winW = (int)winW; g_silCoverage.winH = (int)winH;
-    g_silCoverage.ready = true;
+    for (uint32_t p = 0; p < silPasses; ++p) {
+        const uint32_t v = silIdx[p];
+        {
+            std::lock_guard<std::mutex> lock(g_sceneMutex);
+            if (!g_modelRenderer.hasModel()) return;
+            // Render the avatar into the bottom 75% of the silhouette image too, so
+            // the hit mask matches the confined on-screen avatar (the zone-framed
+            // views map 1:1 onto this sub-viewport — same NDC mapping). The top 25%
+            // is left as-is (covered by the full-top-25% bubble rect in the click
+            // region).
+            const uint32_t silAvH = (h * 3u) / 4u;
+            const uint32_t silAvY = h - silAvH;
+            g_modelRenderer.renderEye(g_silImage.image, VK_FORMAT_R8G8B8A8_UNORM,
+                imgW, imgH,
+                0, silAvY, w, silAvH, viewMats[v], projMats[v], /*transparentBg=*/true,
+                clipFars[v]);
+        }
+        // renderEye leaves the scratch image in COLOR_ATTACHMENT_OPTIMAL → copy to host.
+        VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        ai.commandPool = pool; ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; ai.commandBufferCount = 1;
+        VkCommandBuffer cmd = VK_NULL_HANDLE;
+        vkAllocateCommandBuffers(dev, &ai, &cmd);
+        VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        vkBeginCommandBuffer(cmd, &bi);
+        VkImageMemoryBarrier toSrc = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        toSrc.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        toSrc.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        toSrc.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        toSrc.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        toSrc.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toSrc.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toSrc.image = g_silImage.image;
+        toSrc.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toSrc);
+        VkBufferImageCopy region = {};
+        region.bufferRowLength = w;
+        region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        region.imageExtent = {w, h, 1};
+        vkCmdCopyImageToBuffer(cmd, g_silImage.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            g_silReadback.buffer, 1, &region);
+        vkEndCommandBuffer(cmd);
+        VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        si.commandBufferCount = 1; si.pCommandBuffers = &cmd;
+        vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE);
+        vkQueueWaitIdle(queue);
+        vkFreeCommandBuffers(dev, pool, 1, &cmd);
+
+        const uint8_t* px = (const uint8_t*)g_silMapped;
+        if (!px) return;
+        for (uint32_t i = 0; i < w * h; ++i) {
+            const uint8_t a = px[i * 4 + 3];
+            if (a > unionAlpha[i]) unionAlpha[i] = a;
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_silCoverage.mtx);
+        g_silCoverage.bits.resize((size_t)w * h);
+        for (uint32_t i = 0; i < w * h; ++i) g_silCoverage.bits[i] = (unionAlpha[i] > 40) ? 1 : 0;
+        g_silCoverage.covW = (int)w; g_silCoverage.covH = (int)h;
+        g_silCoverage.winW = (int)winW; g_silCoverage.winH = (int)winH;
+        g_silCoverage.ready = true;
+    }
 
     // Debug: with DXR_DUMP_SILHOUETTE set, dump the silhouette alpha (~once/sec)
     // to %TEMP%\avatar_silhouette.png so the hit mask can be eyeballed (white =
@@ -891,12 +914,10 @@ static void UpdateSilhouette(VkDevice dev, VkPhysicalDevice phys, VkQueue queue,
     static const bool s_dumpSil = (GetEnvironmentVariableA("DXR_DUMP_SILHOUETTE", nullptr, 0) > 0);
     static int s_dbgCounter = 0;
     if (s_dumpSil && (s_dbgCounter++ % 60) == 0) {
-        std::vector<uint8_t> a((size_t)w * h);
-        for (uint32_t i = 0; i < w * h; ++i) a[i] = px[i * 4 + 3];
         char tmp[MAX_PATH] = {0};
         GetTempPathA(MAX_PATH, tmp);
         std::string path = std::string(tmp) + "avatar_silhouette.png";
-        stbi_write_png(path.c_str(), (int)w, (int)h, 1, a.data(), (int)w);
+        stbi_write_png(path.c_str(), (int)w, (int)h, 1, unionAlpha.data(), (int)w);
     }
 }
 
@@ -1144,6 +1165,14 @@ static void RenderThreadFunc(
         // consumed (display pose, mono matrices, pick). The shared input handler
         // still accumulates inputSnapshot.pitch on drag, but nothing renders it.
         float renderPitch = 0.0f;
+        // Manual LMB drag must be fully inert: the billboard owns the heading, so
+        // drag can't rotate the tiger — but the drag-accumulated yaw/pitch would
+        // still rotate the WASD/EQ MOVEMENT frame inside UpdateCameraMovement
+        // (it builds its basis from state.yaw/pitch). Pin both to 0 before the
+        // movement step so movement stays display-aligned; the writeback below
+        // persists the zeros into g_inputState, discarding the drag deltas.
+        inputSnapshot.yaw = 0.0f;
+        inputSnapshot.pitch = 0.0f;
         {
             std::lock_guard<std::mutex> lock(g_inputMutex);
             resetRequested = g_inputState.resetViewRequested;
@@ -1796,18 +1825,21 @@ static void RenderThreadFunc(
                             else            ReleaseSwapchainImage(*xr);
 
                             // Update the click-through silhouette from the same
-                            // left-eye matrices we just drew (so the hit mask
+                            // per-view matrices we just drew (so the hit mask
                             // tracks the animation, W/S dolly, billboard yaw, and
-                            // the display-plane clip). Render-thread-local. Throttled
-                            // to every other frame: the pass adds two GPU waits, and
-                            // ~30 Hz is plenty for the hit region — keeping it off the
-                            // every-frame path steadies frame timing (no billboard
-                            // stutter). imgW/imgH = the dims the eye render used, so
-                            // the renderer's internal targets don't churn.
+                            // the display-plane clip) — union of the outermost
+                            // views, see UpdateSilhouette. Render-thread-local.
+                            // Throttled to every other frame: the pass adds GPU
+                            // waits, and ~30 Hz is plenty for the hit region —
+                            // keeping it off the every-frame path steadies frame
+                            // timing (no billboard stutter). imgW/imgH = the dims
+                            // the eye render used, so the renderer's internal
+                            // targets don't churn.
                             static uint32_t s_silFrame = 0;
                             if (hasGsScene && (s_silFrame++ & 1u) == 0u)
                                 UpdateSilhouette(vkDevice, physDevice, graphicsQueue, renderCmdPool,
-                                    targetW, targetH, windowW, windowH, viewMat[0], projMat[0], clipFar[0]);
+                                    targetW, targetH, windowW, windowH,
+                                    viewMat, projMat, clipFar, (uint32_t)eyeCount);
                         } else {
                             rendered = false;
                         }
