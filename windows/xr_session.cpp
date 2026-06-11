@@ -121,7 +121,9 @@ bool InitializeOpenXR(XrSessionManager& xr) {
     }
 
     XrInstanceCreateInfo createInfo = {XR_TYPE_INSTANCE_CREATE_INFO};
-    strcpy_s(createInfo.applicationInfo.applicationName, "SR3DGSOpenXRExtVK");
+    // Shown as the client tile title in workspace mode — keep it the product
+    // name, not the scaffold's internal codename.
+    strcpy_s(createInfo.applicationInfo.applicationName, "DisplayXR 3D Avatar");
     createInfo.applicationInfo.applicationVersion = 1;
     strcpy_s(createInfo.applicationInfo.engineName, "None");
     createInfo.applicationInfo.engineVersion = 0;
