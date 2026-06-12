@@ -29,7 +29,7 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-# contents: write is required by softprops/action-gh-release@v2 to
+# contents: write is required by softprops/action-gh-release@v3 to
 # create-or-update the GitHub Release on a v* tag push. GH_TOKEN is exported
 # explicitly because the action prefers $GH_TOKEN over its `token:` input.
 permissions:
@@ -41,7 +41,7 @@ jobs:
     outputs:
       docs_only: ${{ steps.filter.outputs.docs_only }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
       - id: filter
@@ -78,7 +78,7 @@ jobs:
       GH_TOKEN: ${{ github.token }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Doc-only PR — skipping heavy build steps
         if: needs.DetectChanges.outputs.docs_only == 'true'
@@ -198,19 +198,19 @@ jobs:
 
       - name: Upload installer
         if: needs.DetectChanges.outputs.docs_only != 'true'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           retention-days: 3
           name: DisplayXRAvatar-Windows
           if-no-files-found: error
           path: installer/DisplayXRAvatarSetup-*.exe
 
-      # softprops/action-gh-release@v2 create-or-updates the GitHub Release on
+      # softprops/action-gh-release@v3 create-or-updates the GitHub Release on
       # a v* tag and attaches the .exe. If the macOS workflow races on the same
       # tag, the action just appends — both assets land on the same release.
       - name: Attach installer to GitHub release on tag
         if: needs.DetectChanges.outputs.docs_only != 'true' && startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: installer/DisplayXRAvatarSetup-*.exe
           fail_on_unmatched_files: true
