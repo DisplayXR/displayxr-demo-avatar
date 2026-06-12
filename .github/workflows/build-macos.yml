@@ -18,7 +18,7 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-# contents: write is required by softprops/action-gh-release@v2 to
+# contents: write is required by softprops/action-gh-release@v3 to
 # create-or-update the GitHub Release on v* tag push. The runtime repo's
 # build-macos.yml also exports GH_TOKEN explicitly because the action
 # prefers $GH_TOKEN over its `token:` input when set — without this it
@@ -32,7 +32,7 @@ jobs:
     outputs:
       docs_only: ${{ steps.filter.outputs.docs_only }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
       - id: filter
@@ -62,7 +62,7 @@ jobs:
       GH_TOKEN: ${{ github.token }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Doc-only PR — skipping heavy build steps
         if: needs.DetectChanges.outputs.docs_only == 'true'
@@ -148,20 +148,20 @@ jobs:
 
       - name: Upload installer
         if: needs.DetectChanges.outputs.docs_only != 'true'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           retention-days: 3
           name: DisplayXRModelViewer-macOS
           if-no-files-found: error
           path: _package/DisplayXRModelViewer-*.pkg
 
-      # softprops/action-gh-release@v2 create-or-updates the GitHub
+      # softprops/action-gh-release@v3 create-or-updates the GitHub
       # Release on v* tag push and attaches the .pkg. If a Windows
       # release workflow on the same tag races, the action just appends
       # — both assets end up on the same release.
       - name: Attach .pkg to GitHub release on tag
         if: needs.DetectChanges.outputs.docs_only != 'true' && startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: _package/DisplayXRModelViewer-*.pkg
           fail_on_unmatched_files: true
