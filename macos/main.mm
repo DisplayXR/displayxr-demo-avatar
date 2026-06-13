@@ -185,6 +185,12 @@ static bool g_fullscreen = false;
 static NSRect g_savedWindowFrame = {};
 static NSUInteger g_savedWindowStyle = 0;
 
+// Window decoration: borderless by default (the floating avatar). B toggles a
+// titled frame so the window can be dragged/resized for repositioning; while
+// decorated, click-through is disabled (the whole frame stays interactive).
+// Mirrors the Windows leg's B-key decoration toggle (windows/main.cpp).
+static bool g_decorated = false;
+
 // Model-viewer state
 static ModelRenderer g_modelRenderer;
 static std::string g_loadedFileName;
@@ -536,6 +542,16 @@ static void OpenLoadDialog() {
 // macOS Window + Metal Layer
 // ============================================================================
 
+// Borderless NSWindows return NO from canBecomeKey/MainWindow by default, which
+// would block keyboard (W/S dolly, Ctrl+T, B) in the avatar's borderless mode.
+// Override so the floating avatar window stays focusable in both modes.
+@interface AvatarWindow : NSWindow
+@end
+@implementation AvatarWindow
+- (BOOL)canBecomeKeyWindow { return YES; }
+- (BOOL)canBecomeMainWindow { return YES; }
+@end
+
 @interface AppDelegate : NSObject <NSApplicationDelegate, NSWindowDelegate>
 @end
 
@@ -626,6 +642,26 @@ static void OpenLoadDialog() {
         case 'c': case 'C':
             g_input.cameraMode = !g_input.cameraMode;
             break;
+        case 'b': case 'B': {
+            // Toggle window decoration: borderless floating avatar ↔ titled
+            // frame for drag/resize. While decorated, click-through is disabled
+            // (handled in the apply loop). Mirrors the Windows B-key toggle.
+            g_decorated = !g_decorated;
+            NSUInteger st = g_decorated
+                ? (NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
+                   NSWindowStyleMaskResizable | NSWindowStyleMaskMiniaturizable)
+                : NSWindowStyleMaskBorderless;
+            [g_window setStyleMask:st];
+            // setStyleMask can reset opacity — re-assert the transparent backing.
+            [g_window setOpaque:NO];
+            [g_window setBackgroundColor:[NSColor clearColor]];
+            if ([g_metalView.layer isKindOfClass:[CAMetalLayer class]])
+                ((CAMetalLayer *)g_metalView.layer).opaque = NO;
+            [g_window makeFirstResponder:g_metalView];
+            [g_window makeKeyAndOrderFront:nil];
+            LOG_INFO("Decoration: %s (B)", g_decorated ? "ON (drag/resize)" : "OFF (borderless)");
+            break;
+        }
         case 'i': case 'I':
             g_input.captureAtlasRequested = true;
             break;
@@ -744,13 +780,20 @@ static bool CreateMacOSWindow(uint32_t width, uint32_t height) {
     [NSApp setDelegate:delegate];
 
     NSRect frame = NSMakeRect(100, 100, width, height);
-    NSUInteger style = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
-                       NSWindowStyleMaskResizable | NSWindowStyleMaskMiniaturizable;
-    g_window = [[NSWindow alloc] initWithContentRect:frame
-        styleMask:style backing:NSBackingStoreBuffered defer:NO];
+    // Borderless by default — the floating avatar (B toggles a draggable titled
+    // frame; see the B handler). AvatarWindow keeps it focusable while borderless.
+    g_window = [[AvatarWindow alloc] initWithContentRect:frame
+        styleMask:NSWindowStyleMaskBorderless backing:NSBackingStoreBuffered defer:NO];
     [g_window setTitle:@"DisplayXR 3D Avatar"];
     [g_window setDelegate:delegate];
     [g_window center];
+
+    // Float above other windows so the avatar stays on top even when another app
+    // takes focus (mirrors the Windows leg's WS_EX_TOPMOST). CanJoinAllSpaces so
+    // it follows the user across Spaces.
+    [g_window setLevel:NSFloatingWindowLevel];
+    [g_window setCollectionBehavior:NSWindowCollectionBehaviorCanJoinAllSpaces |
+                                    NSWindowCollectionBehaviorFullScreenAuxiliary];
 
     // Transparent window so the avatar floats over the desktop (mirrors gauss
     // macos/main.mm). The CAMetalLayer is non-opaque (see makeBackingLayer); the
@@ -762,6 +805,7 @@ static bool CreateMacOSWindow(uint32_t width, uint32_t height) {
     [g_window setContentView:g_metalView];
     [g_window makeKeyAndOrderFront:nil];
     [g_window makeFirstResponder:g_metalView];
+    [NSApp activateIgnoringOtherApps:YES];
 
     // Re-assert layer transparency after the view is realized in the window —
     // AppKit can reset it during attachment.
@@ -2832,7 +2876,9 @@ int main(int argc, char** argv) {
         // is whole-window, so we flip it each frame from the cursor-vs-silhouette
         // test — macOS has no per-pixel window region.
         if (g_window != nil) {
-            BOOL ignore = g_transparentBg.load() ? (ClickInteractiveAtCursor() ? NO : YES) : NO;
+            // Decorated → fully interactive (drag/resize the titled frame).
+            BOOL ignore = (g_transparentBg.load() && !g_decorated)
+                ? (ClickInteractiveAtCursor() ? NO : YES) : NO;
             if ([g_window ignoresMouseEvents] != ignore)
                 [g_window setIgnoresMouseEvents:ignore];
         }
