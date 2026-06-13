@@ -2310,6 +2310,12 @@ static bool CreateBubbleSwapchain(AppXrSession& xr, VkDevice dev, VkPhysicalDevi
 // row 0 = top) buffer; rest left transparent. Returns the buffer (static).
 static const uint8_t* RenderBubbleBitmap(uint32_t subW, uint32_t subH) {
     static std::vector<uint8_t> buf;
+    // The greeting is static — only re-draw (and re-run the CoreText font fit)
+    // when the band sub-rect changes size (i.e. on window resize). Per-frame this
+    // is then a no-op returning the cached pixels.
+    static uint32_t s_lastW = 0, s_lastH = 0;
+    if (!buf.empty() && subW == s_lastW && subH == s_lastH) return buf.data();
+    s_lastW = subW; s_lastH = subH;
     buf.assign((size_t)kBubbleTexW * kBubbleTexH * 4, 0);  // fully transparent
     if (subW < 2 || subH < 2) return buf.data();
 
@@ -2320,9 +2326,11 @@ static const uint8_t* RenderBubbleBitmap(uint32_t subW, uint32_t subH) {
     if (!ctx) return buf.data();
 
     @autoreleasepool {
-        // flipped:YES → top-left origin (y down), matching the Windows layout math
-        // and giving row 0 = top in memory.
-        NSGraphicsContext* nsctx = [NSGraphicsContext graphicsContextWithCGContext:ctx flipped:YES];
+        // flipped:NO matches the CGBitmapContext's native bottom-left origin, so
+        // AppKit draws upright text AND memory row 0 = top (what the Local2D layer
+        // samples as the band top). flipped:YES double-flips → upside-down output.
+        // The panel rect + centred-block math are symmetric, so they're unchanged.
+        NSGraphicsContext* nsctx = [NSGraphicsContext graphicsContextWithCGContext:ctx flipped:NO];
         [NSGraphicsContext saveGraphicsState];
         [NSGraphicsContext setCurrentContext:nsctx];
 
