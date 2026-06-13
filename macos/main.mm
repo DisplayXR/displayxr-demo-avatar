@@ -56,6 +56,12 @@
 #include "camera3d_view.h"
 #include "projection_depth.h"
 #include "model_renderer.h"
+#include "model_vulkan_utils.h"   // scratch image/buffer for the click-through silhouette
+
+// stb_image_write (linked from displayxr-common) — used only by the optional
+// DXR_DUMP_SILHOUETTE debug dump below.
+extern "C" int stbi_write_png(char const* filename, int w, int h, int comp,
+                              const void* data, int stride_in_bytes);
 #include "atlas_capture.h"
 
 // ============================================================================
@@ -2033,6 +2039,154 @@ static void TryAutoLoadBundledScene(const std::string& overridePath = std::strin
 }
 
 // ============================================================================
+// Click-through silhouette (Phase 2)
+// ============================================================================
+// macOS has no WM_NCHITTEST / SetWindowRgn, so click-through is driven by
+// [NSWindow setIgnoresMouseEvents:]. Each frame we render a downscaled avatar
+// silhouette into a scratch image (transparent bg → alpha≈1 on the avatar, 0
+// elsewhere), threshold its alpha into a coverage bitmap, then flip
+// ignoresMouseEvents from a cursor-vs-coverage test: over the avatar (or the
+// on-screen chrome) the window catches the click; off it the click falls
+// through to the desktop behind. All on the main thread (render + poll), so no
+// mutex is needed — unlike the Windows render-thread split. Mirrors
+// windows/main.cpp UpdateSilhouette / SilhouetteHit.
+static std::vector<uint8_t> g_silBits;   // covW*covH, 1 = avatar present
+static int  g_silCovW = 0, g_silCovH = 0;
+static bool g_silReady = false;
+static ModelImage  g_silImage = {};
+static ModelBuffer g_silReadback = {};
+static void*       g_silMapped = nullptr;
+
+static bool EnsureSilhouetteTargets(VkDevice dev, VkPhysicalDevice phys, uint32_t w, uint32_t h) {
+    if (g_silImage.image != VK_NULL_HANDLE && g_silImage.width == w && g_silImage.height == h)
+        return true;
+    if (g_silImage.image != VK_NULL_HANDLE) modelDestroyImage(dev, g_silImage);
+    if (g_silReadback.buffer != VK_NULL_HANDLE) {
+        if (g_silMapped) vkUnmapMemory(dev, g_silReadback.memory);
+        modelDestroyBuffer(dev, g_silReadback);
+        g_silMapped = nullptr;
+    }
+    g_silImage = modelCreateImage2D(dev, phys, w, h, VK_FORMAT_R8G8B8A8_UNORM,
+        VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+    if (g_silImage.image == VK_NULL_HANDLE) return false;
+    g_silReadback = modelCreateBuffer(dev, phys, (VkDeviceSize)w * h * 4,
+        VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (g_silReadback.buffer == VK_NULL_HANDLE) return false;
+    vkMapMemory(dev, g_silReadback.memory, 0, (VkDeviceSize)w * h * 4, 0, &g_silMapped);
+    return g_silMapped != nullptr;
+}
+
+// Render the avatar silhouette into the scratch image and publish the coverage
+// bitmap. Cheap (downscaled ~1/3); called every other frame. imgW/imgH must
+// equal the dims the main eye render used so the renderer's internal targets
+// don't churn. The hit mask is the UNION of the first + last views (the weave
+// shows every view with disparity that grows with window size).
+static void UpdateSilhouette(VkDevice dev, VkPhysicalDevice phys, VkQueue queue, VkCommandPool pool,
+                            uint32_t imgW, uint32_t imgH, uint32_t winW, uint32_t winH,
+                            const float (*viewMats)[16], const float (*projMats)[16],
+                            const float* clipFars, uint32_t numViews) {
+    if (winW == 0 || winH == 0 || numViews == 0) return;
+    if (!g_modelRenderer.hasModel()) return;
+    uint32_t w = winW / 3; if (w < 64) w = 64; if (w > 640) w = 640;
+    uint32_t h = winH / 3; if (h < 64) h = 64; if (h > 360) h = 360;
+    if (!EnsureSilhouetteTargets(dev, phys, w, h)) return;
+
+    const uint32_t silIdx[2] = {0, numViews - 1};
+    const uint32_t silPasses = (numViews > 1) ? 2u : 1u;
+    std::vector<uint8_t> unionAlpha((size_t)w * h, 0);
+
+    for (uint32_t p = 0; p < silPasses; ++p) {
+        const uint32_t v = silIdx[p];
+        // Full-viewport avatar — matches the on-screen full-window avatar in
+        // Phase 2 (Phase 3 confines both to the bottom 75% together).
+        g_modelRenderer.renderEye(g_silImage.image, VK_FORMAT_R8G8B8A8_UNORM,
+            imgW, imgH, 0, 0, w, h, viewMats[v], projMats[v], /*transparentBg=*/true,
+            clipFars[v]);
+        // renderEye leaves the scratch image in COLOR_ATTACHMENT_OPTIMAL → copy to host.
+        VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        ai.commandPool = pool; ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; ai.commandBufferCount = 1;
+        VkCommandBuffer cmd = VK_NULL_HANDLE;
+        vkAllocateCommandBuffers(dev, &ai, &cmd);
+        VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        vkBeginCommandBuffer(cmd, &bi);
+        VkImageMemoryBarrier toSrc = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        toSrc.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        toSrc.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        toSrc.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        toSrc.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        toSrc.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toSrc.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toSrc.image = g_silImage.image;
+        toSrc.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toSrc);
+        VkBufferImageCopy region = {};
+        region.bufferRowLength = w;
+        region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        region.imageExtent = {w, h, 1};
+        vkCmdCopyImageToBuffer(cmd, g_silImage.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            g_silReadback.buffer, 1, &region);
+        vkEndCommandBuffer(cmd);
+        VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        si.commandBufferCount = 1; si.pCommandBuffers = &cmd;
+        vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE);
+        vkQueueWaitIdle(queue);
+        vkFreeCommandBuffers(dev, pool, 1, &cmd);
+
+        const uint8_t* px = (const uint8_t*)g_silMapped;
+        if (!px) return;
+        for (uint32_t i = 0; i < w * h; ++i) {
+            const uint8_t a = px[i * 4 + 3];
+            if (a > unionAlpha[i]) unionAlpha[i] = a;
+        }
+    }
+
+    g_silBits.resize((size_t)w * h);
+    for (uint32_t i = 0; i < w * h; ++i) g_silBits[i] = (unionAlpha[i] > 40) ? 1 : 0;
+    g_silCovW = (int)w; g_silCovH = (int)h;
+    g_silReady = true;
+
+    // Debug: DXR_DUMP_SILHOUETTE → /tmp/avatar_silhouette.png (~once/sec, white
+    // = avatar, black = pass-through) so the hit mask can be eyeballed.
+    static const bool s_dumpSil = (getenv("DXR_DUMP_SILHOUETTE") != nullptr);
+    static int s_dbg = 0;
+    if (s_dumpSil && (s_dbg++ % 60) == 0)
+        stbi_write_png("/tmp/avatar_silhouette.png", (int)w, (int)h, 1, unionAlpha.data(), (int)w);
+}
+
+// True if the cursor is over an interactive region (avatar silhouette, the top
+// bar, or the visible HUD) → the window should catch the click. Reads the live
+// cursor; main-thread only.
+static bool ClickInteractiveAtCursor() {
+    if (g_window == nil) return true;
+    NSView* cv = [g_window contentView];
+    if (cv == nil) return true;
+    NSPoint scr = [NSEvent mouseLocation];
+    NSPoint winPt = [g_window convertPointFromScreen:scr];
+    NSPoint cvPt = [cv convertPoint:winPt fromView:nil];
+    NSRect b = [cv bounds];
+    if (cvPt.x < 0 || cvPt.y < 0 || cvPt.x >= b.size.width || cvPt.y >= b.size.height)
+        return false;  // outside the window → fall through to the desktop
+    // On-screen chrome stays interactive (so Open/Mode + HUD work while transparent).
+    if (g_topBar && NSPointInRect(cvPt, [g_topBar frame])) return true;
+    if (g_input.hudVisible && g_hudBackdrop && NSPointInRect(cvPt, [g_hudBackdrop frame])) return true;
+    // Avatar silhouette: normalize, flip Cocoa bottom-left Y to top-down rows.
+    if (!g_silReady || g_silCovW <= 0 || g_silCovH <= 0) return false;
+    int sx = (int)((cvPt.x / b.size.width) * g_silCovW);
+    int sy = (int)((1.0f - cvPt.y / b.size.height) * g_silCovH);
+    const int R = 2;  // forgiving edge dilation
+    for (int dy = -R; dy <= R; ++dy)
+        for (int dx = -R; dx <= R; ++dx) {
+            int x = sx + dx, y = sy + dy;
+            if (x < 0 || y < 0 || x >= g_silCovW || y >= g_silCovH) continue;
+            if (g_silBits[(size_t)y * g_silCovW + x]) return true;
+        }
+    return false;
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 
@@ -2533,6 +2687,7 @@ int main(int argc, char** argv) {
                             std::vector<std::array<float, 16>> viewMat((size_t)eyeCount);
                             std::vector<std::array<float, 16>> projMat((size_t)eyeCount);
                             std::vector<std::pair<uint32_t, uint32_t>> tileOffsets((size_t)eyeCount);
+                            std::vector<float> clipFars((size_t)eyeCount, 0.0f);  // per-eye, for the silhouette pass
                             for (int eye = 0; eye < eyeCount; eye++) {
                                 int srcView = eye < (int)runtimeViewCount ? eye : 0;
                                 if (hasKooima) {
@@ -2574,14 +2729,14 @@ int main(int argc, char** argv) {
                                     // quantity as eye_display.z). 0 = off. Mirrors
                                     // windows/main.cpp clipFar[eye].
                                     float ez = hasKooima ? eyeViews[eye].eye_display.z : 0.0f;
-                                    float clipFar = (tbg && ez > 0.2f) ? ez : 0.0f;
+                                    clipFars[eye] = (tbg && ez > 0.2f) ? ez : 0.0f;
                                     g_modelRenderer.renderEye(
                                         targetImage, swapFormat,
                                         xr.swapchain.width, xr.swapchain.height,
                                         tileOffsets[eye].first, tileOffsets[eye].second,
                                         renderW, renderH,
                                         viewMat[eye].data(), projMat[eye].data(),
-                                        tbg, clipFar);
+                                        tbg, clipFars[eye]);
                                 }
                             } else {
                                 RenderPlaceholder(vkDevice, graphicsQueue, cmdPool,
@@ -2634,6 +2789,22 @@ int main(int argc, char** argv) {
                             }
 
                             ReleaseSwapchainImage(xr);
+
+                            // Update the click-through silhouette from the same
+                            // per-view matrices we just drew (so the hit mask
+                            // tracks the animation, W/S dolly, billboard yaw and
+                            // the display-plane clip). Throttled to every other
+                            // frame — the pass adds GPU waits and ~30 Hz is plenty
+                            // for the hit region. imgW/imgH = the dims the eye
+                            // render used, so the renderer's internal targets
+                            // don't churn.
+                            static uint32_t s_silFrame = 0;
+                            if (g_modelRenderer.hasModel() && (s_silFrame++ & 1u) == 0u)
+                                UpdateSilhouette(vkDevice, physDevice, graphicsQueue, cmdPool,
+                                    xr.swapchain.width, xr.swapchain.height, g_windowW, g_windowH,
+                                    (const float(*)[16])viewMat.data(),
+                                    (const float(*)[16])projMat.data(),
+                                    clipFars.data(), (uint32_t)eyeCount);
                         } else {
                             rendered = false;
                         }
@@ -2653,6 +2824,17 @@ int main(int argc, char** argv) {
             }
         } else {
             usleep(100000);
+        }
+
+        // Click-through: while transparent, the window catches the click only
+        // over the avatar / chrome; elsewhere it passes through to the desktop.
+        // Opaque mode (Ctrl+T off) keeps full interactivity. setIgnoresMouseEvents
+        // is whole-window, so we flip it each frame from the cursor-vs-silhouette
+        // test — macOS has no per-pixel window region.
+        if (g_window != nil) {
+            BOOL ignore = g_transparentBg.load() ? (ClickInteractiveAtCursor() ? NO : YES) : NO;
+            if ([g_window ignoresMouseEvents] != ignore)
+                [g_window setIgnoresMouseEvents:ignore];
         }
 
         // Update HUD
