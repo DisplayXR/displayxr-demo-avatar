@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Copyright 2026, Leia Inc.
+    SPDX-License-Identifier: BSL-1.0
+
+    Android leg of displayxr-demo-avatar. A vendor-neutral OpenXR client:
+    no CNSDK, no SR SDK — it binds to whatever DisplayXR runtime is installed
+    via the Khronos OpenXR loader broker. Per ADR-025 the runtime + vendor DP
+    run OUT-OF-PROCESS; the <queries> block lets the loader discover + bind it.
+
+    Transparency (#568): the Activity uses Theme.Avatar.Transparent so its
+    window is translucent and the live home screen shows through (the runtime
+    renders the weaved avatar into its translucent overlay surface on top).
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!--
+        Android 12+ package-visibility: cross-package intent/provider queries
+        return empty unless declared here. Without this the Khronos loader's
+        broker lookup returns a null cursor → xrCreateInstance fails
+        XR_ERROR_RUNTIME_UNAVAILABLE (black screen). (runtime#510, NP02J.)
+    -->
+    <queries>
+        <intent>
+            <action android:name="org.khronos.openxr.OpenXRRuntimeService" />
+        </intent>
+        <provider
+            android:authorities="org.khronos.openxr.runtime_broker;org.khronos.openxr.system_runtime_broker"
+            tools:replace="android:authorities" />
+        <package android:name="org.freedesktop.monado.openxr_runtime.out_of_process" />
+        <package android:name="org.freedesktop.monado.openxr_runtime.in_process" />
+        <intent>
+            <action android:name="org.freedesktop.monado.ipc.CONNECT" />
+        </intent>
+    </queries>
+
+    <uses-feature
+        android:glEsVersion="0x00030002"
+        android:required="false" />
+
+    <!-- Long XR sessions generate no input events; without WAKE_LOCK the screen
+         dims and the session pauses. The OOP runtime owns eye tracking/camera. -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+    <application
+        android:allowBackup="false"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:label="DisplayXR Avatar">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:theme="@style/Theme.Avatar.Transparent"
+            android:configChanges="orientation|keyboardHidden|screenSize"
+            android:launchMode="singleTask">
+            <meta-data
+                android:name="android.app.lib_name"
+                android:value="avatar_vk_android" />
+
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

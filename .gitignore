@@ -4,3 +4,9 @@ installer/macos/*.pkg
 _artifact/
 _package/
 *.log
+
+# Android (Gradle/NDK) — build artifacts + machine-specific SDK paths
+local.properties
+.gradle/
+android/build/
+android/.cxx/

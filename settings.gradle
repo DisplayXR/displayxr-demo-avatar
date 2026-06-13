@@ -1,0 +1,28 @@
+// Copyright 2026, Leia Inc.
+// SPDX-License-Identifier: BSL-1.0
+//
+// Gradle settings for the Android leg of displayxr-demo-avatar. The
+// windows/ + macos/ legs build via the top-level CMakeLists.txt; the android/
+// leg is an Android Gradle application that consumes the shared model_common/
+// renderer sources by relative path (see android/src/main/cpp/CMakeLists.txt).
+
+pluginManagement {
+    repositories {
+        gradlePluginPortal()
+        google()
+        mavenCentral()
+    }
+}
+
+dependencyResolutionManagement {
+    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+
+rootProject.name = 'displayxr-demo-avatar'
+
+include ':android'
+project(':android').projectDir = new File(rootDir, 'android')

@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Copyright 2026, Leia Inc.
+    SPDX-License-Identifier: BSL-1.0
+
+    Transparency (#568): the avatar Activity hosts the OpenXR session + the
+    runtime's MonadoView overlay (which the OOP service renders the weaved
+    avatar into). The Activity itself renders nothing, so its window is made
+    fully translucent — this is the Android analog of the Windows
+    WS_EX_NOREDIRECTIONBITMAP + null brush. Combined with the runtime's
+    translucent overlay surface, the live home screen shows through everything
+    around the avatar.
+-->
+<resources>
+    <style name="Theme.Avatar.Transparent" parent="@android:style/Theme.NoTitleBar.Fullscreen">
+        <item name="android:windowBackground">@android:color/transparent</item>
+        <item name="android:windowIsTranslucent">true</item>
+        <item name="android:windowShowWallpaper">false</item>
+        <item name="android:colorBackgroundCacheHint">@null</item>
+        <item name="android:windowContentOverlay">@null</item>
+    </style>
+</resources>
