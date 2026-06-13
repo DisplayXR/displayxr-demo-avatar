@@ -676,6 +676,12 @@ static void OpenLoadDialog() {
             [g_window setBackgroundColor:[NSColor clearColor]];
             if ([g_metalView.layer isKindOfClass:[CAMetalLayer class]])
                 ((CAMetalLayer *)g_metalView.layer).opaque = NO;
+            // When decorated, let the window be dragged by the title bar AND the
+            // body (the MetalView fills the frame, so title-bar-only drag is easy
+            // to miss); borderless keeps background-drag off so it doesn't fight
+            // the click-through / avatar interaction.
+            [g_window setMovable:YES];
+            [g_window setMovableByWindowBackground:g_decorated];
             [g_window makeFirstResponder:g_metalView];
             [g_window makeKeyAndOrderFront:nil];
             LOG_INFO("Decoration: %s (B)", g_decorated ? "ON (drag/resize)" : "OFF (borderless)");
@@ -850,89 +856,10 @@ static bool CreateMacOSWindow(uint32_t width, uint32_t height) {
     // Accept drag-and-drop of .glb / .gltf files
     [g_metalView registerForDraggedTypes:@[NSPasteboardTypeFileURL]];
 
-    // Add HUD overlay — frosted backdrop + text view inside
-    NSRect hudFrame = NSMakeRect(8, 8, 320, 520);
-    g_hudBackdrop = [[NSVisualEffectView alloc] initWithFrame:hudFrame];
-    [g_hudBackdrop setMaterial:NSVisualEffectMaterialHUDWindow];
-    [g_hudBackdrop setBlendingMode:NSVisualEffectBlendingModeWithinWindow];
-    [g_hudBackdrop setState:NSVisualEffectStateActive];
-    [g_hudBackdrop setWantsLayer:YES];
-    g_hudBackdrop.layer.cornerRadius = 8.0;
-    g_hudBackdrop.layer.masksToBounds = YES;
-    [g_metalView addSubview:g_hudBackdrop];
-
-    g_hudView = [[HudOverlayView alloc] initWithFrame:g_hudBackdrop.bounds];
-    [g_hudView setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
-    [g_hudBackdrop addSubview:g_hudView];
-
-    // --- Top bar (Open / Mode) — transparent so the buttons sit directly
-    // over the rendered content (no frosted panel hiding the top of the scene).
-    const CGFloat barH = 48.0;
-    NSRect barFrame = NSMakeRect(0, height - barH, width, barH);
-    NSView *topBar = [[NSView alloc] initWithFrame:barFrame];
-    [topBar setWantsLayer:YES];
-    [[topBar layer] setBackgroundColor:[[NSColor clearColor] CGColor]];
-    [topBar setAutoresizingMask:NSViewWidthSizable | NSViewMinYMargin];
-    g_topBar = topBar;
-    [g_metalView addSubview:g_topBar];
-
-    const CGFloat btnH = 32.0, btnY = (barH - btnH) * 0.5f;
-    const CGFloat gap = 10.0;
-    CGFloat x = 12.0;
-    CGFloat openW = 96.0, modeW = 220.0;
-
-    // Helper: wrap a button in a glassy NSVisualEffectView backdrop matching
-    // the HUD's HUDWindow material so the controls have the same look.
-    NSView * (^makeGlassyButton)(NSRect, NSString*, SEL, NSButton **) =
-        ^NSView *(NSRect frame, NSString *title, SEL act, NSButton **outBtn) {
-        NSVisualEffectView *bd = [[NSVisualEffectView alloc] initWithFrame:frame];
-        [bd setMaterial:NSVisualEffectMaterialHUDWindow];
-        [bd setBlendingMode:NSVisualEffectBlendingModeWithinWindow];
-        [bd setState:NSVisualEffectStateActive];
-        [bd setWantsLayer:YES];
-        bd.layer.cornerRadius = 6.0;
-        bd.layer.masksToBounds = YES;
-        NSButton *b = [[NSButton alloc] initWithFrame:bd.bounds];
-        [b setTitle:title];
-        [b setBezelStyle:NSBezelStyleInline];
-        [b setBordered:NO];
-        [b setTarget:nil];
-        [b setAction:act];
-        [b setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
-        [bd addSubview:b];
-        if (outBtn) *outBtn = b;
-        return bd;
-    };
-
-    NSView *openBd = makeGlassyButton(NSMakeRect(x, btnY, openW, btnH),
-                                       @"Open…", @selector(openButtonClicked:),
-                                       &g_openButton);
-    [g_topBar addSubview:openBd];
-    x += openW + gap;
-
-    NSView *modeBd = makeGlassyButton(NSMakeRect(x, btnY, modeW, btnH),
-                                       @"Mode: —", @selector(modeButtonClicked:),
-                                       &g_modeButton);
-    [g_topBar addSubview:modeBd];
-
-    // Animation button — right-justified (pinned to the right edge via
-    // NSViewMinXMargin so it stays put on resize). Hidden until a model with
-    // clips loads (see UpdateTopBarButtonTitles). Click = next clip (N-key).
-    const CGFloat animW = 160.0;
-    NSView *animBd = makeGlassyButton(NSMakeRect(width - animW - 12.0, btnY, animW, btnH),
-                                       @"", @selector(animationButtonClicked:),
-                                       &g_animButton);
-    [animBd setAutoresizingMask:NSViewMinXMargin | NSViewMinYMargin];
-    [animBd setHidden:YES];
-    g_animButtonBackdrop = animBd;
-    [g_topBar addSubview:animBd];
-
-    // --- Reticle (non-interactive center crosshair) ---
-    const CGFloat retSize = 20.0;
-    NSRect retFrame = NSMakeRect((width - retSize) * 0.5f, (height - retSize) * 0.5f, retSize, retSize);
-    g_reticleView = [[ReticleView alloc] initWithFrame:retFrame];
-    [g_reticleView setAutoresizingMask:NSViewMinXMargin | NSViewMaxXMargin | NSViewMinYMargin | NSViewMaxYMargin];
-    [g_metalView addSubview:g_reticleView];
+    // No model-viewer chrome on the avatar: the floating character is the whole
+    // UI (mirrors the Windows leg, which stripped the Open/Mode/Animation buttons,
+    // the info HUD, and the reticle). g_topBar/g_hudBackdrop/g_hudView/g_reticleView
+    // stay nil — the click-through + HUD-update guards already handle that.
 
     [NSApp activateIgnoringOtherApps:YES];
     LOG_INFO("macOS window created (%ux%u)", width, height);
