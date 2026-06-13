@@ -152,6 +152,14 @@ HudBar g_hud_bar;
 // supports window-space layers on Android OOP (#506/#529 landed). Override with
 // `setprop debug.dxr.mv.ws_ui 0` to fall back to the interim Kotlin widget bar.
 bool g_use_ws_ui = true;
+
+// #568 speech bubble — a rounded panel + greeting, rasterized like the button
+// bar but submitted as an XR_EXT_local_3d_zone Local2D layer in the top-25% 2D
+// band (above the tiger zone). Reuses the HudBar swapchain/font/upload infra.
+HudBar g_bubble;
+constexpr uint32_t kBubbleTexW = 1024;
+constexpr uint32_t kBubbleTexH = 384;
+static const char *const kBubbleText = "Hi there! I'm Leo, your friendly 3D desktop avatar.";
 // Cached labels for the Kotlin bar (written on the android_main thread, read
 // from the UI thread via JNI — the renderer itself is not thread-safe to poll).
 std::mutex g_ui_label_mutex;
@@ -1462,26 +1470,65 @@ render_frame()
 		tiger_zone.next = nullptr;
 		projection_layer.next = &tiger_zone;
 	}
-	const XrCompositionLayerBaseHeader *layers[2] = {
-	    reinterpret_cast<const XrCompositionLayerBaseHeader *>(&projection_layer),
-	    reinterpret_cast<const XrCompositionLayerBaseHeader *>(&bar_layer)};
+	// #568 speech bubble — an XR_EXT_local_3d_zone Local2D layer placed in the
+	// top-25% 2D band (above the tiger zone). Static greeting uploaded once at
+	// init; the runtime blits the released image into `rect` each frame. Only in
+	// a zones frame (the band only exists when the tiger is zone-confined).
+	XrCompositionLayerLocal2DEXT bubble_layer = {(XrStructureType)XR_TYPE_COMPOSITION_LAYER_LOCAL_2D_EXT};
+	bool bubble_active = false;
+	if (zones_frame && g_bubble.ready) {
+		const uint32_t cw = g_win_px_w.load(std::memory_order_relaxed);
+		const uint32_t ch = g_win_px_h.load(std::memory_order_relaxed);
+		if (cw > 0 && ch > 0) {
+			const float band_h = (float)ch * kBubbleBandFrac;  // top 25%
+			const int bw = (int)((float)cw * 0.70f);           // 70% width, centred
+			const int bh = (int)((float)bw * (float)kBubbleTexH / (float)kBubbleTexW);
+			int bx0 = (int)(((float)cw - (float)bw) * 0.5f);
+			int by0 = (int)((band_h - (float)bh) * 0.5f);       // centred in the band
+			const int top_margin = (int)(band_h * 0.05f);
+			if (by0 < top_margin) {
+				by0 = top_margin;
+			}
+			bubble_layer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+			bubble_layer.subImage.swapchain = g_bubble.swapchain;
+			bubble_layer.subImage.imageRect.offset = {0, 0};
+			bubble_layer.subImage.imageRect.extent = {(int32_t)kBubbleTexW, (int32_t)kBubbleTexH};
+			bubble_layer.subImage.imageArrayIndex = 0;
+			bubble_layer.rect.offset = {bx0, by0};
+			bubble_layer.rect.extent = {bw, bh};
+			bubble_active = true;
+		}
+	}
+
+	// Layer order: projection/zone, then the bubble, then the window-space bar
+	// LAST so the existing "drop the bar on reject" fallback below still works.
+	const XrCompositionLayerBaseHeader *layers[3];
+	uint32_t base_count = 0;
+	layers[base_count++] = reinterpret_cast<const XrCompositionLayerBaseHeader *>(&projection_layer);
+	if (bubble_active) {
+		layers[base_count++] = reinterpret_cast<const XrCompositionLayerBaseHeader *>(&bubble_layer);
+	}
+	uint32_t full_count = base_count;
+	if (bar_active) {
+		layers[full_count++] = reinterpret_cast<const XrCompositionLayerBaseHeader *>(&bar_layer);
+	}
 
 	XrFrameEndInfo end_info = {};
 	end_info.type = XR_TYPE_FRAME_END_INFO;
 	end_info.displayTime = frame_state.predictedDisplayTime;
 	end_info.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
-	end_info.layerCount = rendered ? (bar_active ? 2 : 1) : 0;
+	end_info.layerCount = rendered ? full_count : 0;
 	end_info.layers = rendered ? layers : nullptr;
 	res = xrEndFrame(g_session, &end_info);
 	if (res == XR_ERROR_LAYER_INVALID && bar_active) {
 		// The runtime's window-space gate doesn't accept this session (Android
 		// OOP — see the runtime issue on verify_window_space_layer). Disable
-		// the button UI for this run and resubmit the frame without the bar so
-		// frame discipline is preserved.
+		// the button UI for this run and resubmit the frame without the bar (the
+		// last layer) so frame discipline is preserved; the bubble is kept.
 		g_ws_layer_unsupported.store(true, std::memory_order_relaxed);
 		g_ui_visible.store(false, std::memory_order_relaxed);
 		LOGW("window-space layer rejected by the runtime — button UI disabled this session");
-		end_info.layerCount = 1;
+		end_info.layerCount = base_count;
 		res = xrEndFrame(g_session, &end_info);
 	}
 	if (res != XR_SUCCESS) {
@@ -1512,6 +1559,7 @@ destroy_all()
 		g_model_ready = false;
 	}
 	hud_bar_destroy(g_hud_bar);
+	hud_bar_destroy(g_bubble);
 	if (g_session != XR_NULL_HANDLE) {
 		xrDestroySession(g_session);
 		g_session = XR_NULL_HANDLE;
@@ -1568,6 +1616,17 @@ handle_cmd(struct android_app *app, int32_t cmd)
 				hud_bar_init(g_hud_bar, g_session, g_vk_phys_device, g_vk_device,
 				             g_vk_queue, g_vk_queue_family, g_swapchain_format,
 				             kBarTexW, kBarTexH);
+			}
+			if (ok && g_has_local_3d_zone) {
+				// #568 speech bubble (Local2D layer in the top-25% band). Non-fatal:
+				// on failure the bubble simply doesn't draw. Rasterized once here.
+				if (hud_bar_init(g_bubble, g_session, g_vk_phys_device, g_vk_device,
+				                 g_vk_queue, g_vk_queue_family, g_swapchain_format,
+				                 kBubbleTexW, kBubbleTexH, 56.0f)) {
+					hud_bar_render_bubble(g_bubble, kBubbleText);
+					hud_bar_upload(g_bubble, 1.0f);
+					LOGI("#568 speech bubble ready (%ux%u)", kBubbleTexW, kBubbleTexH);
+				}
 			}
 			LOGI(ok ? "Bring-up complete." : "Bring-up failed; see logs.");
 		}
