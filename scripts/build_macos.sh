@@ -6,7 +6,7 @@
 # Usage:
 #   ./scripts/build_macos.sh                run cmake build only
 #   ./scripts/build_macos.sh --installer    also stage artifacts and build
-#                                            _package/DisplayXRModelViewer-*.pkg
+#                                            _package/DisplayXRAvatar-*.pkg
 #
 # Env:
 #   DISPLAYXR_VERSION   version string baked into the .pkg + .app Info.plist
@@ -72,7 +72,7 @@ cmake -S . -B build -G Ninja \
     -DCMAKE_PREFIX_PATH="$OPENXR_DIR"
 cmake --build build
 
-BIN="$REPO_ROOT/build/macos/model_viewer_handle_vk_macos"
+BIN="$REPO_ROOT/build/macos/avatar_handle_vk_macos"
 if [ ! -x "$BIN" ]; then
     echo "Error: expected binary not found at $BIN" >&2
     exit 1
@@ -148,7 +148,7 @@ done
 # --- 3. .pkg ---------------------------------------------------------------
 PKG_DIR="$REPO_ROOT/_package"
 mkdir -p "$PKG_DIR"
-PKG_PATH="$PKG_DIR/DisplayXRModelViewer-${VERSION}.pkg"
+PKG_PATH="$PKG_DIR/DisplayXRAvatar-${VERSION}.pkg"
 
 DISPLAYXR_VERSION="$VERSION" \
     bash "$REPO_ROOT/installer/macos/build_installer.sh" "$ARTIFACT_DIR" "$PKG_PATH"

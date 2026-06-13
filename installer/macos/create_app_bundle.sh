@@ -1,5 +1,5 @@
 #!/bin/bash
-# Create a macOS .app bundle for the Model Viewer demo.
+# Create a macOS .app bundle for the Avatar demo.
 #
 # Adapted from the runtime repo's installer/macos/create_app_bundle.sh.
 # Differences from that template:
@@ -20,12 +20,12 @@
 set -e
 
 ARTIFACT_DIR="${1:?Usage: $0 <artifact-dir> [output.app]}"
-APP_BUNDLE="${2:-3D Model Viewer.app}"
-BINARY_NAME="model_viewer_handle_vk_macos"
+APP_BUNDLE="${2:-3D Avatar.app}"
+BINARY_NAME="avatar_handle_vk_macos"
 VERSION="${DISPLAYXR_VERSION:-1.0.0}"
 
-BUNDLE_DISPLAY_NAME="3D Model Viewer"
-BUNDLE_ID="com.displayxr.modelviewer"
+BUNDLE_DISPLAY_NAME="3D Avatar"
+BUNDLE_ID="com.displayxr.avatar"
 
 if [ ! -f "$ARTIFACT_DIR/bin/$BINARY_NAME" ]; then
     echo "Error: $BINARY_NAME binary not found in $ARTIFACT_DIR/bin/" >&2
@@ -56,6 +56,8 @@ cat > "$APP_BUNDLE/Contents/Info.plist" <<EOF
     <string>${BUNDLE_DISPLAY_NAME}</string>
     <key>CFBundleDisplayName</key>
     <string>${BUNDLE_DISPLAY_NAME}</string>
+    <key>CFBundleIconFile</key>
+    <string>avatar</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
@@ -81,7 +83,7 @@ export DYLD_LIBRARY_PATH="$DIR/lib:${DYLD_LIBRARY_PATH:-}"
 export VK_ICD_FILENAMES="$DIR/MoltenVK_icd.json"
 export VK_DRIVER_FILES="$DIR/MoltenVK_icd.json"
 cd "$DIR"
-exec "$DIR/model_viewer_handle_vk_macos" "$@"
+exec "$DIR/avatar_handle_vk_macos" "$@"
 LAUNCHER
 chmod +x "$APP_BUNDLE/Contents/MacOS/$BUNDLE_DISPLAY_NAME"
 
@@ -92,6 +94,28 @@ if [ -f "$ARTIFACT_DIR/assets/sample.glb" ]; then
 fi
 if [ -d "$ARTIFACT_DIR/displayxr" ]; then
     cp -R "$ARTIFACT_DIR/displayxr/." "$APP_BUNDLE/Contents/Resources/displayxr/"
+fi
+
+# --- App icon (.icns) ---
+# Generate Contents/Resources/avatar.icns from the 2D workspace logo
+# (displayxr/avatar_icon.png) so the .app shows the avatar logo in Finder /
+# the Dock. iconutil + sips ship with macOS, so this needs no extra deps and
+# keeps the logo single-sourced (no committed .icns binary). CFBundleIconFile
+# in Info.plist points at "avatar".
+ICON_SRC="$ARTIFACT_DIR/displayxr/avatar_icon.png"
+if [ -f "$ICON_SRC" ]; then
+    ICONSET="$(mktemp -d)/avatar.iconset"
+    mkdir -p "$ICONSET"
+    for spec in "16:16x16" "32:16x16@2x" "32:32x32" "64:32x32@2x" \
+                "128:128x128" "256:128x128@2x" "256:256x256" "512:256x256@2x" \
+                "512:512x512" "1024:512x512@2x"; do
+        px="${spec%%:*}"; name="${spec#*:}"
+        sips -z "$px" "$px" "$ICON_SRC" --out "$ICONSET/icon_${name}.png" >/dev/null
+    done
+    iconutil -c icns "$ICONSET" -o "$APP_BUNDLE/Contents/Resources/avatar.icns"
+    rm -rf "$(dirname "$ICONSET")"
+else
+    echo "Warning: $ICON_SRC not found — .app will have no custom icon" >&2
 fi
 
 # --- Resources/lib: bundled support dylibs ---

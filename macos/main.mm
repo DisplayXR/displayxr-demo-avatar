@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  macOS Vulkan OpenXR glTF 2.0 PBR model viewer with external window binding
+ * @brief  macOS Vulkan OpenXR glTF 2.0 PBR 3D avatar viewer with external window binding
  *
  * Renders glTF 2.0 models on tracked 3D displays via OpenXR.
  * Based on cube_handle_vk_macos with the cube/grid renderer replaced by
@@ -721,7 +721,7 @@ static bool CreateMacOSWindow(uint32_t width, uint32_t height) {
                        NSWindowStyleMaskResizable | NSWindowStyleMaskMiniaturizable;
     g_window = [[NSWindow alloc] initWithContentRect:frame
         styleMask:style backing:NSBackingStoreBuffered defer:NO];
-    [g_window setTitle:@"DisplayXR 3D Model Viewer"];
+    [g_window setTitle:@"DisplayXR 3D Avatar"];
     [g_window setDelegate:delegate];
     [g_window center];
 
@@ -1094,7 +1094,7 @@ static bool InitializeOpenXR(AppXrSession& xr) {
     if (xr.hasMcpToolsExt) enabled.push_back(XR_EXT_MCP_TOOLS_EXTENSION_NAME);
 
     XrInstanceCreateInfo ci = {XR_TYPE_INSTANCE_CREATE_INFO};
-    strncpy(ci.applicationInfo.applicationName, "DisplayXRModelViewerMacOS", sizeof(ci.applicationInfo.applicationName));
+    strncpy(ci.applicationInfo.applicationName, "DisplayXRAvatarMacOS", sizeof(ci.applicationInfo.applicationName));
     ci.applicationInfo.applicationVersion = 1;
     strncpy(ci.applicationInfo.engineName, "None", sizeof(ci.applicationInfo.engineName));
     ci.applicationInfo.apiVersion = XR_CURRENT_API_VERSION;
@@ -1192,7 +1192,7 @@ static bool CreateVulkanInstance(AppXrSession& xr, VkInstance& vkInstance) {
 
     VkApplicationInfo ai = {};
     ai.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
-    ai.pApplicationName = "DisplayXRModelViewerMacOS";
+    ai.pApplicationName = "DisplayXRAvatarMacOS";
     ai.apiVersion = VK_API_VERSION_1_2;
     VkInstanceCreateInfo ci = {};
     ci.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
@@ -1288,14 +1288,14 @@ static bool CreateSession(AppXrSession& xr, VkInstance vkInstance, VkPhysicalDev
 
     // XR_EXT_mcp_tools (#22): declare identity + register the base agent
     // tools. The appId MUST match `id` in
-    // displayxr/model_viewer_handle_vk_macos.displayxr.json (INV-10.1).
+    // displayxr/avatar_handle_vk_macos.displayxr.json (INV-10.1).
     // Failure is non-fatal by design — the MCP capability gate may simply be
     // off on this machine; the viewer runs identically without an agent
     // surface. The animation tools are NOT registered here: they appear only
     // once a model with clips loads (UpdateMcpAnimationTools).
     if (xr.hasMcpToolsExt && xr.pfnSetMCPAppInfo && xr.pfnRegisterMCPTool) {
         XrMCPAppInfoEXT mcpAppInfo = {XR_TYPE_MCP_APP_INFO_EXT};
-        strncpy(mcpAppInfo.appId, "modelviewer", sizeof(mcpAppInfo.appId) - 1);
+        strncpy(mcpAppInfo.appId, "avatar", sizeof(mcpAppInfo.appId) - 1);
         XrResult ar = xr.pfnSetMCPAppInfo(xr.session, &mcpAppInfo);
         if (XR_SUCCEEDED(ar)) {
             XrMCPToolInfoEXT loadTool = {XR_TYPE_MCP_TOOL_INFO_EXT};
@@ -1351,7 +1351,7 @@ static bool CreateSession(AppXrSession& xr, VkInstance vkInstance, VkPhysicalDev
             XrResult t4 = xr.pfnRegisterMCPTool(xr.session, &frameTool);
 
             xr.mcpToolsReady = true;
-            LOG_INFO("XR_EXT_mcp_tools: appId=modelviewer load_model=%d get_status=%d "
+            LOG_INFO("XR_EXT_mcp_tools: appId=avatar load_model=%d get_status=%d "
                      "set_orbit=%d frame_model=%d", t1, t2, t3, t4);
         } else {
             LOG_INFO("XR_EXT_mcp_tools: appId not accepted (%d) — no agent surface", ar);
@@ -1977,7 +1977,7 @@ int main() {
     signal(SIGINT, SignalHandler);
     signal(SIGTERM, SignalHandler);
 
-    LOG_INFO("=== DisplayXR 3D Model Viewer (Vulkan) + External macOS Window ===");
+    LOG_INFO("=== DisplayXR 3D Avatar (Vulkan) + External macOS Window ===");
 
     // Initialize rendering mode from env var (legacy fallback)
     {

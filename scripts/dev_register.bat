@@ -28,12 +28,12 @@ REM Locate this repo's build dir relative to the script location.
 set "REPO_ROOT=%~dp0.."
 for %%I in ("%REPO_ROOT%") do set "REPO_ROOT=%%~fI"
 set "BUILD_DIR=%REPO_ROOT%\build\windows"
-set "EXE_PATH=%BUILD_DIR%\model_viewer_handle_vk_win.exe"
-set "ICON_PNG=%BUILD_DIR%\icon.png"
-set "ICON_SBS=%BUILD_DIR%\icon_sbs.png"
+set "EXE_PATH=%BUILD_DIR%\avatar_handle_vk_win.exe"
+set "ICON_PNG=%BUILD_DIR%\avatar_icon.png"
+set "ICON_SBS=%BUILD_DIR%\avatar_icon_sbs.png"
 
 set "TARGET_DIR=%LOCALAPPDATA%\DisplayXR\apps"
-set "MANIFEST_PATH=%TARGET_DIR%\model_viewer-dev.displayxr.json"
+set "MANIFEST_PATH=%TARGET_DIR%\avatar-dev.displayxr.json"
 
 if /i "%~1" == "--unregister" goto :unregister
 
@@ -50,8 +50,8 @@ if not exist "%TARGET_DIR%" mkdir "%TARGET_DIR%"
 
 REM Copy icons next to the manifest (icon paths in the manifest are
 REM resolved relative to the manifest file per spec ?2.3).
-if exist "%ICON_PNG%" copy /y "%ICON_PNG%" "%TARGET_DIR%\icon.png" >nul
-if exist "%ICON_SBS%" copy /y "%ICON_SBS%" "%TARGET_DIR%\icon_sbs.png" >nul
+if exist "%ICON_PNG%" copy /y "%ICON_PNG%" "%TARGET_DIR%\avatar_icon.png" >nul
+if exist "%ICON_SBS%" copy /y "%ICON_SBS%" "%TARGET_DIR%\avatar_icon_sbs.png" >nul
 
 REM Forward slashes in exe_path (spec accepts either; fwd slashes parse
 REM cleanly with strict JSON readers).
@@ -60,13 +60,14 @@ set "EXE_FWD=%EXE_PATH:\=/%"
 (
     echo {
     echo   "schema_version": 1,
-    echo   "name": "3D Model Viewer (dev)",
+    echo   "id": "avatar-dev",
+    echo   "name": "3D Avatar (dev)",
     echo   "type": "3d",
     echo   "category": "demo",
     echo   "display_mode": "auto",
-    echo   "description": "DEV BUILD: Interactive PBR viewer for 3D models (.glb / .gltf). Drag-and-drop a model or press L to load.",
-    echo   "icon": "icon.png",
-    echo   "icon_3d": "icon_sbs.png",
+    echo   "description": "DEV BUILD: a transparent, click-through 3D avatar that floats over your desktop with a 2D speech bubble.",
+    echo   "icon": "avatar_icon.png",
+    echo   "icon_3d": "avatar_icon_sbs.png",
     echo   "icon_3d_layout": "sbs-lr",
     echo   "exe_path": "%EXE_FWD%"
     echo }

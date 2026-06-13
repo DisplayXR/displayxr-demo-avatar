@@ -1,7 +1,7 @@
 # Copyright 2026, Leia Inc.
 # SPDX-License-Identifier: BSL-1.0
 #
-# Standalone build — lives inside displayxr-demo-modelviewer repo as
+# Standalone build — lives inside displayxr-demo-avatar repo as
 # macos/CMakeLists.txt. Assumes sibling dirs: ../common, ../model_common,
 # ../openxr_includes. Top-level CMakeLists.txt is expected to have already
 # added ../common and ../model_common as subdirectories, exposing the
@@ -44,20 +44,20 @@ if(NOT OPENXR_FOUND)
     message(FATAL_ERROR "OpenXR not found. Install via: brew install openxr-loader")
 endif()
 
-add_executable(model_viewer_handle_vk_macos
+add_executable(avatar_handle_vk_macos
     main.mm
     # stb_image (read) implementation TU comes from displayxr::common
     # (stb_image_impl_macos.cpp) — model_loader.cpp takes declarations only
     # (#396 W4).
 )
 
-target_include_directories(model_viewer_handle_vk_macos PRIVATE
+target_include_directories(avatar_handle_vk_macos PRIVATE
     ${CMAKE_SOURCE_DIR}/openxr_includes
     ${CMAKE_SOURCE_DIR}/common
     ${CMAKE_SOURCE_DIR}/model_common
 )
 
-target_link_libraries(model_viewer_handle_vk_macos PRIVATE
+target_link_libraries(avatar_handle_vk_macos PRIVATE
     sr_common_base
     model_renderer
     OpenXR::openxr_loader
@@ -73,8 +73,8 @@ target_link_libraries(model_viewer_handle_vk_macos PRIVATE
 # Copy bundled default model next to the exe (auto-loaded at startup), if present.
 set(BUNDLED_MODEL "${CMAKE_CURRENT_SOURCE_DIR}/assets/sample.glb")
 if(EXISTS "${BUNDLED_MODEL}")
-    add_custom_command(TARGET model_viewer_handle_vk_macos POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${BUNDLED_MODEL}" "$<TARGET_FILE_DIR:model_viewer_handle_vk_macos>/sample.glb"
+    add_custom_command(TARGET avatar_handle_vk_macos POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${BUNDLED_MODEL}" "$<TARGET_FILE_DIR:avatar_handle_vk_macos>/sample.glb"
         COMMENT "Copying bundled sample.glb next to exe"
     )
 endif()
