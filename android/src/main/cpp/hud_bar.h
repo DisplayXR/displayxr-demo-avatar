@@ -68,6 +68,9 @@ struct HudBar
 // Create the swapchain (tex_w x tex_h, the session's RGBA8 format), staging
 // buffer + command pool, and bake the system font. Non-fatal on failure
 // (returns false, bar stays !ready and the app simply has no button UI).
+// font_px: glyph size for the baked atlas; 0 = auto (0.42·tex_h, right for a
+// single-line bar). Pass an explicit smaller value for a multi-line panel like
+// the speech bubble. The glyph atlas grows automatically until the bake fits.
 bool
 hud_bar_init(HudBar &bar,
              XrSession session,
@@ -77,7 +80,8 @@ hud_bar_init(HudBar &bar,
              uint32_t queue_family,
              VkFormat format,
              uint32_t tex_w,
-             uint32_t tex_h);
+             uint32_t tex_h,
+             float font_px = 0.0f);
 
 void
 hud_bar_destroy(HudBar &bar);
@@ -86,6 +90,12 @@ hud_bar_destroy(HudBar &bar);
 // label per enabled button.
 void
 hud_bar_render(HudBar &bar, const HudBarButton *buttons, uint32_t count);
+
+// (Re)rasterize the base pixels as a single rounded panel with a word-wrapped,
+// centered greeting — the #568 speech bubble (submitted as a Local2D layer in
+// the top-25% 2D band rather than the window-space bar).
+void
+hud_bar_render_bubble(HudBar &bar, const char *text);
 
 // Upload the base pixels, with the alpha channel scaled by `alpha` [0..1],
 // into the next swapchain image (acquire → copy → release). The released

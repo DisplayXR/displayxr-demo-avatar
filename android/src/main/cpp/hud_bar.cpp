@@ -162,7 +162,8 @@ hud_bar_init(HudBar &bar,
              uint32_t queue_family,
              VkFormat format,
              uint32_t tex_w,
-             uint32_t tex_h)
+             uint32_t tex_h,
+             float font_px)
 {
 	bar.device = device;
 	bar.queue = queue;
@@ -182,23 +183,36 @@ hud_bar_init(HudBar &bar,
 		BAR_LOGW("hud_bar: no system TTF found — button UI disabled");
 		return false;
 	}
-	bar.font_px = (float)tex_h * 0.42f;
+	// Auto font size (0.42·tex_h) suits a single-line bar; callers pass an
+	// explicit smaller size for a multi-line panel (the bubble).
+	bar.font_px = font_px > 0.0f ? font_px : (float)tex_h * 0.42f;
 	bar.atlas_w = 1024;
-	bar.atlas_h = 256;
-	bar.font_atlas.assign((size_t)bar.atlas_w * bar.atlas_h, 0);
 	bar.baked_chars.assign(sizeof(stbtt_bakedchar) * kNumChars, 0);
-	if (stbtt_BakeFontBitmap(ttf.data(), 0, bar.font_px, bar.font_atlas.data(), bar.atlas_w,
-	                         bar.atlas_h, kFirstChar, kNumChars,
-	                         reinterpret_cast<stbtt_bakedchar *>(bar.baked_chars.data())) <= 0) {
-		BAR_LOGW("hud_bar: stbtt_BakeFontBitmap failed for %s", used);
+	// Grow the atlas height until all glyphs pack (a bigger font needs more
+	// area; stbtt_BakeFontBitmap returns <=0 if they don't fit).
+	bool baked = false;
+	for (int atlas_h = 256; atlas_h <= 4096; atlas_h *= 2) {
+		bar.atlas_h = atlas_h;
+		bar.font_atlas.assign((size_t)bar.atlas_w * bar.atlas_h, 0);
+		if (stbtt_BakeFontBitmap(ttf.data(), 0, bar.font_px, bar.font_atlas.data(), bar.atlas_w,
+		                         bar.atlas_h, kFirstChar, kNumChars,
+		                         reinterpret_cast<stbtt_bakedchar *>(bar.baked_chars.data())) > 0) {
+			baked = true;
+			break;
+		}
+	}
+	if (!baked) {
+		BAR_LOGW("hud_bar: stbtt_BakeFontBitmap failed for %s (font_px=%.0f)", used, bar.font_px);
 		return false;
 	}
 
 	// HUD swapchain — same RGBA8 format the model swapchains use.
 	XrSwapchainCreateInfo ci = {};
 	ci.type = XR_TYPE_SWAPCHAIN_CREATE_INFO;
+	// TRANSFER_SRC so the runtime can blit this image into a Local2D layer's
+	// destination rect (the speech bubble, #568); harmless for the window-space bar.
 	ci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT |
-	                XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
+	                XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_SRC_BIT;
 	ci.format = (int64_t)format;
 	ci.sampleCount = 1;
 	ci.width = tex_w;
@@ -346,6 +360,78 @@ hud_bar_render(HudBar &bar, const HudBarButton *buttons, uint32_t count)
 		}
 		const float baseline = cy + bar.font_px * 0.34f;
 		draw_text(bar, buttons[b].label.c_str(), tx, baseline, x0 + pad * 0.5f, x1 - pad * 0.5f);
+	}
+}
+
+void
+hud_bar_render_bubble(HudBar &bar, const char *text)
+{
+	if (!bar.ready) {
+		return;
+	}
+	std::memset(bar.pixels.data(), 0, bar.pixels.size());
+
+	const float W = (float)bar.tex_w, H = (float)bar.tex_h;
+
+	// One rounded glassy panel filling the texture (small margin), same fill/rim
+	// look as the button pills (the #568 speech bubble).
+	const float margin = H * 0.10f;
+	const float cx = W * 0.5f, cy = H * 0.5f;
+	const float hw = W * 0.5f - margin, hh = H * 0.5f - margin;
+	const float radius = hh * 0.5f;
+	for (int y = 0; y < (int)bar.tex_h; ++y) {
+		for (int x = 0; x < (int)bar.tex_w; ++x) {
+			const float d = rounded_rect_dist((float)x + 0.5f, (float)y + 0.5f, cx, cy, hw, hh, radius);
+			const float fill_cov = d < -1.0f ? 1.0f : (d < 0.0f ? -d : 0.0f);
+			const float rim_cov =
+			    std::fabs(d + 0.75f) < 1.25f ? 1.0f - std::fabs(d + 0.75f) / 1.25f : 0.0f;
+			if (fill_cov <= 0.0f && rim_cov <= 0.0f) {
+				continue;
+			}
+			unsigned char *dst = &bar.pixels[((size_t)y * bar.tex_w + x) * 4];
+			blend_px(dst, 0.10f, 0.11f, 0.13f, fill_cov * 0.82f);
+			blend_px(dst, 0.55f, 0.58f, 0.64f, rim_cov * 0.55f);
+		}
+	}
+
+	// Greedy word-wrap the greeting to the panel interior, then draw centered lines.
+	const float pad = radius + W * 0.02f;
+	const float maxW = (hw * 2.0f) - 2.0f * pad;
+	const float line_h = bar.font_px * 1.25f;
+
+	std::vector<std::string> lines;
+	{
+		std::string cur, word;
+		for (const char *p = text;; ++p) {
+			if (*p != ' ' && *p != '\0') {
+				word.push_back(*p);
+				continue;
+			}
+			if (!word.empty()) {
+				std::string trial = cur.empty() ? word : cur + " " + word;
+				if (cur.empty() || text_width_px(bar, trial.c_str()) <= maxW) {
+					cur.swap(trial);
+				} else {
+					lines.push_back(cur);
+					cur = word;
+				}
+				word.clear();
+			}
+			if (*p == '\0') {
+				break;
+			}
+		}
+		if (!cur.empty()) {
+			lines.push_back(cur);
+		}
+	}
+
+	const float block_h = line_h * (float)lines.size();
+	float baseline = cy - 0.5f * block_h + bar.font_px * 0.8f;
+	for (const auto &ln : lines) {
+		const float tw = text_width_px(bar, ln.c_str());
+		draw_text(bar, ln.c_str(), cx - 0.5f * tw, baseline, 0.0f, W);
+		baseline += line_h;
 	}
 }
 
