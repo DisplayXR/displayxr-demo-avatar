@@ -1585,21 +1585,21 @@ handle_cmd(struct android_app *app, int32_t cmd)
 
 // ─── JNI bridge to MainActivity ──────────────────────────────────────────
 extern "C" JNIEXPORT void JNICALL
-Java_com_displayxr_model_1viewer_1vk_1android_MainActivity_nativeSetRotation(
+Java_com_displayxr_avatar_1vk_1android_MainActivity_nativeSetRotation(
     JNIEnv * /*env*/, jobject /*thiz*/, jint rotation)
 {
 	g_display_rotation.store(rotation & 3, std::memory_order_relaxed);
 }
 
 extern "C" JNIEXPORT jboolean JNICALL
-Java_com_displayxr_model_1viewer_1vk_1android_MainActivity_nativeRuntimeUnavailable(
+Java_com_displayxr_avatar_1vk_1android_MainActivity_nativeRuntimeUnavailable(
     JNIEnv * /*env*/, jobject /*thiz*/)
 {
 	return g_runtime_unavailable.load(std::memory_order_relaxed) ? JNI_TRUE : JNI_FALSE;
 }
 
 extern "C" JNIEXPORT jboolean JNICALL
-Java_com_displayxr_model_1viewer_1vk_1android_MainActivity_nativeXrReady(
+Java_com_displayxr_avatar_1vk_1android_MainActivity_nativeXrReady(
     JNIEnv * /*env*/, jobject /*thiz*/)
 {
 	return (g_instance != XR_NULL_HANDLE) ? JNI_TRUE : JNI_FALSE;
@@ -1613,7 +1613,7 @@ Java_com_displayxr_model_1viewer_1vk_1android_MainActivity_nativeXrReady(
 // MainActivity.dispatchTouchEvent and bridge the coordinates down here instead.
 // action = MotionEvent.getActionMasked(); count = pointerCount.
 extern "C" JNIEXPORT void JNICALL
-Java_com_displayxr_model_1viewer_1vk_1android_MainActivity_nativeOnTouch(
+Java_com_displayxr_avatar_1vk_1android_MainActivity_nativeOnTouch(
     JNIEnv * /*env*/, jobject /*thiz*/, jint action, jint count,
     jfloat x0, jfloat y0, jfloat x1, jfloat y1)
 {
@@ -1680,7 +1680,7 @@ Java_com_displayxr_model_1viewer_1vk_1android_MainActivity_nativeOnTouch(
 // double-tap — it moves to the planned on-tap button UI (g_load_request
 // stays as its hook).
 extern "C" JNIEXPORT void JNICALL
-Java_com_displayxr_model_1viewer_1vk_1android_MainActivity_nativeResetView(
+Java_com_displayxr_avatar_1vk_1android_MainActivity_nativeResetView(
     JNIEnv * /*env*/, jobject /*thiz*/)
 {
 	g_reset_view_request.store(true, std::memory_order_relaxed);
@@ -1690,7 +1690,7 @@ Java_com_displayxr_model_1viewer_1vk_1android_MainActivity_nativeResetView(
 // part of a double-tap). Coords are view pixels; hit-testing runs on the
 // android_main thread.
 extern "C" JNIEXPORT void JNICALL
-Java_com_displayxr_model_1viewer_1vk_1android_MainActivity_nativeOnTap(
+Java_com_displayxr_avatar_1vk_1android_MainActivity_nativeOnTap(
     JNIEnv * /*env*/, jobject /*thiz*/, jfloat x, jfloat y)
 {
 	g_ui_tap_x.store((float)x, std::memory_order_relaxed);
@@ -1701,7 +1701,7 @@ Java_com_displayxr_model_1viewer_1vk_1android_MainActivity_nativeOnTap(
 // Kotlin polls this; true means the native Open button was tapped and the
 // SAF document picker should be launched (native code can't start an Intent).
 extern "C" JNIEXPORT jboolean JNICALL
-Java_com_displayxr_model_1viewer_1vk_1android_MainActivity_nativeConsumeOpenRequest(
+Java_com_displayxr_avatar_1vk_1android_MainActivity_nativeConsumeOpenRequest(
     JNIEnv * /*env*/, jobject /*thiz*/)
 {
 	return g_open_picker_request.exchange(false, std::memory_order_relaxed) ? JNI_TRUE
@@ -1712,7 +1712,7 @@ Java_com_displayxr_model_1viewer_1vk_1android_MainActivity_nativeConsumeOpenRequ
 
 // Which bar implementation this run uses (debug.dxr.mv.ws_ui).
 extern "C" JNIEXPORT jboolean JNICALL
-Java_com_displayxr_model_1viewer_1vk_1android_MainActivity_nativeUseWindowSpaceUi(
+Java_com_displayxr_avatar_1vk_1android_MainActivity_nativeUseWindowSpaceUi(
     JNIEnv * /*env*/, jobject /*thiz*/)
 {
 	return g_use_ws_ui ? JNI_TRUE : JNI_FALSE;
@@ -1721,7 +1721,7 @@ Java_com_displayxr_model_1viewer_1vk_1android_MainActivity_nativeUseWindowSpaceU
 // Mode button: request the next display rendering mode (serviced on the
 // android_main thread; the label updates via the mode-changed event).
 extern "C" JNIEXPORT void JNICALL
-Java_com_displayxr_model_1viewer_1vk_1android_MainActivity_nativeCycleMode(
+Java_com_displayxr_avatar_1vk_1android_MainActivity_nativeCycleMode(
     JNIEnv * /*env*/, jobject /*thiz*/)
 {
 	g_cycle_mode_request.store(true, std::memory_order_relaxed);
@@ -1729,7 +1729,7 @@ Java_com_displayxr_model_1viewer_1vk_1android_MainActivity_nativeCycleMode(
 
 // Animation button: next clip / play-pause toggle (serviced on android_main).
 extern "C" JNIEXPORT void JNICALL
-Java_com_displayxr_model_1viewer_1vk_1android_MainActivity_nativeAnimAction(
+Java_com_displayxr_avatar_1vk_1android_MainActivity_nativeAnimAction(
     JNIEnv * /*env*/, jobject /*thiz*/)
 {
 	g_anim_cycle_request.store(true, std::memory_order_relaxed);
@@ -1738,7 +1738,7 @@ Java_com_displayxr_model_1viewer_1vk_1android_MainActivity_nativeAnimAction(
 // "Mode: <name>" — names are written once at enumerate, index via the
 // mode-changed event; safe to read from the UI thread.
 extern "C" JNIEXPORT jstring JNICALL
-Java_com_displayxr_model_1viewer_1vk_1android_MainActivity_nativeGetModeLabel(
+Java_com_displayxr_avatar_1vk_1android_MainActivity_nativeGetModeLabel(
     JNIEnv *env, jobject /*thiz*/)
 {
 	char label[80];
@@ -1750,7 +1750,7 @@ Java_com_displayxr_model_1viewer_1vk_1android_MainActivity_nativeGetModeLabel(
 
 // Clip name / "Paused"; empty string = model has no animations (hide button).
 extern "C" JNIEXPORT jstring JNICALL
-Java_com_displayxr_model_1viewer_1vk_1android_MainActivity_nativeGetAnimLabel(
+Java_com_displayxr_avatar_1vk_1android_MainActivity_nativeGetAnimLabel(
     JNIEnv *env, jobject /*thiz*/)
 {
 	std::lock_guard<std::mutex> lock(g_ui_label_mutex);
@@ -1760,7 +1760,7 @@ Java_com_displayxr_model_1viewer_1vk_1android_MainActivity_nativeGetAnimLabel(
 // A picked document, already copied by Kotlin into app-private storage (the
 // glTF loader needs a filesystem path). Loaded on the android_main thread.
 extern "C" JNIEXPORT void JNICALL
-Java_com_displayxr_model_1viewer_1vk_1android_MainActivity_nativeOpenModelPath(
+Java_com_displayxr_avatar_1vk_1android_MainActivity_nativeOpenModelPath(
     JNIEnv *env, jobject /*thiz*/, jstring jpath)
 {
 	const char *chars = env->GetStringUTFChars(jpath, nullptr);
