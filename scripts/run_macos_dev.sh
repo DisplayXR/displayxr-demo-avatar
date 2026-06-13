@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# scripts/run_macos_dev.sh — launch the locally-built model viewer against an
+# scripts/run_macos_dev.sh — launch the locally-built 3D avatar demo against an
 # already-installed DisplayXR macOS runtime (from the DisplayXRBundle .pkg).
 #
 # Why this script exists
@@ -51,7 +51,7 @@ fi
 export DYLD_LIBRARY_PATH="$VK_PREFIX/lib:${DYLD_LIBRARY_PATH:-}"
 
 # --- Launch ----------------------------------------------------------------
-BIN="$(cd "$(dirname "$0")/.." && pwd)/build/macos/model_viewer_handle_vk_macos"
+BIN="$(cd "$(dirname "$0")/.." && pwd)/build/macos/avatar_handle_vk_macos"
 if [ ! -x "$BIN" ]; then
     echo "Error: $BIN not found — build first: ./scripts/build_macos.sh" >&2
     exit 1

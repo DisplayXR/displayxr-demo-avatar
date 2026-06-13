@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Build the macOS .pkg for the Model Viewer demo.
+# Build the macOS .pkg for the Avatar demo.
 #
 # Usage:
 #   DISPLAYXR_VERSION=1.4.0 ./build_installer.sh <artifact-dir> [output.pkg]
 #
 # <artifact-dir> must contain:
-#   bin/model_viewer_handle_vk_macos        the cmake-built binary
+#   bin/avatar_handle_vk_macos        the cmake-built binary
 #   lib/libopenxr_loader*.dylib                   bundled OpenXR loader
 #   lib/libvulkan*.dylib                          bundled Vulkan loader
 #   lib/libMoltenVK*.dylib                        bundled MoltenVK ICD
@@ -13,8 +13,8 @@
 #   displayxr/...                                 app manifest + icons
 #
 # Two-stage build (mirroring displayxr-runtime/installer/macos/build_installer.sh):
-#   1. pkgbuild --root <staging>  → modelviewer.pkg   (component .pkg)
-#   2. productbuild --distribution Distribution.xml ... → DisplayXRModelViewer-<v>.pkg
+#   1. pkgbuild --root <staging>  → avatar.pkg   (component .pkg)
+#   2. productbuild --distribution Distribution.xml ... → DisplayXRAvatar-<v>.pkg
 #
 # The .pkg is ad-hoc signed only (Signature=adhoc). Full Developer ID signing
 # is a parallel effort tracked in DisplayXR/displayxr-runtime#280.
@@ -30,7 +30,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ARTIFACT_DIR="${1:?Usage: $0 <artifact-dir> [output.pkg]}"
 VERSION="${DISPLAYXR_VERSION:-1.0.0}"
-OUTPUT_PKG="${2:-$(pwd)/DisplayXRModelViewer-${VERSION}.pkg}"
+OUTPUT_PKG="${2:-$(pwd)/DisplayXRAvatar-${VERSION}.pkg}"
 
 # Resolve to absolute paths up-front so cd around doesn't break them.
 ARTIFACT_DIR="$(cd "$ARTIFACT_DIR" && pwd)"
@@ -41,7 +41,7 @@ mkdir -p "$OUTPUT_PKG_DIR"
 WORK_DIR="$(mktemp -d)"
 trap 'rm -rf "$WORK_DIR"' EXIT
 
-echo "==> Building DisplayXRModelViewer installer"
+echo "==> Building DisplayXRAvatar installer"
 echo "    version:     $VERSION"
 echo "    artifact:    $ARTIFACT_DIR"
 echo "    output:      $OUTPUT_PKG"
@@ -49,7 +49,7 @@ echo "    workdir:     $WORK_DIR"
 
 # --- Stage payload --------------------------------------------------------
 # pkgbuild --root <root> --install-location / lays $root's children at /.
-# We want the .app at /Applications/3D Model Viewer.app, so the
+# We want the .app at /Applications/3D Avatar.app, so the
 # staging tree is $WORK_DIR/payload/Applications/<name>.app.
 PAYLOAD_ROOT="$WORK_DIR/payload"
 APPS_DIR="$PAYLOAD_ROOT/Applications"
@@ -59,7 +59,7 @@ mkdir -p "$APPS_DIR"
 # bundle ends up there directly. The script needs DISPLAYXR_VERSION in the
 # environment; we already exported it (or it inherits).
 ( cd "$APPS_DIR" && DISPLAYXR_VERSION="$VERSION" \
-    bash "$SCRIPT_DIR/create_app_bundle.sh" "$ARTIFACT_DIR" "3D Model Viewer.app" )
+    bash "$SCRIPT_DIR/create_app_bundle.sh" "$ARTIFACT_DIR" "3D Avatar.app" )
 
 # Strip stray AppleDouble metadata / `.DS_Store` files from the staging
 # tree if any crept in via cp. Note: pkgbuild's cpio path still encodes
@@ -68,10 +68,10 @@ mkdir -p "$APPS_DIR"
 find "$PAYLOAD_ROOT" \( -name '._*' -o -name '.DS_Store' \) -delete
 
 # --- pkgbuild: component package ------------------------------------------
-COMPONENT_PKG="$WORK_DIR/modelviewer.pkg"
+COMPONENT_PKG="$WORK_DIR/avatar.pkg"
 pkgbuild \
     --root "$PAYLOAD_ROOT" \
-    --identifier com.displayxr.modelviewer \
+    --identifier com.displayxr.avatar \
     --version "$VERSION" \
     --install-location / \
     "$COMPONENT_PKG"
