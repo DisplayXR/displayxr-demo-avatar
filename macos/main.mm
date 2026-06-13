@@ -31,6 +31,7 @@
 #include <openxr/XR_EXT_display_info.h>
 #include <openxr/XR_EXT_atlas_capture.h>
 #include <openxr/XR_EXT_mcp_tools.h>
+#include <openxr/XR_EXT_local_3d_zone.h>   // XrCompositionLayerLocal2DEXT (speech bubble)
 
 #include <cmath>
 #include <atomic>
@@ -190,6 +191,24 @@ static NSUInteger g_savedWindowStyle = 0;
 // decorated, click-through is disabled (the whole frame stays interactive).
 // Mirrors the Windows leg's B-key decoration toggle (windows/main.cpp).
 static bool g_decorated = false;
+
+// Phase 3: the avatar occupies the bottom 75% canvas; the top 25% is the
+// speech-bubble band, composited flat as a Local2D layer (XR_EXT_local_3d_zone).
+static constexpr float kAvatarCanvasFrac = 0.75f;
+// Speech-bubble texture — generous + ~4:1 so the rounded panel renders into an
+// aspect-matched sub-rect and maps sub-rect→full-band with no stretch.
+static const uint32_t kBubbleTexW = 2048;
+static const uint32_t kBubbleTexH = 512;
+static NSString* const kBubbleText = @"Hi there! I'm Leo, your friendly 3D desktop avatar.";
+
+// Speech-bubble window-space swapchain + staging upload (created in main when the
+// runtime advertises XR_EXT_local_3d_zone). 2048x512 RGBA8.
+static XrSwapchain g_bubbleSwapchain = XR_NULL_HANDLE;
+static int64_t     g_bubbleFormat = 0;
+static std::vector<XrSwapchainImageVulkanKHR> g_bubbleImages;
+static ModelBuffer g_bubbleStaging = {};       // host-visible RGBA8 upload buffer
+static void*       g_bubbleStagingMapped = nullptr;
+static bool        g_bubbleReady = false;      // swapchain + staging created
 
 // Model-viewer state
 static ModelRenderer g_modelRenderer;
@@ -986,6 +1005,7 @@ struct AppXrSession {
     // Display info from XR_EXT_display_info
     bool hasDisplayInfoExt = false;
     bool hasCocoaWindowBinding = false;
+    bool hasLocal3DZone = false;   // XR_EXT_local_3d_zone — speech-bubble Local2D layer
     float displayWidthM = 0, displayHeightM = 0;
     float nominalViewerX = 0, nominalViewerY = 0, nominalViewerZ = 0.5f;
     float recommendedViewScaleX = 0.5f, recommendedViewScaleY = 1.0f;
@@ -1165,6 +1185,7 @@ static bool InitializeOpenXR(AppXrSession& xr) {
         if (strcmp(ext.extensionName, XR_EXT_DISPLAY_INFO_EXTENSION_NAME) == 0) xr.hasDisplayInfoExt = true;
         if (strcmp(ext.extensionName, XR_EXT_ATLAS_CAPTURE_EXTENSION_NAME) == 0) xr.hasAtlasCaptureExt = true;
         if (strcmp(ext.extensionName, XR_EXT_MCP_TOOLS_EXTENSION_NAME) == 0) xr.hasMcpToolsExt = true;
+        if (strcmp(ext.extensionName, XR_EXT_LOCAL_3D_ZONE_EXTENSION_NAME) == 0) xr.hasLocal3DZone = true;
     }
 
     if (!hasVulkan) { LOG_ERROR("XR_KHR_vulkan_enable not available"); return false; }
@@ -1175,6 +1196,7 @@ static bool InitializeOpenXR(AppXrSession& xr) {
     if (xr.hasDisplayInfoExt) enabled.push_back(XR_EXT_DISPLAY_INFO_EXTENSION_NAME);
     if (xr.hasAtlasCaptureExt) enabled.push_back(XR_EXT_ATLAS_CAPTURE_EXTENSION_NAME);
     if (xr.hasMcpToolsExt) enabled.push_back(XR_EXT_MCP_TOOLS_EXTENSION_NAME);
+    if (xr.hasLocal3DZone) enabled.push_back(XR_EXT_LOCAL_3D_ZONE_EXTENSION_NAME);
 
     XrInstanceCreateInfo ci = {XR_TYPE_INSTANCE_CREATE_INFO};
     strncpy(ci.applicationInfo.applicationName, "DisplayXRAvatarMacOS", sizeof(ci.applicationInfo.applicationName));
@@ -2129,7 +2151,7 @@ static bool EnsureSilhouetteTargets(VkDevice dev, VkPhysicalDevice phys, uint32_
 static void UpdateSilhouette(VkDevice dev, VkPhysicalDevice phys, VkQueue queue, VkCommandPool pool,
                             uint32_t imgW, uint32_t imgH, uint32_t winW, uint32_t winH,
                             const float (*viewMats)[16], const float (*projMats)[16],
-                            const float* clipFars, uint32_t numViews) {
+                            const float* clipFars, uint32_t numViews, float canvasFrac) {
     if (winW == 0 || winH == 0 || numViews == 0) return;
     if (!g_modelRenderer.hasModel()) return;
     uint32_t w = winW / 3; if (w < 64) w = 64; if (w > 640) w = 640;
@@ -2142,10 +2164,12 @@ static void UpdateSilhouette(VkDevice dev, VkPhysicalDevice phys, VkQueue queue,
 
     for (uint32_t p = 0; p < silPasses; ++p) {
         const uint32_t v = silIdx[p];
-        // Full-viewport avatar — matches the on-screen full-window avatar in
-        // Phase 2 (Phase 3 confines both to the bottom 75% together).
+        // Render into the bottom canvasFrac of the silhouette image so the hit
+        // mask matches the on-screen avatar's bottom-canvas confinement.
+        uint32_t silAvH = (uint32_t)((float)h * canvasFrac); if (silAvH == 0) silAvH = 1;
+        uint32_t silAvY = h - silAvH;
         g_modelRenderer.renderEye(g_silImage.image, VK_FORMAT_R8G8B8A8_UNORM,
-            imgW, imgH, 0, 0, w, h, viewMats[v], projMats[v], /*transparentBg=*/true,
+            imgW, imgH, 0, silAvY, w, silAvH, viewMats[v], projMats[v], /*transparentBg=*/true,
             clipFars[v]);
         // renderEye leaves the scratch image in COLOR_ATTACHMENT_OPTIMAL → copy to host.
         VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
@@ -2228,6 +2252,137 @@ static bool ClickInteractiveAtCursor() {
             if (g_silBits[(size_t)y * g_silCovW + x]) return true;
         }
     return false;
+}
+
+// ============================================================================
+// Speech bubble — Local2D layer (Phase 3)
+// ============================================================================
+// A flat 2D nameplate pill in the top 25% band, composited post-weave as a
+// Local2D layer (XR_EXT_local_3d_zone) so the avatar keeps weaving in the
+// bottom 75%. The rounded panel + balanced greeting are drawn with CoreText
+// into a CPU bitmap (CoreText replaces the Windows DirectWrite path), uploaded
+// to an app-owned window-space swapchain, then mapped sub-rect→full-band.
+// Mirrors windows/main.cpp RenderBubbleToTexture + the bubble submission block.
+
+static bool CreateBubbleSwapchain(AppXrSession& xr, VkDevice dev, VkPhysicalDevice phys) {
+    uint32_t fc = 0;
+    xrEnumerateSwapchainFormats(xr.session, 0, &fc, nullptr);
+    std::vector<int64_t> fmts(fc);
+    if (fc) xrEnumerateSwapchainFormats(xr.session, fc, &fc, fmts.data());
+    // Prefer UNORM (RGBA8) so the CoreText-drawn sRGB bytes pass through the
+    // BGRA8Unorm CAMetalLayer with no hidden sRGB decode (same reason the main
+    // swapchain uses UNORM). VK_FORMAT_R8G8B8A8_UNORM = 37, B8G8R8A8_UNORM = 44.
+    int64_t fmt = fmts.empty() ? VK_FORMAT_R8G8B8A8_UNORM : fmts[0];
+    for (auto f : fmts) { if (f == VK_FORMAT_R8G8B8A8_UNORM) { fmt = f; break; }
+                          if (f == VK_FORMAT_B8G8R8A8_UNORM) fmt = f; }
+    g_bubbleFormat = fmt;
+
+    XrSwapchainCreateInfo ci = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
+    ci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT |
+                    XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
+    ci.format = fmt; ci.sampleCount = 1;
+    ci.width = kBubbleTexW; ci.height = kBubbleTexH;
+    ci.faceCount = 1; ci.arraySize = 1; ci.mipCount = 1;
+    if (XR_FAILED(xrCreateSwapchain(xr.session, &ci, &g_bubbleSwapchain))) {
+        LOG_WARN("Bubble swapchain create failed");
+        return false;
+    }
+    uint32_t ic = 0;
+    xrEnumerateSwapchainImages(g_bubbleSwapchain, 0, &ic, nullptr);
+    g_bubbleImages.assign(ic, {XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR});
+    xrEnumerateSwapchainImages(g_bubbleSwapchain, ic, &ic,
+        (XrSwapchainImageBaseHeader*)g_bubbleImages.data());
+
+    g_bubbleStaging = modelCreateBuffer(dev, phys, (VkDeviceSize)kBubbleTexW * kBubbleTexH * 4,
+        VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (g_bubbleStaging.buffer == VK_NULL_HANDLE) return false;
+    vkMapMemory(dev, g_bubbleStaging.memory, 0, (VkDeviceSize)kBubbleTexW * kBubbleTexH * 4,
+        0, &g_bubbleStagingMapped);
+    if (!g_bubbleStagingMapped) return false;
+    LOG_INFO("Bubble swapchain ready (%ux%u, %u images, format=%lld)",
+             kBubbleTexW, kBubbleTexH, ic, (long long)fmt);
+    return true;
+}
+
+// Draw the rounded glassy pill + centred, word-wrapped, size-fitted greeting
+// into the top-left subW×subH of a kBubbleTexW×kBubbleTexH RGBA8 (premultiplied,
+// row 0 = top) buffer; rest left transparent. Returns the buffer (static).
+static const uint8_t* RenderBubbleBitmap(uint32_t subW, uint32_t subH) {
+    static std::vector<uint8_t> buf;
+    buf.assign((size_t)kBubbleTexW * kBubbleTexH * 4, 0);  // fully transparent
+    if (subW < 2 || subH < 2) return buf.data();
+
+    CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+    CGContextRef ctx = CGBitmapContextCreate(buf.data(), kBubbleTexW, kBubbleTexH, 8,
+        kBubbleTexW * 4, cs, kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
+    CGColorSpaceRelease(cs);
+    if (!ctx) return buf.data();
+
+    @autoreleasepool {
+        // flipped:YES → top-left origin (y down), matching the Windows layout math
+        // and giving row 0 = top in memory.
+        NSGraphicsContext* nsctx = [NSGraphicsContext graphicsContextWithCGContext:ctx flipped:YES];
+        [NSGraphicsContext saveGraphicsState];
+        [NSGraphicsContext setCurrentContext:nsctx];
+
+        // Near-edge-to-edge panel (the band IS the bubble): small margin for the
+        // rounded corners + the desktop to peek through them.
+        const CGFloat mX = subW * 0.010, mY = subH * 0.020;
+        NSRect panel = NSMakeRect(mX, mY, (CGFloat)subW - 2 * mX, (CGFloat)subH - 2 * mY);
+        const CGFloat radius = panel.size.height * 0.16;
+        NSBezierPath* pill = [NSBezierPath bezierPathWithRoundedRect:panel
+                                                            xRadius:radius yRadius:radius];
+        [[NSColor colorWithSRGBRed:0.05 green:0.05 blue:0.09 alpha:0.64] setFill];
+        [pill fill];
+
+        // Text area inside the panel.
+        const CGFloat padX = panel.size.width * 0.06, padY = panel.size.height * 0.16;
+        NSRect textRect = NSInsetRect(panel, padX, padY);
+
+        NSMutableParagraphStyle* ps = [[NSMutableParagraphStyle alloc] init];
+        ps.alignment = NSTextAlignmentCenter;
+        ps.lineBreakMode = NSLineBreakByWordWrapping;
+
+        // Largest font (binary search) whose wrapped greeting fits textRect.
+        CGFloat lo = 6.0, hi = textRect.size.height, best = lo;
+        for (int i = 0; i < 18; ++i) {
+            CGFloat mid = 0.5 * (lo + hi);
+            NSDictionary* a = @{ NSFontAttributeName: [NSFont systemFontOfSize:mid
+                                     weight:NSFontWeightSemibold],
+                                 NSParagraphStyleAttributeName: ps };
+            NSRect r = [kBubbleText boundingRectWithSize:NSMakeSize(textRect.size.width, 1.0e5)
+                          options:NSStringDrawingUsesLineFragmentOrigin attributes:a];
+            if (r.size.height <= textRect.size.height && r.size.width <= textRect.size.width) {
+                best = mid; lo = mid;
+            } else hi = mid;
+        }
+        NSDictionary* attrs = @{ NSFontAttributeName: [NSFont systemFontOfSize:best
+                                     weight:NSFontWeightSemibold],
+                                 NSForegroundColorAttributeName: [NSColor whiteColor],
+                                 NSParagraphStyleAttributeName: ps };
+        // Vertical-center the measured block within textRect.
+        NSRect tb = [kBubbleText boundingRectWithSize:NSMakeSize(textRect.size.width, 1.0e5)
+                       options:NSStringDrawingUsesLineFragmentOrigin attributes:attrs];
+        NSRect drawRect = textRect;
+        drawRect.origin.y += (textRect.size.height - tb.size.height) * 0.5;
+        drawRect.size.height = tb.size.height;
+        [kBubbleText drawWithRect:drawRect
+                          options:NSStringDrawingUsesLineFragmentOrigin attributes:attrs];
+
+        [NSGraphicsContext restoreGraphicsState];
+    }
+    CGContextRelease(ctx);
+
+    // Debug: DXR_DUMP_BUBBLE → /tmp/avatar_bubble.png (once) to eyeball layout.
+    static const bool s_dump = (getenv("DXR_DUMP_BUBBLE") != nullptr);
+    static bool s_dumped = false;
+    if (s_dump && !s_dumped) {
+        s_dumped = true;
+        stbi_write_png("/tmp/avatar_bubble.png", (int)subW, (int)subH, 4, buf.data(),
+                       (int)(kBubbleTexW * 4));
+    }
+    return buf.data();
 }
 
 // ============================================================================
@@ -2343,6 +2498,13 @@ int main(int argc, char** argv) {
       ci.queueFamilyIndex = queueFamilyIndex;
       vkCreateCommandPool(vkDevice, &ci, nullptr, &cmdPool); }
 
+    // Speech-bubble window-space swapchain (Phase 3) — only if the runtime
+    // advertises XR_EXT_local_3d_zone (the Metal compositor does).
+    if (xr.hasLocal3DZone)
+        g_bubbleReady = CreateBubbleSwapchain(xr, vkDevice, physDevice);
+    else
+        LOG_WARN("XR_EXT_local_3d_zone unavailable — no speech bubble");
+
     g_input.viewParams.virtualDisplayHeight = kDefaultVirtualDisplayHeightM;
     g_input.nominalViewerZ = xr.nominalViewerZ;
     g_input.renderingModeCount = xr.renderingModeCount;
@@ -2369,6 +2531,20 @@ int main(int argc, char** argv) {
 
     while (g_running && !xr.exitRequested) {
         PumpMacOSEvents();
+
+        // Track the LIVE drawable size every frame. The window can be clamped to
+        // the screen at launch (a tall portrait request shrinks) and resized by
+        // the B decoration toggle / user drag; reading it once at startup left
+        // g_windowW/H stale, so the Kooima winW_m/winH_m + per-eye render size
+        // went out of sync (avatar zoomed/squished). Recompute from the realized
+        // contentView × backingScale so the projection always matches the window.
+        if (g_window != nil && g_metalView != nil) {
+            NSSize cs = [g_metalView bounds].size;
+            CGFloat bs = [g_window backingScaleFactor];
+            uint32_t lw = (uint32_t)(cs.width * bs + 0.5f);
+            uint32_t lh = (uint32_t)(cs.height * bs + 0.5f);
+            if (lw > 0 && lh > 0) { g_windowW = lw; g_windowH = lh; }
+        }
 
         auto now = std::chrono::high_resolution_clock::now();
         float deltaTime = std::chrono::duration<float>(now - lastTime).count();
@@ -2568,6 +2744,12 @@ int main(int argc, char** argv) {
                         if (renderH == 0) renderH = 1;
                         g_renderW = renderW; g_renderH = renderH;
 
+                        // Avatar canvas = bottom 75% when the speech bubble is active
+                        // (top 25% is the bubble band); full window otherwise. Drives
+                        // the Kooima framing, the on-screen sub-viewport, and the
+                        // silhouette so they all stay in lock-step.
+                        const float canvasFrac = g_bubbleReady ? kAvatarCanvasFrac : 1.0f;
+
                         // Per-view Kooima pose + projection — one entry per view in this
                         // multiview mode (1 for mono, 2 for stereo, 4 for quad, etc.).
                         std::vector<Display3DView> eyeViews((size_t)eyeCount);
@@ -2578,16 +2760,22 @@ int main(int argc, char** argv) {
                             float pxSizeX = xr.displayWidthM / dispPxW;
                             float pxSizeY = xr.displayHeightM / dispPxH;
                             float winW_m = (float)g_windowW * pxSizeX;
-                            float winH_m = (float)g_windowH * pxSizeY;
+                            // The avatar canvas is the BOTTOM 75% of the window (the top
+                            // 25% is the speech-bubble band). Frame the Kooima to the
+                            // canvas height so the projection aspect matches the bottom-75%
+                            // sub-viewport the avatar renders into — no vertical squish.
+                            float winH_m = (float)g_windowH * canvasFrac * pxSizeY;
 
-                            // Window-relative Kooima: compute eye offset from window center
+                            // Window-relative Kooima: eye offset from the CANVAS center
+                            // (canvas = bottom 75%, so its center sits below the window
+                            // center) so the off-axis frustum centers on the avatar region.
                             float eyeOffsetX = 0.0f, eyeOffsetY = 0.0f;
                             if (g_window != nil) {
                                 NSRect winFrame = [g_window frame];
                                 NSScreen *screen_ns = [g_window screen] ?: [NSScreen mainScreen];
                                 NSRect screenFrame = [screen_ns frame];
                                 float winCenterX = (winFrame.origin.x - screenFrame.origin.x) + winFrame.size.width / 2.0f;
-                                float winCenterY = (winFrame.origin.y - screenFrame.origin.y) + winFrame.size.height / 2.0f;
+                                float winCenterY = (winFrame.origin.y - screenFrame.origin.y) + winFrame.size.height * canvasFrac * 0.5f;
                                 float dispCenterX = screenFrame.size.width / 2.0f;
                                 float dispCenterY = screenFrame.size.height / 2.0f;
                                 CGFloat backingScale = [g_window backingScaleFactor];
@@ -2774,11 +2962,17 @@ int main(int argc, char** argv) {
                                     // windows/main.cpp clipFar[eye].
                                     float ez = hasKooima ? eyeViews[eye].eye_display.z : 0.0f;
                                     clipFars[eye] = (tbg && ez > 0.2f) ? ez : 0.0f;
+                                    // Confine the avatar to the bottom canvasFrac of the
+                                    // tile (→ bottom of the window). The top band is left
+                                    // transparent; the Local2D bubble + backer cover it.
+                                    uint32_t avH = (uint32_t)((float)renderH * canvasFrac);
+                                    if (avH == 0) avH = 1;
+                                    uint32_t avY = tileOffsets[eye].second + (renderH - avH);
                                     g_modelRenderer.renderEye(
                                         targetImage, swapFormat,
                                         xr.swapchain.width, xr.swapchain.height,
-                                        tileOffsets[eye].first, tileOffsets[eye].second,
-                                        renderW, renderH,
+                                        tileOffsets[eye].first, avY,
+                                        renderW, avH,
                                         viewMat[eye].data(), projMat[eye].data(),
                                         tbg, clipFars[eye]);
                                 }
@@ -2848,7 +3042,7 @@ int main(int argc, char** argv) {
                                     xr.swapchain.width, xr.swapchain.height, g_windowW, g_windowH,
                                     (const float(*)[16])viewMat.data(),
                                     (const float(*)[16])projMat.data(),
-                                    clipFars.data(), (uint32_t)eyeCount);
+                                    clipFars.data(), (uint32_t)eyeCount, canvasFrac);
                         } else {
                             rendered = false;
                         }
@@ -2856,8 +3050,109 @@ int main(int argc, char** argv) {
                 }
 
                 if (rendered) {
-                    EndFrame(xr, frameState.predictedDisplayTime,
-                        projectionViews.data(), (uint32_t)projectionViews.size());
+                    // ── Speech bubble (Phase 3): render the CoreText pill, upload it
+                    //    to the window-space swapchain, and submit it as a Local2D
+                    //    layer (+ a transparent full-band backer) on top of the
+                    //    projection layer. The implicit M=0 mask flattens the top band
+                    //    so the avatar keeps weaving in the bottom canvas. ──
+                    XrCompositionLayerLocal2DEXT bubbleLayer = {(XrStructureType)XR_TYPE_COMPOSITION_LAYER_LOCAL_2D_EXT};
+                    XrCompositionLayerLocal2DEXT bubbleBgLayer = {(XrStructureType)XR_TYPE_COMPOSITION_LAYER_LOCAL_2D_EXT};
+                    bool bubbleReady = false;
+                    if (g_bubbleReady && xr.hasLocal3DZone) {
+                        const int bandH = (g_windowH > 0) ? (int)((float)g_windowH * (1.0f - kAvatarCanvasFrac)) : 1;
+                        const int bandW = (int)g_windowW;
+                        // Render the panel into the LARGEST band-aspect sub-rect of the
+                        // fixed bubble texture, then map sub-rect→full-band (equal scale
+                        // both axes → round corners, unstretched text on any resize).
+                        const float bandAR = (float)bandW / (float)(bandH > 0 ? bandH : 1);
+                        const float texAR  = (float)kBubbleTexW / (float)kBubbleTexH;
+                        uint32_t subW, subH;
+                        if (bandAR >= texAR) { subW = kBubbleTexW; subH = (uint32_t)((float)kBubbleTexW / bandAR + 0.5f); }
+                        else                 { subH = kBubbleTexH; subW = (uint32_t)((float)kBubbleTexH * bandAR + 0.5f); }
+                        if (subW < 2) subW = 2; else if (subW > kBubbleTexW) subW = kBubbleTexW;
+                        if (subH < 2) subH = 2; else if (subH > kBubbleTexH) subH = kBubbleTexH;
+
+                        const uint8_t* px = RenderBubbleBitmap(subW, subH);
+                        uint32_t idx = 0;
+                        XrSwapchainImageAcquireInfo bai = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+                        XrSwapchainImageWaitInfo bwi = {XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO}; bwi.timeout = 1000000000;
+                        if (px && XR_SUCCEEDED(xrAcquireSwapchainImage(g_bubbleSwapchain, &bai, &idx)) &&
+                            XR_SUCCEEDED(xrWaitSwapchainImage(g_bubbleSwapchain, &bwi))) {
+                            memcpy(g_bubbleStagingMapped, px, (size_t)kBubbleTexW * kBubbleTexH * 4);
+                            VkCommandBufferAllocateInfo cai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+                            cai.commandPool = cmdPool; cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; cai.commandBufferCount = 1;
+                            VkCommandBuffer cb = VK_NULL_HANDLE;
+                            vkAllocateCommandBuffers(vkDevice, &cai, &cb);
+                            VkCommandBufferBeginInfo bgi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+                            bgi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+                            vkBeginCommandBuffer(cb, &bgi);
+                            VkImage img = g_bubbleImages[idx].image;
+                            VkImageMemoryBarrier bar = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+                            bar.srcAccessMask = 0; bar.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                            bar.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED; bar.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                            bar.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED; bar.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                            bar.image = img; bar.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+                            vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                0, 0, nullptr, 0, nullptr, 1, &bar);
+                            VkBufferImageCopy rg = {};
+                            rg.bufferRowLength = kBubbleTexW;
+                            rg.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                            rg.imageExtent = {kBubbleTexW, kBubbleTexH, 1};
+                            vkCmdCopyBufferToImage(cb, g_bubbleStaging.buffer, img,
+                                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &rg);
+                            bar.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; bar.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+                            bar.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; bar.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+                            vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                0, 0, nullptr, 0, nullptr, 1, &bar);
+                            vkEndCommandBuffer(cb);
+                            VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO}; si.commandBufferCount = 1; si.pCommandBuffers = &cb;
+                            vkQueueSubmit(graphicsQueue, 1, &si, VK_NULL_HANDLE);
+                            vkQueueWaitIdle(graphicsQueue);
+                            vkFreeCommandBuffers(vkDevice, cmdPool, 1, &cb);
+                            XrSwapchainImageReleaseInfo bri = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+                            xrReleaseSwapchainImage(g_bubbleSwapchain, &bri);
+
+                            // Visible bubble = the panel sub-rect mapped onto the FULL band.
+                            bubbleLayer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+                            bubbleLayer.subImage.swapchain = g_bubbleSwapchain;
+                            bubbleLayer.subImage.imageRect.offset = {0, 0};
+                            bubbleLayer.subImage.imageRect.extent = {(int32_t)subW, (int32_t)subH};
+                            bubbleLayer.subImage.imageArrayIndex = 0;
+                            bubbleLayer.rect.offset = {0, 0};
+                            bubbleLayer.rect.extent = {bandW, bandH};
+                            // Transparent backer over the WHOLE band: a 2×2 texel from the
+                            // panel's inset margin (texture (0,0) is outside the panel) so
+                            // M=0 + alpha 0 extends into the rounded-corner cut-outs.
+                            bubbleBgLayer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+                            bubbleBgLayer.subImage.swapchain = g_bubbleSwapchain;
+                            bubbleBgLayer.subImage.imageRect.offset = {0, 0};
+                            bubbleBgLayer.subImage.imageRect.extent = {2, 2};
+                            bubbleBgLayer.subImage.imageArrayIndex = 0;
+                            bubbleBgLayer.rect.offset = {0, 0};
+                            bubbleBgLayer.rect.extent = {bandW, bandH};
+                            bubbleReady = true;
+                        }
+                    }
+
+                    XrCompositionLayerProjection proj = {XR_TYPE_COMPOSITION_LAYER_PROJECTION};
+                    proj.space = xr.localSpace;
+                    proj.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+                    proj.viewCount = (uint32_t)projectionViews.size();
+                    proj.views = projectionViews.data();
+                    const XrCompositionLayerBaseHeader* layers[3];
+                    uint32_t layerN = 0;
+                    layers[layerN++] = (const XrCompositionLayerBaseHeader*)&proj;
+                    if (bubbleReady) {  // backer first, then bubble — Local2D flattens in list order
+                        layers[layerN++] = (const XrCompositionLayerBaseHeader*)&bubbleBgLayer;
+                        layers[layerN++] = (const XrCompositionLayerBaseHeader*)&bubbleLayer;
+                    }
+                    XrFrameEndInfo ei = {XR_TYPE_FRAME_END_INFO};
+                    ei.displayTime = frameState.predictedDisplayTime;
+                    // OPAQUE per the gauss precedent (the Metal compositor keys transparency
+                    // off the cocoa binding flag, not the blend mode).
+                    ei.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+                    ei.layerCount = layerN; ei.layers = layers;
+                    xrEndFrame(xr.session, &ei);
                 } else {
                     XrFrameEndInfo ei = {XR_TYPE_FRAME_END_INFO};
                     ei.displayTime = frameState.predictedDisplayTime;
@@ -2962,6 +3257,16 @@ int main(int argc, char** argv) {
     LOG_INFO("=== Shutting down ===");
     g_xrForMcp = nullptr;  // session is going away; stop touching MCP tools
     g_modelRenderer.cleanup();
+    // Speech-bubble window-space swapchain + staging.
+    if (g_bubbleStaging.buffer != VK_NULL_HANDLE) {
+        if (g_bubbleStagingMapped) vkUnmapMemory(vkDevice, g_bubbleStaging.memory);
+        modelDestroyBuffer(vkDevice, g_bubbleStaging);
+        g_bubbleStagingMapped = nullptr;
+    }
+    if (g_bubbleSwapchain != XR_NULL_HANDLE) {
+        xrDestroySwapchain(g_bubbleSwapchain);
+        g_bubbleSwapchain = XR_NULL_HANDLE;
+    }
     if (cmdPool != VK_NULL_HANDLE) vkDestroyCommandPool(vkDevice, cmdPool, nullptr);
     CleanupOpenXR(xr);
     // MoltenVK may throw std::system_error ("mutex lock failed") during device/instance
