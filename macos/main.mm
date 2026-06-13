@@ -33,6 +33,7 @@
 #include <openxr/XR_EXT_mcp_tools.h>
 
 #include <cmath>
+#include <atomic>
 #include <csignal>
 #include <cstdio>
 #include <cstring>
@@ -142,10 +143,10 @@ struct InputState {
 static constexpr float kDefaultVirtualDisplayHeightM = 1.5f;
 
 // Initial virtual-display height as a multiple of the model's height: the
-// display-centric rig frames the (centered) model with 1.4× its height, i.e.
-// ~20% headroom top and bottom — enough that the window title bar doesn't
-// clip the subject.
-static constexpr float kAutoFitVerticalComfort = 1.4f;
+// display-centric rig frames the (centered) model with 1.111× its height, i.e.
+// the avatar occupies ~90% of the virtual display (5% headroom top and bottom).
+// Matches the Windows avatar leg (windows/main.cpp kAutoFitVerticalComfort).
+static constexpr float kAutoFitVerticalComfort = 1.111f;
 
 // Cached auto-fit result for the currently loaded scene. Reused by Reset
 // so 'Space' returns to the framed pose rather than world origin.
@@ -162,6 +163,13 @@ static volatile bool g_running = true;
 static NSWindow *g_window = nil;
 static NSView *g_metalView = nil;
 static InputState g_input;
+
+// Transparent-background mode — ON by default: the avatar floats over the live
+// desktop. The session-level flag (transparentBackgroundEnabled, set permanently
+// at xrCreateSession) is what makes the macOS Metal compositor composite over the
+// desktop; Ctrl+T flips only the renderer's output alpha + the ZDP far-plane
+// clamp (foreground-only). Mirrors gauss macos/main.mm + windows/main.cpp.
+static std::atomic<bool> g_transparentBg{true};
 static const float CAMERA_HALF_TAN_VFOV = 0.32491969623f;
 
 typedef void (*PFN_sim_display_set_output_mode)(int mode);
@@ -538,6 +546,11 @@ static void OpenLoadDialog() {
 - (CALayer*)makeBackingLayer {
     CAMetalLayer *layer = [CAMetalLayer layer];
     layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
+    // Non-opaque so transparent-bg mode lets the desktop show through alpha<1
+    // regions. The runtime's Metal compositor also sets this when
+    // transparentBackgroundEnabled=XR_TRUE, but the demo owns layer creation, so
+    // set it here too. Harmless when opaque (alpha=1). Mirrors gauss main.mm.
+    layer.opaque = NO;
     return layer;
 }
 - (BOOL)wantsLayer { return YES; }
@@ -611,7 +624,15 @@ static void OpenLoadDialog() {
             g_input.captureAtlasRequested = true;
             break;
         case 't': case 'T':
-            g_input.eyeTrackingModeToggleRequested = true;
+            // Ctrl+T toggles transparent background (mirrors the Windows + gauss
+            // demos); plain T stays the eye-tracking-mode toggle.
+            if ([event modifierFlags] & NSEventModifierFlagControl) {
+                bool now = !g_transparentBg.load();
+                g_transparentBg.store(now);
+                LOG_INFO("Transparent background: %s (Ctrl+T)", now ? "ON" : "OFF");
+            } else {
+                g_input.eyeTrackingModeToggleRequested = true;
+            }
             break;
         case 'l': case 'L':
             g_input.loadRequested = true;
@@ -725,10 +746,22 @@ static bool CreateMacOSWindow(uint32_t width, uint32_t height) {
     [g_window setDelegate:delegate];
     [g_window center];
 
+    // Transparent window so the avatar floats over the desktop (mirrors gauss
+    // macos/main.mm). The CAMetalLayer is non-opaque (see makeBackingLayer); the
+    // window itself must be non-opaque + clear-backed too.
+    [g_window setOpaque:NO];
+    [g_window setBackgroundColor:[NSColor clearColor]];
+
     g_metalView = [[MetalView alloc] initWithFrame:frame];
     [g_window setContentView:g_metalView];
     [g_window makeKeyAndOrderFront:nil];
     [g_window makeFirstResponder:g_metalView];
+
+    // Re-assert layer transparency after the view is realized in the window —
+    // AppKit can reset it during attachment.
+    if ([g_metalView.layer isKindOfClass:[CAMetalLayer class]]) {
+        ((CAMetalLayer *)g_metalView.layer).opaque = NO;
+    }
 
     // Accept drag-and-drop of .glb / .gltf files
     [g_metalView registerForDraggedTypes:@[NSPasteboardTypeFileURL]];
@@ -1277,9 +1310,16 @@ static bool CreateSession(AppXrSession& xr, VkInstance vkInstance, VkPhysicalDev
 
     XrCocoaWindowBindingCreateInfoEXT macBinding = {(XrStructureType)XR_TYPE_COCOA_WINDOW_BINDING_CREATE_INFO_EXT};
     macBinding.viewHandle = (__bridge void*)g_metalView;
+    // Always-on transparent-window support (mirrors windows/xr_session.cpp +
+    // gauss macos/main.mm). macOS is alpha-native — no chroma key. The runtime
+    // configures the CAMetalLayer non-opaque + clears the atlas to (0,0,0,0)
+    // based on this flag at session create; it cannot be flipped at runtime. The
+    // Ctrl+T toggle only changes the renderer's output alpha + far-plane clamp
+    // (opaque mode emits alpha=1 throughout, compositing fully opaque).
+    macBinding.transparentBackgroundEnabled = XR_TRUE;
     if (xr.hasCocoaWindowBinding && g_metalView) {
         vkBinding.next = &macBinding;
-        LOG_INFO("Using XR_EXT_cocoa_window_binding");
+        LOG_INFO("Using XR_EXT_cocoa_window_binding (transparent-bg ENABLED)");
     }
 
     XrSessionCreateInfo si = {XR_TYPE_SESSION_CREATE_INFO};
@@ -1819,6 +1859,12 @@ static void EndFrame(AppXrSession& xr, XrTime displayTime,
     XrCompositionLayerProjectionView* projViews, uint32_t viewCount) {
     XrCompositionLayerProjection layer = {XR_TYPE_COMPOSITION_LAYER_PROJECTION};
     layer.space = xr.localSpace;
+    // Blend with source alpha so transparent-bg regions (alpha<1) composite over
+    // the desktop. On the macOS Metal compositor transparency keys off the cocoa
+    // binding flag (not layerFlags / blend mode), so environmentBlendMode stays
+    // OPAQUE per the gauss precedent — but the flag is correct per the OpenXR
+    // contract and harmless when opaque (alpha=1).
+    layer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
     layer.viewCount = viewCount;
     layer.views = projViews;
     const XrCompositionLayerBaseHeader* layers[] = {(const XrCompositionLayerBaseHeader*)&layer};
@@ -1947,16 +1993,27 @@ static void ApplyAutoFitForLoadedScene() {
     // +Y-up convention. No runtime view-stage flips needed.
 }
 
-static void TryAutoLoadBundledScene() {
-    std::string dir = ExeDir();
-    if (dir.empty()) return;
-    std::string path = dir + "/sample.glb";
-    if (!FileExists(path)) {
-        LOG_INFO("No bundled model at %s (skipping auto-load)", path.c_str());
-        return;
+static void TryAutoLoadBundledScene(const std::string& overridePath = std::string()) {
+    std::string path;
+    if (!overridePath.empty()) {
+        if (model_validate_file(overridePath)) {
+            path = overridePath;
+        } else {
+            LOG_WARN("CLI model '%s' invalid/missing — falling back to bundled avatar.fbx",
+                     overridePath.c_str());
+        }
     }
-    if (!model_validate_file(path)) return;
-    LOG_INFO("Auto-loading bundled model: %s", path.c_str());
+    if (path.empty()) {
+        std::string dir = ExeDir();
+        if (dir.empty()) return;
+        path = dir + "/avatar.fbx";
+        if (!FileExists(path)) {
+            LOG_INFO("No bundled avatar at %s (skipping auto-load)", path.c_str());
+            return;
+        }
+        if (!model_validate_file(path)) return;
+    }
+    LOG_INFO("Auto-loading model: %s", path.c_str());
     if (g_modelRenderer.loadModel(path.c_str())) {
         g_loadedFileName = model_basename(path);
         LOG_INFO("Loaded %s (%s)", g_loadedFileName.c_str(), model_filesize_str(path).c_str());
@@ -1970,7 +2027,7 @@ static void TryAutoLoadBundledScene() {
 // Main
 // ============================================================================
 
-int main() {
+int main(int argc, char** argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
 
@@ -1990,8 +2047,11 @@ int main() {
         }
     }
 
-    // Step 1: Create macOS window
-    g_windowW = 1280; g_windowH = 720;
+    // Step 1: Create macOS window. Portrait, matching the Windows avatar leg
+    // (811×1421 logical points → the bottom 75% frames the avatar, top 25% is the
+    // speech-bubble band). The drawable px size is recomputed from the realized
+    // contentView × backingScale just below.
+    g_windowW = 811; g_windowH = 1421;
     if (!CreateMacOSWindow(g_windowW, g_windowH)) {
         LOG_ERROR("Failed to create macOS window");
         return 1;
@@ -2091,7 +2151,7 @@ int main() {
     UpdateTopBarButtonTitles(xr);
 
     // Try loading the bundled sample.glb model (copied next to the exe by CMake).
-    TryAutoLoadBundledScene();
+    TryAutoLoadBundledScene(argc > 1 ? std::string(argv[1]) : std::string());
 
     LOG_INFO("=== Entering main loop ===");
     LOG_INFO("Controls: WASDEQ=Move  LMB-drag=Rotate  Scroll=Zoom  DblClick=Focus");
@@ -2241,6 +2301,39 @@ int main() {
                             rawEyePos.assign(1, c);
                         }
 
+                        // ── Face-the-viewer billboard (yaw-only) ──────────────
+                        // The avatar always faces the viewer: drive yaw from the
+                        // raw display-space eye centroid (mirrors windows/main.cpp).
+                        // Only chase while eye tracking is LOCKED — warmup positions
+                        // would jitter the heading; otherwise hold the last facing so
+                        // mouse-drag / orbit still work without a tracker. Pitch is
+                        // pinned upright (the avatar is a standing character).
+                        {
+                            static constexpr float FACE_YAW_SIGN = -1.0f;  // viewer-confirmed
+                            float cx, cz;
+                            if (eyeCount <= 1 || modeViewCount < 2) {
+                                cx = views[0].pose.position.x;
+                                cz = views[0].pose.position.z;
+                            } else {
+                                cx = (views[0].pose.position.x + views[1].pose.position.x) * 0.5f;
+                                cz = (views[0].pose.position.z + views[1].pose.position.z) * 0.5f;
+                            }
+                            const float hzAbs = fabsf(cz) > 1e-3f ? fabsf(cz) : 1e-3f;
+                            float targetYaw = FACE_YAW_SIGN * atan2f(cx, hzAbs);
+                            static float s_faceYaw = 0.0f;
+                            const float tau = 0.04f;  // seconds (settle ≈ 3·tau)
+                            float a = 1.0f - expf(-deltaTime / tau);
+                            if (a < 0.0f) a = 0.0f; else if (a > 1.0f) a = 1.0f;
+                            if (xr.isEyeTracking) {
+                                float dy = targetYaw - s_faceYaw;
+                                while (dy >  3.14159265f) dy -= 6.28318531f;
+                                while (dy < -3.14159265f) dy += 6.28318531f;
+                                s_faceYaw += dy * a;
+                                g_input.yaw = s_faceYaw;
+                                g_input.pitch = 0.0f;
+                            }
+                        }
+
                         XrPosef cameraPose;
                         quat_from_yaw_pitch(g_input.yaw, g_input.pitch, &cameraPose.orientation);
                         // ModelRenderer Y-mirrors the world inside updateUniforms (see comment
@@ -2315,11 +2408,13 @@ int main() {
                             // display3d_compute_view): near = ez - near_offset, far =
                             // ez + far_offset, with the offsets given as ABSOLUTE distances
                             // in virtual-display-height (vH) units. Scales with the virtual
-                            // display (zoom) so large models don't clip. macOS has no
-                            // transparent-bg mode, so far_offset keeps a large recede band.
+                            // display (zoom) so large models don't clip. In transparent-bg
+                            // mode the far plane is clamped to the ZDP (far_offset=0) so only
+                            // foreground content shows over the desktop; opaque keeps a large
+                            // recede band. Mirrors windows/main.cpp.
                             const float vH = tunables.virtual_display_height;
                             const float near_offset = vH;
-                            const float far_offset  = 1000.0f * vH;
+                            const float far_offset  = g_transparentBg.load() ? 0.0f : 1000.0f * vH;
 
                             display3d_compute_views(
                                 rawEyePos.data(), (uint32_t)eyeCount, &nominalViewer,
@@ -2463,13 +2558,21 @@ int main() {
                             VkFormat swapFormat = (VkFormat)xr.swapchain.format;
 
                             if (g_modelRenderer.hasModel()) {
+                                const bool tbg = g_transparentBg.load();
                                 for (int eye = 0; eye < eyeCount; eye++) {
+                                    // Transparent mode → cull content behind the ZDP
+                                    // (view-space far = eye→display distance, the same
+                                    // quantity as eye_display.z). 0 = off. Mirrors
+                                    // windows/main.cpp clipFar[eye].
+                                    float ez = hasKooima ? eyeViews[eye].eye_display.z : 0.0f;
+                                    float clipFar = (tbg && ez > 0.2f) ? ez : 0.0f;
                                     g_modelRenderer.renderEye(
                                         targetImage, swapFormat,
                                         xr.swapchain.width, xr.swapchain.height,
                                         tileOffsets[eye].first, tileOffsets[eye].second,
                                         renderW, renderH,
-                                        viewMat[eye].data(), projMat[eye].data());
+                                        viewMat[eye].data(), projMat[eye].data(),
+                                        tbg, clipFar);
                                 }
                             } else {
                                 RenderPlaceholder(vkDevice, graphicsQueue, cmdPool,

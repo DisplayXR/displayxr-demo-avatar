@@ -10,7 +10,9 @@
 # macos/main.mm is the macOS entry point: Cocoa window + MoltenVK + OpenXR
 # session + HUD/input, with the renderer call sites wired to ModelRenderer
 # (loadModel / hasModel / getRobustSceneBounds, .glb/.gltf NSOpenPanel +
-# drag-drop). No transparent-background mode on macOS (Windows-only).
+# drag-drop). Transparent-background mode IS supported on macOS: the Metal
+# compositor is alpha-native (no chroma key) — see XR_EXT_cocoa_window_binding
+# transparentBackgroundEnabled in main.mm + the gauss demo recipe.
 
 cmake_minimum_required(VERSION 3.21)
 
@@ -70,11 +72,15 @@ target_link_libraries(avatar_handle_vk_macos PRIVATE
     "-framework UniformTypeIdentifiers"
 )
 
-# Copy bundled default model next to the exe (auto-loaded at startup), if present.
-set(BUNDLED_MODEL "${CMAKE_CURRENT_SOURCE_DIR}/assets/sample.glb")
-if(EXISTS "${BUNDLED_MODEL}")
+# Copy the bundled avatar next to the exe (auto-loaded at startup). The FBX's
+# embedded texture path is stale (authored on another machine), so the loader's
+# basename fallback resolves rgb.jpg from the model's own directory — copy both.
+# Mirrors windows/CMakeLists.txt.
+set(AVATAR_DIR "${CMAKE_SOURCE_DIR}/assets/tiger")
+if(EXISTS "${AVATAR_DIR}/avatar.fbx")
     add_custom_command(TARGET avatar_handle_vk_macos POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${BUNDLED_MODEL}" "$<TARGET_FILE_DIR:avatar_handle_vk_macos>/sample.glb"
-        COMMENT "Copying bundled sample.glb next to exe"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${AVATAR_DIR}/avatar.fbx" "$<TARGET_FILE_DIR:avatar_handle_vk_macos>/avatar.fbx"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${AVATAR_DIR}/rgb.jpg"   "$<TARGET_FILE_DIR:avatar_handle_vk_macos>/rgb.jpg"
+        COMMENT "Copying bundled avatar.fbx + texture next to exe"
     )
 endif()
