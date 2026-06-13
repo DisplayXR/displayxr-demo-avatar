@@ -45,6 +45,37 @@ roadmap is below. For how the renderer works today, see `CLAUDE.md` →
    bubble (currently the pill hugs the text); re-enable the pitch billboard
    (`FACE_PITCH_SIGN`); a second/idle greeting line.
 
+## Android (in progress — #568)
+
+The `android/` tree (Gradle + NDK, NativeActivity, Vulkan) runs the avatar as an
+out-of-process OpenXR client against the installed DisplayXR runtime (ADR-025) —
+NO CNSDK/SR SDK in the app. It reuses the shared `model_common/` renderer by
+relative path (like `windows/` + `macos/`), scaffolded from the
+`displayxr-demo-modelviewer` android leg.
+
+**Working** (verified on the nubia NP02J):
+- **Transparent over the live screen** — `Theme.Avatar.Transparent` (translucent
+  Activity) + `renderEye(transparentBg=true)`, so the live Android desktop shows
+  through everything around the avatar. The Android analog of Windows'
+  `WS_EX_NOREDIRECTIONBITMAP` + null brush; the runtime renders the avatar into a
+  translucent SurfaceFlinger overlay (no DComp, no IPC handback — see the runtime
+  `#568` work). 2D verified; 3D weave (Leia) is pending the DP alpha-gate.
+- **Bundled tiger** `assets/tiger/avatar.fbx` via the ufbx backend (its `rgb.jpg`
+  is staged alongside). OBJ/STL/USD are desktop-only (gated under `__ANDROID__`).
+- **Worst-case view sizing** — one atlas swapchain sized for the runtime's max
+  advertised view count (sim_display advertises a 4-view Quad mode).
+
+**Next (Android):**
+1. **Tiger-zone framing** — confine the avatar to the bottom-75% via
+   `XR_EXT_display_zones` (app side wired, chains the zone on locate + submit;
+   dormant until the runtime advertises zone support on the OOP path — a runtime
+   + DP feature, see runtime `#568`). Until then the tiger frames full-canvas.
+2. **3D weave** — needs the Leia Android DP alpha-gate (reconstructs alpha
+   post-weave); over sim_display it renders 2D passthrough.
+3. **Parity** — speech bubble (Windows uses DirectWrite — needs an Android text
+   path), face-the-viewer billboard, Z-dolly input. Click-through has no Android
+   `SetWindowRgn` analogue.
+
 ## Multi-format import (done)
 
 The loader is a thin **format dispatcher** (`model_loader.cpp`) routing by
