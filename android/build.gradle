@@ -1,0 +1,101 @@
+// Copyright 2026, Leia Inc.
+// SPDX-License-Identifier: BSL-1.0
+//
+// Android leg of displayxr-demo-avatar. A vendor-neutral OpenXR client
+// (Vulkan, NativeActivity): NO CNSDK / SR SDK — it binds to the installed
+// DisplayXR runtime out-of-process via the Khronos OpenXR loader broker
+// (ADR-025). The native build (src/main/cpp/CMakeLists.txt) compiles the
+// SHARED model_common/ renderer sources by relative path.
+//
+// Transparency (#568): the Activity uses a translucent theme and the OpenXR
+// session opts into transparentBackgroundEnabled, so the weaved avatar floats
+// over the live Android screen (SurfaceFlinger composites the translucent
+// SurfaceView). See android/src/main/res/values/themes.xml + AndroidManifest.
+
+plugins {
+    id 'com.android.application'
+    id 'org.jetbrains.kotlin.android'
+}
+
+android {
+    namespace 'com.displayxr.avatar_vk_android'
+    compileSdk project.sharedCompileSdk
+    buildToolsVersion = buildToolsVersion
+
+    ndkVersion "${ndk_version}"
+
+    // prefab consumes native libs + headers from .aar dependencies: picks up
+    // libopenxr_loader.so + openxr/*.h from openxr_loader_for_android so
+    // find_package(OpenXR) resolves.
+    buildFeatures {
+        prefab true
+    }
+
+    defaultConfig {
+        applicationId 'com.displayxr.avatar_vk_android'
+        minSdkVersion project.sharedMinSdk
+        targetSdkVersion project.sharedTargetSdk
+        versionCode 1
+        versionName "0.1"
+
+        externalNativeBuild {
+            cmake {
+                arguments "-DANDROID_PLATFORM=${project.sharedMinSdk}",
+                    "-DANDROID_STL=c++_shared",
+                    "-DANDROID_ARM_NEON=TRUE"
+            }
+        }
+
+        //noinspection ChromeOsAbiSupport
+        ndk { abiFilters 'arm64-v8a' }
+    }
+
+    buildTypes {
+        debug {
+            minifyEnabled false
+            debuggable true
+            jniDebuggable true
+            externalNativeBuild {
+                cmake {
+                    cppFlags '-DXRT_DEBUG_ANDROID_VERBOSE'
+                    cFlags '-DXRT_DEBUG_ANDROID_VERBOSE'
+                }
+            }
+        }
+        release {
+            minifyEnabled false
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            path "src/main/cpp/CMakeLists.txt"
+            version "${cmake_version}"
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    kotlinOptions {
+        jvmTarget = JavaVersion.VERSION_17
+    }
+
+    packagingOptions {
+        jniLibs {
+            // libopenxr_loader.so ships in the loader AAR; keep it as-is.
+            useLegacyPackaging true
+        }
+    }
+}
+
+dependencies {
+    implementation "org.jetbrains.kotlin:kotlin-stdlib:$kotlinVersion"
+
+    // Khronos OpenXR loader for Android — bundles libopenxr_loader.so +
+    // openxr/*.h headers via prefab. The loader discovers the DisplayXR
+    // runtime APK at runtime via the OpenXRRuntimeService broker.
+    implementation 'org.khronos.openxr:openxr_loader_for_android:1.1.41'
+}

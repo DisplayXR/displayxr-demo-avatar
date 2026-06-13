@@ -49,14 +49,19 @@ bool model_loader_load(const char* path, ModelData& out) {
     switch (formatFromPath(path)) {
         case ModelFormat::Gltf:
             return model_load_gltf(path, out);
+        case ModelFormat::Fbx:
+            return model_load_fbx(path, out);
+#if !defined(__ANDROID__)
+        // OBJ/STL/USD backends (tinyobjloader / hand-rolled / tinyusdz) are
+        // desktop-only; the Android leg ships glTF + FBX (the bundled avatar)
+        // to keep the APK lean and avoid the heavy tinyusdz FetchContent (#568).
         case ModelFormat::Stl:
             return model_load_stl(path, out);
         case ModelFormat::Obj:
             return model_load_obj(path, out);
-        case ModelFormat::Fbx:
-            return model_load_fbx(path, out);
         case ModelFormat::Usd:
             return model_load_usd(path, out);
+#endif
         default:
             std::fprintf(stderr, "[model_loader] '%s': unsupported format\n", path);
             return false;

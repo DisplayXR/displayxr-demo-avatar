@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Copyright 2026, Leia Inc.
+    SPDX-License-Identifier: BSL-1.0
+    Adaptive-icon background — sampled from the avatar_icon.png edge color.
+-->
+<resources>
+    <color name="ic_launcher_background">#000000</color>
+</resources>
