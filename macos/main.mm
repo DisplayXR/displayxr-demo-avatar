@@ -798,6 +798,21 @@ static bool CreateMacOSWindow(uint32_t width, uint32_t height) {
     AppDelegate *delegate = [[AppDelegate alloc] init];
     [NSApp setDelegate:delegate];
 
+    // Clamp the requested size to the screen's visible area, preserving the
+    // portrait aspect. macOS auto-clamps TITLED windows to the screen but NOT
+    // borderless ones, so an 811x1421 portrait request on a shorter laptop
+    // screen would otherwise stay oversized (avatar + bubble render huge / partly
+    // off-screen) until the B-toggle made it titled. Clamp up-front instead.
+    {
+        NSRect vis = [[NSScreen mainScreen] visibleFrame];
+        const float ar = (float)width / (float)height;  // portrait (<1)
+        float w = (float)width, h = (float)height;
+        if (h > (float)vis.size.height) { h = (float)vis.size.height; w = h * ar; }
+        if (w > (float)vis.size.width)  { w = (float)vis.size.width;  h = w / ar; }
+        width  = (uint32_t)(w + 0.5f);
+        height = (uint32_t)(h + 0.5f);
+    }
+
     NSRect frame = NSMakeRect(100, 100, width, height);
     // Borderless by default — the floating avatar (B toggles a draggable titled
     // frame; see the B handler). AvatarWindow keeps it focusable while borderless.
