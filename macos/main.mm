@@ -1456,10 +1456,19 @@ static bool CreateSwapchains(AppXrSession& xr) {
     std::vector<int64_t> fmts(fmtCount);
     xrEnumerateSwapchainFormats(xr.session, fmtCount, &fmtCount, fmts.data());
 
+    // Prefer a UNORM swapchain on macOS. ModelRenderer renders to an internal
+    // UNORM target and BLITS to the swapchain; with an sRGB swapchain it relies
+    // on "the blit's HW linear→sRGB encode" — which MoltenVK skips for a same-
+    // size copy, so the linear bytes reach the sRGB image unencoded and the
+    // Metal compositor's sRGB sample-decode darkens them again (very dark
+    // avatar). With a UNORM swapchain swapchainIsSrgb_=false → the shader does
+    // the linear→sRGB encode itself, and the bytes pass straight through the
+    // BGRA8Unorm CAMetalLayer with no hidden decode. (gauss avoids this by
+    // writing its final pixels directly to the swapchain, no blit.)
     int64_t selectedFmt = fmts.empty() ? VK_FORMAT_B8G8R8A8_UNORM : fmts[0];
     for (auto f : fmts) {
-        if (f == VK_FORMAT_B8G8R8A8_SRGB || f == VK_FORMAT_R8G8B8A8_SRGB) { selectedFmt = f; break; }
-        if (f == VK_FORMAT_B8G8R8A8_UNORM || f == VK_FORMAT_R8G8B8A8_UNORM) selectedFmt = f;
+        if (f == VK_FORMAT_B8G8R8A8_UNORM || f == VK_FORMAT_R8G8B8A8_UNORM) { selectedFmt = f; break; }
+        if (f == VK_FORMAT_B8G8R8A8_SRGB || f == VK_FORMAT_R8G8B8A8_SRGB) selectedFmt = f;
     }
 
     // Size the swapchain at init from the largest atlas any rendering mode
