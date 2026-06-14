@@ -1593,8 +1593,22 @@ render_frame()
 		const uint32_t ch = g_win_px_h.load(std::memory_order_relaxed);
 		if (cw > 0 && ch > 0) {
 			const float band_h = (float)ch * kBubbleBandFrac;  // top 25%
-			const int bw = (int)((float)cw * 0.70f);           // 70% width, centred
-			const int bh = (int)((float)bw * (float)kBubbleTexH / (float)kBubbleTexW);
+			const float bubble_aspect = (float)kBubbleTexH / (float)kBubbleTexW;
+			// Size the bubble to 70% width, but CLAMP so its aspect-locked height
+			// fits the band. In landscape the band is short (25% of the small
+			// dimension) while cw is large, so a pure width-relative size made the
+			// bubble taller than the band → it spilled into the tiger zone and the
+			// 2D region read as ">25%" (#570). Constrain by height first, then
+			// width, whichever binds.
+			float bwf = (float)cw * 0.70f;
+			float bhf = bwf * bubble_aspect;
+			const float max_bh = band_h * 0.90f;  // leave a 10% margin in the band
+			if (bhf > max_bh) {
+				bhf = max_bh;
+				bwf = bhf / bubble_aspect;
+			}
+			const int bw = (int)bwf;
+			const int bh = (int)bhf;
 			int bx0 = (int)(((float)cw - (float)bw) * 0.5f);
 			int by0 = (int)((band_h - (float)bh) * 0.5f);       // centred in the band
 			const int top_margin = (int)(band_h * 0.05f);
