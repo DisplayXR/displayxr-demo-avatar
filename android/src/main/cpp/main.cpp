@@ -106,15 +106,14 @@ XrSpace g_app_space = XR_NULL_HANDLE;
 
 // ── Display rendering-mode switching (XR_EXT_display_info) ─────────────────
 // The runtime advertises a set of display rendering modes (e.g. 3D-stereo,
-// 2D-mono); double-tap-with-two-fingers cycles them. Mode requests are async —
+// 2D-mono); `setprop debug.dxr.mode N` selects one. Mode requests are async —
 // the runtime applies them and (if view count changes) the next frame adapts.
 PFN_xrEnumerateDisplayRenderingModesEXT g_pfnEnumModes = nullptr;
 PFN_xrRequestDisplayRenderingModeEXT g_pfnReqMode = nullptr;
 uint32_t g_rmode_count = 0;
 std::atomic<uint32_t> g_rmode_current{0};
 bool g_rmode_requestable = false;
-std::atomic<bool> g_cycle_mode_request{false};
-char g_rmode_names[8][64] = {};  // mode names for the Mode button label
+char g_rmode_names[8][64] = {};  // mode names (debug.dxr.mode hook / logs)
 // Per-mode tiling (multiview-tiling invariant): ONE atlas swapchain created once
 // at init, sized worst-case over all modes × both orientations. Per frame the app
 // renders the ACTIVE mode's tiles (display × view_scale) into the atlas at the
@@ -133,26 +132,6 @@ uint32_t g_rmode_rows[8] = {}; // tile rows (1)
 uint32_t g_atlas_w = 0;
 uint32_t g_atlas_h = 0;
 
-// ── On-screen button bar ─────────────────────────────────────────────────────
-// Tap anywhere → a top button bar appears ([Open] [Mode] [Anim], the same
-// chrome as the Windows leg); it fades out after 5 s without any touch.
-//
-// TWO implementations:
-// 1. DEFAULT (interim): Android-widget bar in MainActivity.kt — a separate
-//    WindowManager window added ABOVE the runtime's MonadoView weave window.
-//    Kotlin drives show/fade/clicks and calls the nativeCycleMode /
-//    nativeAnimAction / label JNI below; native services the requests on the
-//    android_main thread.
-// 2. XrCompositionLayerWindowSpaceEXT bar (hud_bar.{h,cpp}) — the proper
-//    cross-platform path, currently REJECTED by the runtime on Android OOP
-//    sessions (runtime#506). Kept behind `adb shell setprop debug.dxr.mv.ws_ui 1`
-//    as the ready-made #506 test client; flip the default once #506 lands.
-HudBar g_hud_bar;
-// Default to the XrCompositionLayerWindowSpaceEXT bar now that the runtime
-// supports window-space layers on Android OOP (#506/#529 landed). Override with
-// `setprop debug.dxr.mv.ws_ui 0` to fall back to the interim Kotlin widget bar.
-bool g_use_ws_ui = true;
-
 // #568 speech bubble — a rounded panel + greeting, rasterized like the button
 // bar but submitted as an XR_EXT_local_3d_zone Local2D layer in the top-25% 2D
 // band (above the tiger zone). Reuses the HudBar swapchain/font/upload infra.
@@ -160,49 +139,10 @@ HudBar g_bubble;
 constexpr uint32_t kBubbleTexW = 1024;
 constexpr uint32_t kBubbleTexH = 384;
 static const char *const kBubbleText = "Hi there! I'm Leo, your friendly 3D desktop avatar.";
-// Cached labels for the Kotlin bar (written on the android_main thread, read
-// from the UI thread via JNI — the renderer itself is not thread-safe to poll).
-std::mutex g_ui_label_mutex;
-std::string g_ui_anim_label;  // clip name / "Paused"; empty = no animations
-std::atomic<bool> g_ui_visible{false};
-std::atomic<int64_t> g_ui_last_touch_ms{0};
-// Set when the runtime rejects the window-space layer (XR_ERROR_LAYER_INVALID
-// — the Android OOP session doesn't pass oxr's verify_window_space_layer gate
-// yet); the whole button UI then stays off for the session. Auto-heals on a
-// runtime that accepts the layer: nothing to change app-side.
-std::atomic<bool> g_ws_layer_unsupported{false};
-std::atomic<bool> g_ui_tap_pending{false};
-std::atomic<float> g_ui_tap_x{0.0f};
-std::atomic<float> g_ui_tap_y{0.0f};
-std::atomic<bool> g_anim_cycle_request{false};
-std::atomic<bool> g_open_picker_request{false};  // native → Kotlin (polled)
-std::mutex g_picked_path_mutex;
-std::string g_picked_path;
-std::atomic<bool> g_picked_pending{false};
-// Live window pixel size (from the rig raw channel) for tap → fraction mapping.
+// Live window pixel size (from the rig raw channel) — drives canvas sizing and
+// the bottom-75% zone framing each frame.
 std::atomic<uint32_t> g_win_px_w{0};
 std::atomic<uint32_t> g_win_px_h{0};
-
-constexpr int64_t kUiHideMs = 5000;  // idle time before the bar starts fading
-constexpr int64_t kUiFadeMs = 400;   // fade-out duration
-
-// Bar geometry — mirrors the Windows leg's top button bar (windows/main.cpp):
-// absolute window fractions used both for hit-testing and pill placement (the
-// bar layer spans the full window width, so window-x == bar-texture-x).
-constexpr float kBarYFrac = 0.008f;
-constexpr float kOpenBtnX = 0.010f, kOpenBtnW = 0.080f;
-constexpr float kModeBtnX = 0.100f, kModeBtnW = 0.160f;
-constexpr float kAnimBtnW = 0.160f, kAnimBtnMargin = 0.010f;
-constexpr uint32_t kBarTexW = 1920;
-constexpr uint32_t kBarTexH = 112;  // thicker than Windows' 56 px — finger targets
-
-int64_t
-now_ms()
-{
-	struct timespec ts;
-	clock_gettime(CLOCK_MONOTONIC, &ts);
-	return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
-}
 
 // ── XR_EXT_view_rig (#396 W7) ───────────────────────────────────────────────
 // When the runtime advertises XR_EXT_view_rig, chain an XrDisplayRigEXT on
@@ -268,12 +208,9 @@ const char *const kModelSidecars[] = {
 constexpr int kSidecarCount = (int)(sizeof(kModelSidecars) / sizeof(kModelSidecars[0]));
 constexpr int kModelCount = (int)(sizeof(kModels) / sizeof(kModels[0]));
 std::atomic<int> g_model_index{0};    // which model is loaded
-std::atomic<int> g_load_request{-1};  // a switch request from Java (-1 = none)
-// Double-tap = reset the viewpoint to the initial framing (pitch 0, fit zoom,
-// turntable restarting from yaw 0). Lightweight — no model reload. Model
-// switching moves to the (future) on-tap button UI.
+// Double-tap recenters the camera (pan/dolly/zoom back to the framed default);
+// serviced on the android_main thread (no Vulkan work, no model reload).
 std::atomic<bool> g_reset_view_request{false};
-std::atomic<uint64_t> g_spin_base{0};  // frame the turntable phase restarts from
 
 // Scene framing: the .spz is centered near the world origin, which is also
 // where the head/reference space sits — so by default the splat is right on
@@ -291,12 +228,13 @@ float g_fit_scale = 1.0f;             // auto-fit scale; pinch-zoom multiplies a
 constexpr float kTargetSize = 0.95f;  // fill the view like the Windows auto-fit (model.height*1.4)
 // Flip the splat vertically (some splats are trained Y-up vs Y-down).
 bool g_flip_y = false;  // glTF is Y-up already (the butterfly point cloud was upside-down)
-// Slow turntable spin about Y (radians/frame). 0 = static. Auto-spin runs until
-// the user first drags with one finger, then they control the orientation.
-float g_spin_speed = 0.01f;
-std::atomic<float> g_user_yaw{0.0f};    // single-finger horizontal drag → yaw
-std::atomic<float> g_user_pitch{0.0f};  // single-finger vertical drag → pitch
-std::atomic<bool> g_user_rotated{false};
+// Touch-drag camera controls (Windows parity): the avatar never rotates. Vertical
+// drag = depth dolly (Windows W/S → cameraPosZ); horizontal drag = lateral strafe
+// (Windows A/D → cameraPosX). Both offset the virtual-display rig pose, baselined
+// on the animated anchor; the avatar's HEADING is owned by the face-the-viewer
+// billboard (see the render loop), exactly like windows/main.cpp.
+std::atomic<float> g_cam_pan_x{0.0f};    // horizontal drag → lateral strafe
+std::atomic<float> g_cam_dolly_z{0.0f};  // vertical drag   → depth dolly
 
 std::atomic<int> g_display_rotation{0};
 std::atomic<bool> g_runtime_unavailable{false};
@@ -440,8 +378,9 @@ mat4_mul(const Mat4 &a, const Mat4 &b)
 }
 
 // Splat model transform (same for both eyes): recenter on the scene centroid,
-// optional Y-flip, turntable spin about Y, then push g_scene_push m in front.
-// M = Translate(0,0,-push) * RotY(angle) * ScaleY(flip?-1:1) * Translate(-center)
+// optional Y-flip, yaw about Y (the face-the-viewer billboard heading — NOT drag;
+// the avatar stays upright, no pitch), then push g_scene_push m in front.
+// M = place * Translate(0,0,-push) * RotY(angle) * ScaleY(flip?-1:1) * Translate(-center)
 Mat4
 build_splat_model(float angle)
 {
@@ -460,13 +399,6 @@ build_splat_model(float angle)
 	roty.m[0] = c;  roty.m[2] = -s;
 	roty.m[8] = s;  roty.m[10] = c;
 
-	// Single-finger vertical drag tilts the model (pitch about X).
-	const float p = g_user_pitch.load(std::memory_order_relaxed);
-	const float pc = std::cos(p), ps = std::sin(p);
-	Mat4 rotx = mat4_identity();
-	rotx.m[5] = pc;  rotx.m[9] = -ps;
-	rotx.m[6] = ps;  rotx.m[10] = pc;
-
 	const float sc = g_scene_scale.load(std::memory_order_relaxed);
 	Mat4 scale = mat4_identity();
 	scale.m[0] = sc; scale.m[5] = sc; scale.m[10] = sc;
@@ -483,10 +415,11 @@ build_splat_model(float angle)
 	place.m[13] = g_scene_center[1];
 	place.m[14] = g_scene_center[2];
 
-	// place * push * rotx * roty * flip * scale * recenter (spin/scale about the
-	// centre, model rendered in place at the centre — rig coincides with it).
+	// place * push * roty * flip * scale * recenter (yaw/scale about the centre,
+	// model rendered in place at the centre — rig coincides with it). Upright: no
+	// pitch (the billboard owns heading; tilting the avatar looks wrong).
 	return mat4_mul(place,
-	    mat4_mul(push, mat4_mul(rotx, mat4_mul(roty, mat4_mul(flip, mat4_mul(scale, recenter))))));
+	    mat4_mul(push, mat4_mul(roty, mat4_mul(flip, mat4_mul(scale, recenter)))));
 }
 
 // ─── OpenXR-Android bring-up (reused verbatim from cube_handle_vk_android) ─
@@ -1266,8 +1199,20 @@ render_frame()
 		// (the model's animated scene centre), not at the world origin. The model
 		// is rendered in place at the same centre (build_splat_model), so the
 		// tiger sits at the centre of its virtual display at 90% of vHeight.
-		const XrPosef rig_pose = {{0.0f, 0.0f, 0.0f, 1.0f},
-		                          {g_scene_center[0], g_scene_center[1], g_scene_center[2]}};
+		//
+		// Touch-drag camera controls (Windows parity, windows/main.cpp:1272-1290):
+		// the rig (= virtual display plane the server Kooima frames around) is offset
+		// from the animated anchor by the accumulated drag — horizontal = lateral
+		// strafe (kPanSign matches Windows' D-is-right), vertical = depth dolly. The
+		// model render stays at g_scene_center (build_splat_model `place`), so the
+		// rig→model offset is what slides/pops the avatar. At zero drag the rig
+		// coincides with the model — identical to the pre-control framing.
+		constexpr float kPanSign = -1.0f;  // D = avatar right; flip on device if reversed
+		const XrPosef rig_pose = {
+		    {0.0f, 0.0f, 0.0f, 1.0f},
+		    {g_scene_center[0] + kPanSign * g_cam_pan_x.load(std::memory_order_relaxed),
+		     g_scene_center[1],
+		     g_scene_center[2] + g_cam_dolly_z.load(std::memory_order_relaxed)}};
 		const float rig_vh = g_rig_vh;
 		if (g_has_view_rig) {
 			display_rig.pose = rig_pose;
@@ -1366,12 +1311,39 @@ render_frame()
 				if (tile_w > max_tw) tile_w = max_tw;
 				if (tile_h > max_th) tile_h = max_th;
 			}
-			// Splat model (recenter + flip + spin + push) — same for both eyes.
-			const float yaw =
-			    g_user_rotated.load(std::memory_order_relaxed)
-			        ? g_user_yaw.load(std::memory_order_relaxed)
-			        : (float)(g_frame_count - g_spin_base.load(std::memory_order_relaxed)) *
-			              g_spin_speed;
+			// Face-the-viewer billboard yaw (windows/main.cpp:1386-1436). Head
+			// centroid from the raw display-space eyes (rawEyes are display-CENTRE
+			// origin, +X right +Z toward viewer — and the tiger zone is full-width
+			// bottom-75%, so the zone centre == display centre and NO canvas rebase
+			// is needed, unlike the panel-relative Windows path). Only chase while
+			// eye tracking is LOCKED; hold facing-forward (yaw 0) during warmup.
+			// Time-based exponential smoothing → frame-rate independent.
+			static constexpr float FACE_YAW_SIGN = -1.0f;  // viewer-confirmed; flip if reversed
+			static float s_face_yaw = 0.0f;
+			{
+				float cx = 0.0f, cz = 0.0f;
+				const uint32_t ne = view_raw.eyeCountOutput;
+				if (ne >= 1) {
+					for (uint32_t e = 0; e < ne; ++e) {
+						cx += view_raw.rawEyes[e].x;
+						cz += view_raw.rawEyes[e].z;
+					}
+					cx /= (float)ne;
+					cz /= (float)ne;
+				}
+				const float hz_abs = fabsf(cz) > 1.0e-3f ? fabsf(cz) : 1.0e-3f;
+				const float target_yaw = FACE_YAW_SIGN * atan2f(cx, hz_abs);
+				const float tau = 0.04f, dt = 1.0f / 60.0f;  // settle ≈ 3·tau
+				float a = 1.0f - expf(-dt / tau);
+				a = a < 0.0f ? 0.0f : (a > 1.0f ? 1.0f : a);
+				if (view_raw.isTracking) {
+					float dy = target_yaw - s_face_yaw;
+					while (dy > 3.14159265f) dy -= 6.28318531f;
+					while (dy < -3.14159265f) dy += 6.28318531f;
+					s_face_yaw += dy * a;
+				}
+			}
+			const float yaw = s_face_yaw;
 			// #568: track the ANIMATED visual anchor each frame so the avatar
 			// stays centred in the zone as the clip plays — the load-time static
 			// AABB centre mis-centres the animated tiger (rides high / top-
@@ -1423,14 +1395,23 @@ render_frame()
 					Mat4 viewM = view_matrix_from_pose(views[i].pose);
 					Mat4 evM = mat4_mul(viewM, splat_model);  // apply splat model
 					Mat4 projM;
+					// Foreground-only clip (windows/main.cpp:1640-1668): in transparent
+					// mode cull geometry behind the virtual display plane (ZDP) so only
+					// popping-out content shows. clipFar rides in the renderer UBO
+					// (lightDir.w, view-space); 0 = off. The avatar always renders
+					// transparent here, so it collapses to the ez>0.2m guard (never cull
+					// at/behind near). Threaded into renderEye below.
+					float clip_far = 0.0f;
 					if (g_has_view_rig) {
 						// Render-ready off-axis FOV from the rig — pass it through
 						// (aspect -1: the symmetric override would destroy the
-						// off-axis skew). ZDP-anchored clips about the virtual
-						// display plane: near = ez - vH, far = ez + 1000·vH.
+						// off-axis skew). ZDP-anchored clip about the virtual display
+						// plane: near = ez - vH; transparent far = ez (clip at the ZDP,
+						// matching Windows — opaque would use ez + 1000·vH).
 						const float ez = rig_local_eye_z(rig_pose, views[i].pose.position);
 						const float near_z = (ez - rig_vh > 1.0e-4f) ? (ez - rig_vh) : 1.0e-4f;
-						const float far_z = ez + 1000.0f * rig_vh;
+						const float far_z = ez;
+						clip_far = (ez > 0.2f) ? ez : 0.0f;
 						XrFovf eff_fov = views[i].fov;
 						// #568: the Android OOP runtime returns a FULL-CANVAS rig FOV
 						// (its zone canvas rebase is D3D11-gated → no-op on Android),
@@ -1473,7 +1454,7 @@ render_frame()
 					    g_views[0].width, g_views[0].height,
 					    tile_x, tile_y, tile_w, tile_h,
 					    evM.m, projM.m,
-					    /*transparentBg*/ true);
+					    /*transparentBg*/ true, /*clipFarViewSpace*/ clip_far);
 
 					projection_views[i].type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
 					projection_views[i].pose = views[i].pose;
@@ -1493,80 +1474,6 @@ render_frame()
 		} else {
 			log_xr_result("xrLocateViews", res);
 		}
-	}
-
-	// ── Button bar (window-space layer): shown on tap, fades after 5 s idle ──
-	float ui_alpha = 0.0f;
-	if (g_ui_visible.load(std::memory_order_relaxed)) {
-		const int64_t idle = now_ms() - g_ui_last_touch_ms.load(std::memory_order_relaxed);
-		if (idle < kUiHideMs) {
-			ui_alpha = 1.0f;
-		} else if (idle < kUiHideMs + kUiFadeMs) {
-			ui_alpha = 1.0f - (float)(idle - kUiHideMs) / (float)kUiFadeMs;
-		} else {
-			g_ui_visible.store(false, std::memory_order_relaxed);
-		}
-	}
-	XrCompositionLayerWindowSpaceEXT bar_layer = {};
-	bool bar_active = false;
-	if (ui_alpha > 0.0f && g_hud_bar.ready && rendered &&
-	    !g_ws_layer_unsupported.load(std::memory_order_relaxed)) {
-		char mode_label[80];
-		const uint32_t cur = g_rmode_current.load(std::memory_order_relaxed);
-		std::snprintf(mode_label, sizeof(mode_label), "Mode: %s",
-		              (cur < 8 && g_rmode_names[cur][0] != '\0') ? g_rmode_names[cur] : "n/a");
-		const bool anim_enabled = g_model.hasAnimations();
-		std::string anim_label;
-		if (anim_enabled) {
-			std::string nm;
-			int ai = 0, ac = 0;
-			float t = 0, d = 0;
-			bool playing = false;
-			if (g_model.getPlaybackInfo(nm, ai, ac, t, d, playing)) {
-				anim_label = playing ? nm : "Paused";
-			}
-		}
-		static std::string s_last_mode, s_last_anim;
-		static bool s_last_anim_en = false;
-		static float s_last_alpha = -1.0f;
-		const bool content_changed = s_last_mode != mode_label || s_last_anim != anim_label ||
-		                             s_last_anim_en != anim_enabled;
-		if (content_changed) {
-			const HudBarButton btns[3] = {
-			    {kOpenBtnX, kOpenBtnW, "Open", true},
-			    {kModeBtnX, kModeBtnW, mode_label, true},
-			    {1.0f - kAnimBtnW - kAnimBtnMargin, kAnimBtnW, anim_label, anim_enabled},
-			};
-			hud_bar_render(g_hud_bar, btns, 3);
-			s_last_mode = mode_label;
-			s_last_anim = anim_label;
-			s_last_anim_en = anim_enabled;
-		}
-		if (content_changed || ui_alpha != s_last_alpha) {
-			hud_bar_upload(g_hud_bar, ui_alpha);
-			s_last_alpha = ui_alpha;
-		}
-		uint32_t ww = g_win_px_w.load(std::memory_order_relaxed);
-		uint32_t wh = g_win_px_h.load(std::memory_order_relaxed);
-		if (ww == 0 || wh == 0) {
-			ww = 2560;
-			wh = 1600;
-		}
-		// Full window width; height preserves the texture aspect (Windows-leg
-		// BtnBarHeightFraction): h_frac = windowAR / texAR.
-		const float bar_h = ((float)ww / (float)wh) / ((float)kBarTexW / (float)kBarTexH);
-		bar_layer.type = (XrStructureType)XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_EXT;
-		bar_layer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
-		bar_layer.subImage.swapchain = g_hud_bar.swapchain;
-		bar_layer.subImage.imageRect.offset = {0, 0};
-		bar_layer.subImage.imageRect.extent = {(int32_t)kBarTexW, (int32_t)kBarTexH};
-		bar_layer.subImage.imageArrayIndex = 0;
-		bar_layer.x = 0.0f;
-		bar_layer.y = kBarYFrac;
-		bar_layer.width = 1.0f;
-		bar_layer.height = bar_h;
-		bar_layer.disparity = 0.0f;
-		bar_active = true;
 	}
 
 	XrCompositionLayerProjection projection_layer = {};
@@ -1626,37 +1533,21 @@ render_frame()
 		}
 	}
 
-	// Layer order: projection/zone, then the bubble, then the window-space bar
-	// LAST so the existing "drop the bar on reject" fallback below still works.
-	const XrCompositionLayerBaseHeader *layers[3];
+	// Layer order: projection/zone first, then the #568 speech bubble on top.
+	const XrCompositionLayerBaseHeader *layers[2];
 	uint32_t base_count = 0;
 	layers[base_count++] = reinterpret_cast<const XrCompositionLayerBaseHeader *>(&projection_layer);
 	if (bubble_active) {
 		layers[base_count++] = reinterpret_cast<const XrCompositionLayerBaseHeader *>(&bubble_layer);
-	}
-	uint32_t full_count = base_count;
-	if (bar_active) {
-		layers[full_count++] = reinterpret_cast<const XrCompositionLayerBaseHeader *>(&bar_layer);
 	}
 
 	XrFrameEndInfo end_info = {};
 	end_info.type = XR_TYPE_FRAME_END_INFO;
 	end_info.displayTime = frame_state.predictedDisplayTime;
 	end_info.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
-	end_info.layerCount = rendered ? full_count : 0;
+	end_info.layerCount = rendered ? base_count : 0;
 	end_info.layers = rendered ? layers : nullptr;
 	res = xrEndFrame(g_session, &end_info);
-	if (res == XR_ERROR_LAYER_INVALID && bar_active) {
-		// The runtime's window-space gate doesn't accept this session (Android
-		// OOP — see the runtime issue on verify_window_space_layer). Disable
-		// the button UI for this run and resubmit the frame without the bar (the
-		// last layer) so frame discipline is preserved; the bubble is kept.
-		g_ws_layer_unsupported.store(true, std::memory_order_relaxed);
-		g_ui_visible.store(false, std::memory_order_relaxed);
-		LOGW("window-space layer rejected by the runtime — button UI disabled this session");
-		end_info.layerCount = base_count;
-		res = xrEndFrame(g_session, &end_info);
-	}
 	if (res != XR_SUCCESS) {
 		log_xr_result("xrEndFrame", res);
 		return false;
@@ -1684,7 +1575,6 @@ destroy_all()
 		g_model.cleanup();
 		g_model_ready = false;
 	}
-	hud_bar_destroy(g_hud_bar);
 	hud_bar_destroy(g_bubble);
 	if (g_session != XR_NULL_HANDLE) {
 		xrDestroySession(g_session);
@@ -1736,13 +1626,6 @@ handle_cmd(struct android_app *app, int32_t cmd)
 			    create_reference_space() &&
 			    gs_init() &&
 			    load_model_index(app, 0);
-			if (ok && g_use_ws_ui) {
-				// #506 test path only (debug.dxr.mv.ws_ui=1); the default
-				// button UI is the Kotlin bar in MainActivity. Non-fatal.
-				hud_bar_init(g_hud_bar, g_session, g_vk_phys_device, g_vk_device,
-				             g_vk_queue, g_vk_queue_family, g_swapchain_format,
-				             kBarTexW, kBarTexH);
-			}
 			if (ok && g_has_local_3d_zone) {
 				// #568 speech bubble (Local2D layer in the top-25% band). Non-fatal:
 				// on failure the bubble simply doesn't draw. Rasterized once here.
@@ -1790,13 +1673,15 @@ Java_com_displayxr_avatar_1vk_1android_MainActivity_nativeXrReady(
 	return (g_instance != XR_NULL_HANDLE) ? JNI_TRUE : JNI_FALSE;
 }
 
-// Pinch-to-zoom, fed from Java. The runtime's MonadoView overlay is the only
+// Touch bridge, fed from Java. The runtime's MonadoView overlay is the only
 // window that receives touch (it covers our NativeActivity); David's #499 design
 // forwards each event to the host Activity via dispatchTouchEvent. But a
 // NativeActivity's native InputQueue (→ app->onInputEvent) is NOT driven by
 // Activity.dispatchTouchEvent — so we capture the forwarded MotionEvent in
 // MainActivity.dispatchTouchEvent and bridge the coordinates down here instead.
-// action = MotionEvent.getActionMasked(); count = pointerCount.
+// One finger = camera controls (depth dolly + lateral strafe, Windows parity);
+// two fingers = pinch-to-zoom. action = MotionEvent.getActionMasked(); count =
+// pointerCount.
 extern "C" JNIEXPORT void JNICALL
 Java_com_displayxr_avatar_1vk_1android_MainActivity_nativeOnTouch(
     JNIEnv * /*env*/, jobject /*thiz*/, jint action, jint count,
@@ -1807,11 +1692,6 @@ Java_com_displayxr_avatar_1vk_1android_MainActivity_nativeOnTouch(
 	static bool drag_valid = false;  // a clean single-finger gesture is in progress
 	// AMOTION_EVENT_ACTION_* values match MotionEvent.ACTION_* (0=DOWN,1=UP,2=MOVE,…).
 	constexpr int kDown = 0, kUp = 1, kMove = 2;
-
-	// Any touch while the button bar is visible re-arms its 5 s idle timer.
-	if (g_ui_visible.load(std::memory_order_relaxed)) {
-		g_ui_last_touch_ms.store(now_ms(), std::memory_order_relaxed);
-	}
 
 	if (count >= 2) {
 		// ── two fingers: pinch-to-zoom (scale around the auto-fit size) ──
@@ -1830,40 +1710,33 @@ Java_com_displayxr_avatar_1vk_1android_MainActivity_nativeOnTouch(
 	}
 	pinch_last = 0.0f;  // <2 fingers
 
-	// ── one finger: drag to orbit (horizontal = yaw, vertical = pitch) ──
-	constexpr float kYawPerPx = 0.01f, kPitchPerPx = 0.01f, kPitchLimit = 1.3f;
+	// ── one finger: camera controls (windows/main.cpp A/D + W/S) ──
+	// Horizontal drag → lateral strafe (cameraPosX); vertical drag → depth dolly
+	// (cameraPosZ). The avatar never rotates. Per-pixel gains are the on-device
+	// tuning knobs (screencap is blind — David eyeballs); flip a sign here or
+	// kPanSign / the dolly sign in the render loop if a direction feels reversed.
+	constexpr float kPanPerPx = 0.002f;    // lateral units per px (≈500px → 1 unit)
+	constexpr float kDollyPerPx = 0.004f;  // depth   units per px (≈250px → 1 unit)
 	if (action == kDown) {
 		drag_x = x0;
 		drag_y = y0;
 		drag_valid = true;
-		// Seed user yaw from the turntable angle so the first drag doesn't snap.
-		if (!g_user_rotated.load(std::memory_order_relaxed)) {
-			g_user_yaw.store(
-			    (float)(g_frame_count - g_spin_base.load(std::memory_order_relaxed)) *
-			        g_spin_speed,
-			    std::memory_order_relaxed);
-		}
 	} else if (action == kMove && drag_valid) {
 		const float dx = x0 - drag_x, dy = y0 - drag_y;
 		drag_x = x0;
 		drag_y = y0;
-		g_user_yaw.store(g_user_yaw.load(std::memory_order_relaxed) + dx * kYawPerPx,
-		                 std::memory_order_relaxed);
-		float pitch = g_user_pitch.load(std::memory_order_relaxed) + dy * kPitchPerPx;
-		if (pitch < -kPitchLimit) pitch = -kPitchLimit;
-		if (pitch > kPitchLimit) pitch = kPitchLimit;
-		g_user_pitch.store(pitch, std::memory_order_relaxed);
-		g_user_rotated.store(true, std::memory_order_relaxed);
+		g_cam_pan_x.store(g_cam_pan_x.load(std::memory_order_relaxed) + dx * kPanPerPx,
+		                  std::memory_order_relaxed);
+		g_cam_dolly_z.store(g_cam_dolly_z.load(std::memory_order_relaxed) + dy * kDollyPerPx,
+		                    std::memory_order_relaxed);
 	} else if (action == kUp) {
 		drag_valid = false;
 	}
 }
 
-// Double-tap (from Java's GestureDetector) resets the viewpoint to the
-// initial framing. Just records the request; the reset runs on the
-// android_main thread (see the loop). Model switching is no longer on
-// double-tap — it moves to the planned on-tap button UI (g_load_request
-// stays as its hook).
+// Double-tap (from Java's GestureDetector) recenters the camera (pan/dolly/zoom
+// back to the framed default). Just records the request; the reset runs on the
+// android_main thread (no Vulkan work, no model reload).
 extern "C" JNIEXPORT void JNICALL
 Java_com_displayxr_avatar_1vk_1android_MainActivity_nativeResetView(
     JNIEnv * /*env*/, jobject /*thiz*/)
@@ -1871,108 +1744,10 @@ Java_com_displayxr_avatar_1vk_1android_MainActivity_nativeResetView(
 	g_reset_view_request.store(true, std::memory_order_relaxed);
 }
 
-// Single tap (GestureDetector onSingleTapConfirmed — fires only when it's NOT
-// part of a double-tap). Coords are view pixels; hit-testing runs on the
-// android_main thread.
-extern "C" JNIEXPORT void JNICALL
-Java_com_displayxr_avatar_1vk_1android_MainActivity_nativeOnTap(
-    JNIEnv * /*env*/, jobject /*thiz*/, jfloat x, jfloat y)
-{
-	g_ui_tap_x.store((float)x, std::memory_order_relaxed);
-	g_ui_tap_y.store((float)y, std::memory_order_relaxed);
-	g_ui_tap_pending.store(true, std::memory_order_relaxed);
-}
-
-// Kotlin polls this; true means the native Open button was tapped and the
-// SAF document picker should be launched (native code can't start an Intent).
-extern "C" JNIEXPORT jboolean JNICALL
-Java_com_displayxr_avatar_1vk_1android_MainActivity_nativeConsumeOpenRequest(
-    JNIEnv * /*env*/, jobject /*thiz*/)
-{
-	return g_open_picker_request.exchange(false, std::memory_order_relaxed) ? JNI_TRUE
-	                                                                        : JNI_FALSE;
-}
-
-// ── Kotlin widget-bar JNI (the default UI while runtime#506 is open) ────────
-
-// Which bar implementation this run uses (debug.dxr.mv.ws_ui).
-extern "C" JNIEXPORT jboolean JNICALL
-Java_com_displayxr_avatar_1vk_1android_MainActivity_nativeUseWindowSpaceUi(
-    JNIEnv * /*env*/, jobject /*thiz*/)
-{
-	return g_use_ws_ui ? JNI_TRUE : JNI_FALSE;
-}
-
-// Mode button: request the next display rendering mode (serviced on the
-// android_main thread; the label updates via the mode-changed event).
-extern "C" JNIEXPORT void JNICALL
-Java_com_displayxr_avatar_1vk_1android_MainActivity_nativeCycleMode(
-    JNIEnv * /*env*/, jobject /*thiz*/)
-{
-	g_cycle_mode_request.store(true, std::memory_order_relaxed);
-}
-
-// Animation button: next clip / play-pause toggle (serviced on android_main).
-extern "C" JNIEXPORT void JNICALL
-Java_com_displayxr_avatar_1vk_1android_MainActivity_nativeAnimAction(
-    JNIEnv * /*env*/, jobject /*thiz*/)
-{
-	g_anim_cycle_request.store(true, std::memory_order_relaxed);
-}
-
-// "Mode: <name>" — names are written once at enumerate, index via the
-// mode-changed event; safe to read from the UI thread.
-extern "C" JNIEXPORT jstring JNICALL
-Java_com_displayxr_avatar_1vk_1android_MainActivity_nativeGetModeLabel(
-    JNIEnv *env, jobject /*thiz*/)
-{
-	char label[80];
-	const uint32_t cur = g_rmode_current.load(std::memory_order_relaxed);
-	std::snprintf(label, sizeof(label), "Mode: %s",
-	              (cur < 8 && g_rmode_names[cur][0] != '\0') ? g_rmode_names[cur] : "n/a");
-	return env->NewStringUTF(label);
-}
-
-// Clip name / "Paused"; empty string = model has no animations (hide button).
-extern "C" JNIEXPORT jstring JNICALL
-Java_com_displayxr_avatar_1vk_1android_MainActivity_nativeGetAnimLabel(
-    JNIEnv *env, jobject /*thiz*/)
-{
-	std::lock_guard<std::mutex> lock(g_ui_label_mutex);
-	return env->NewStringUTF(g_ui_anim_label.c_str());
-}
-
-// A picked document, already copied by Kotlin into app-private storage (the
-// glTF loader needs a filesystem path). Loaded on the android_main thread.
-extern "C" JNIEXPORT void JNICALL
-Java_com_displayxr_avatar_1vk_1android_MainActivity_nativeOpenModelPath(
-    JNIEnv *env, jobject /*thiz*/, jstring jpath)
-{
-	const char *chars = env->GetStringUTFChars(jpath, nullptr);
-	if (chars != nullptr) {
-		{
-			std::lock_guard<std::mutex> lock(g_picked_path_mutex);
-			g_picked_path = chars;
-		}
-		env->ReleaseStringUTFChars(jpath, chars);
-		g_picked_pending.store(true, std::memory_order_relaxed);
-	}
-}
-
 extern "C" void
 android_main(struct android_app *app)
 {
-	LOGI("model_viewer_vk_android: android_main entered");
-	{
-		// Window-space bar is the default now (#506/#529 landed). Allow an
-		// explicit override either way: `setprop debug.dxr.mv.ws_ui 0` forces the
-		// interim Kotlin widget bar, `=1` forces the window-space bar.
-		char prop[PROP_VALUE_MAX] = {};
-		if (__system_property_get("debug.dxr.mv.ws_ui", prop) > 0 && (prop[0] == '0' || prop[0] == '1')) {
-			g_use_ws_ui = (prop[0] == '1');
-		}
-		LOGI("button UI: %s", g_use_ws_ui ? "window-space layer (#506 test)" : "Kotlin widget bar");
-	}
+	LOGI("avatar_vk_android: android_main entered");
 	app->onAppCmd = handle_cmd;
 	// Touch is NOT consumed via app->onInputEvent: the runtime's MonadoView
 	// overlay covers our window, so a NativeActivity never sees native input.
@@ -2001,51 +1776,9 @@ android_main(struct android_app *app)
 				destroy_all();
 				return;
 			}
-			// Single tap: first tap shows the button bar; while visible, taps
-			// hit-test the buttons (window fractions, mirroring the Windows
-			// hit-test). All servicing on this thread.
-			if (g_ui_tap_pending.exchange(false, std::memory_order_relaxed) &&
-			    !g_ws_layer_unsupported.load(std::memory_order_relaxed)) {
-				if (!g_ui_visible.load(std::memory_order_relaxed)) {
-					g_ui_visible.store(true, std::memory_order_relaxed);
-					LOGI("UI: bar shown");
-				} else {
-					uint32_t ww = g_win_px_w.load(std::memory_order_relaxed);
-					uint32_t wh = g_win_px_h.load(std::memory_order_relaxed);
-					if (ww == 0 || wh == 0) {
-						ww = 2560;
-						wh = 1600;
-					}
-					const float fx = g_ui_tap_x.load(std::memory_order_relaxed) / (float)ww;
-					const float fy = g_ui_tap_y.load(std::memory_order_relaxed) / (float)wh;
-					const float bar_h =
-					    ((float)ww / (float)wh) / ((float)kBarTexW / (float)kBarTexH);
-					if (fy >= kBarYFrac && fy <= kBarYFrac + bar_h) {
-						if (fx >= kOpenBtnX && fx <= kOpenBtnX + kOpenBtnW) {
-							LOGI("UI: Open tapped");
-							g_open_picker_request.store(true, std::memory_order_relaxed);
-						} else if (fx >= kModeBtnX && fx <= kModeBtnX + kModeBtnW) {
-							LOGI("UI: Mode tapped");
-							g_cycle_mode_request.store(true, std::memory_order_relaxed);
-						} else if (fx >= 1.0f - kAnimBtnW - kAnimBtnMargin &&
-						           fx <= 1.0f - kAnimBtnMargin && g_model.hasAnimations()) {
-							LOGI("UI: Animation tapped");
-							g_anim_cycle_request.store(true, std::memory_order_relaxed);
-						}
-					}
-				}
-				g_ui_last_touch_ms.store(now_ms(), std::memory_order_relaxed);
-			}
-			if (g_cycle_mode_request.exchange(false, std::memory_order_relaxed) &&
-			    g_pfnReqMode != nullptr && g_rmode_count > 1) {
-				const uint32_t next =
-				    (g_rmode_current.load(std::memory_order_relaxed) + 1) % g_rmode_count;
-				LOGI("UI: requesting rendering mode %u", next);
-				g_pfnReqMode(g_session, next);
-			}
-			// #533 test hook: absolute mode select via adb (the UI button bar is
-			// dormant pending the window-space layer). `setprop debug.dxr.mode N` →
-			// request mode N (0=2D, 1=3D). Re-request only on change.
+			// #533 test hook: absolute mode select via adb. `setprop
+			// debug.dxr.mode N` → request mode N (0=2D, 1=3D). Re-request only on
+			// change. (The only mode control now that the button bar is gone.)
 			{
 				static int last_prop_mode = -1;
 				char prop[PROP_VALUE_MAX] = {0};
@@ -2059,74 +1792,12 @@ android_main(struct android_app *app)
 					}
 				}
 			}
-			if (g_anim_cycle_request.exchange(false, std::memory_order_relaxed)) {
-				// Multiple clips → next clip (the Windows 'N' semantics);
-				// single clip → toggle play/pause so the button still does
-				// something visible.
-				if (g_model.animationCount() > 1) {
-					g_model.cycleAnimation();
-				} else if (g_model.hasAnimations()) {
-					std::string nm;
-					int ai = 0, ac = 0;
-					float t = 0, d = 0;
-					bool playing = false;
-					g_model.getPlaybackInfo(nm, ai, ac, t, d, playing);
-					g_model.setPaused(playing);
-				}
-			}
-			// Refresh the Kotlin bar's animation label cache (renderer state is
-			// only safe to read on this thread).
-			if (g_scene_loaded.load(std::memory_order_relaxed)) {
-				std::string label;
-				if (g_model.hasAnimations()) {
-					std::string nm;
-					int ai = 0, ac = 0;
-					float t = 0, d = 0;
-					bool playing = false;
-					if (g_model.getPlaybackInfo(nm, ai, ac, t, d, playing)) {
-						label = playing ? nm : "Paused";
-					}
-				}
-				std::lock_guard<std::mutex> lock(g_ui_label_mutex);
-				if (g_ui_anim_label != label) {
-					g_ui_anim_label = label;
-				}
-			}
-			// A model picked via SAF (Kotlin copies it to app storage first).
-			if (g_picked_pending.exchange(false, std::memory_order_relaxed)) {
-				std::string path;
-				{
-					std::lock_guard<std::mutex> lock(g_picked_path_mutex);
-					path = g_picked_path;
-				}
-				if (!path.empty()) {
-					g_user_rotated.store(false, std::memory_order_relaxed);
-					g_user_yaw.store(0.0f, std::memory_order_relaxed);
-					g_user_pitch.store(0.0f, std::memory_order_relaxed);
-					g_spin_base.store(g_frame_count, std::memory_order_relaxed);
-					load_model_path(path.c_str());
-				}
-			}
-			// Double-tap: reset the viewpoint to the initial framing. Pure
-			// atomic stores — instant, no Vulkan work, no reload.
+			// Double-tap recenter: camera pan/dolly back to 0, zoom back to the
+			// auto-fit scale. Pure atomic stores — instant, no Vulkan work.
 			if (g_reset_view_request.exchange(false, std::memory_order_relaxed)) {
-				g_user_rotated.store(false, std::memory_order_relaxed);
-				g_user_yaw.store(0.0f, std::memory_order_relaxed);
-				g_user_pitch.store(0.0f, std::memory_order_relaxed);
+				g_cam_pan_x.store(0.0f, std::memory_order_relaxed);
+				g_cam_dolly_z.store(0.0f, std::memory_order_relaxed);
 				g_scene_scale.store(g_fit_scale, std::memory_order_relaxed);
-				g_spin_base.store(g_frame_count, std::memory_order_relaxed);
-			}
-			// Service a pending model switch (future button UI) on this thread,
-			// where the Vulkan device is valid. load_model_index waits for GPU
-			// idle.
-			const int req = g_load_request.exchange(-1, std::memory_order_relaxed);
-			if (req >= 0) {
-				// Reset orientation/zoom so the new model auto-frames cleanly.
-				g_user_rotated.store(false, std::memory_order_relaxed);
-				g_user_yaw.store(0.0f, std::memory_order_relaxed);
-				g_user_pitch.store(0.0f, std::memory_order_relaxed);
-				g_spin_base.store(g_frame_count, std::memory_order_relaxed);
-				load_model_index(app, req);
 			}
 			// Drive frames from READY (not SYNCHRONIZED+): a CTS-compliant
 			// runtime only advances READY->SYNCHRONIZED on the first
