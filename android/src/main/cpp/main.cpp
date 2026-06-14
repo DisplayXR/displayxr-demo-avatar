@@ -474,9 +474,19 @@ build_splat_model(float angle)
 	Mat4 push = mat4_identity();
 	push.m[14] = -g_scene_push.load(std::memory_order_relaxed);
 
-	// push * rotx * roty * flip * scale * recenter (orbit about the recentred origin)
-	return mat4_mul(push,
-	    mat4_mul(rotx, mat4_mul(roty, mat4_mul(flip, mat4_mul(scale, recenter)))));
+	// #570: match macOS/Windows — render the model IN PLACE at the scene centre
+	// (the rig pose is set to the same centre), rather than recentring to the
+	// world origin under an identity rig. Spin/scale happen about the centre,
+	// then `place` puts the model back at the centre so model and rig coincide.
+	Mat4 place = mat4_identity();
+	place.m[12] = g_scene_center[0];
+	place.m[13] = g_scene_center[1];
+	place.m[14] = g_scene_center[2];
+
+	// place * push * rotx * roty * flip * scale * recenter (spin/scale about the
+	// centre, model rendered in place at the centre — rig coincides with it).
+	return mat4_mul(place,
+	    mat4_mul(push, mat4_mul(rotx, mat4_mul(roty, mat4_mul(flip, mat4_mul(scale, recenter))))));
 }
 
 // ─── OpenXR-Android bring-up (reused verbatim from cube_handle_vk_android) ─
@@ -1067,7 +1077,12 @@ load_model_path(const char *path)
 			g_scene_center[2] = anch[2];
 		}
 		g_fit_scale = (maxe > 1e-4f) ? kTargetSize / maxe : 1.0f;
-		g_scene_scale.store(g_fit_scale, std::memory_order_relaxed);
+		// #570: match macOS/Windows — render the model at WORLD scale (1.0) and
+		// let virtual_display_height (= modelHeight/0.9, set below) drive the 90%
+		// fill, instead of pre-scaling the model. Pre-scaling decoupled the model
+		// size from vHeight and mis-framed the tiger once the runtime off-axis-
+		// frames the zone. Pinch zoom still rides g_scene_scale.
+		g_scene_scale.store(1.0f, std::memory_order_relaxed);
 		g_scene_push.store(g_has_view_rig ? 0.0f : 0.45f, std::memory_order_relaxed);
 		// 90% fill: the avatar occupies 90% of the virtual-display (zone) height
 		// at start — vHeight = modelHeight / 0.90 = modelHeight × 1.111 (Windows
@@ -1247,7 +1262,12 @@ render_frame()
 		// raw channel reports the DP's display-space eyes + tracking state.
 		XrDisplayRigEXT display_rig = {XR_TYPE_DISPLAY_RIG_EXT};
 		XrViewDisplayRawEXT view_raw = {XR_TYPE_VIEW_DISPLAY_RAW_EXT};
-		const XrPosef rig_pose = {{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, 0.0f}};
+		// #570: match macOS/Windows — the virtual display is centred ON the tiger
+		// (the model's animated scene centre), not at the world origin. The model
+		// is rendered in place at the same centre (build_splat_model), so the
+		// tiger sits at the centre of its virtual display at 90% of vHeight.
+		const XrPosef rig_pose = {{0.0f, 0.0f, 0.0f, 1.0f},
+		                          {g_scene_center[0], g_scene_center[1], g_scene_center[2]}};
 		const float rig_vh = g_rig_vh;
 		if (g_has_view_rig) {
 			display_rig.pose = rig_pose;
