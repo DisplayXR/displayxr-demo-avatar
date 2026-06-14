@@ -43,6 +43,7 @@
 
 #include "hud_bar.h"
 #include "model_renderer.h"
+#include "model_vulkan_utils.h"  // scratch image/buffer for the click-through silhouette
 
 #define LOG_TAG "model_viewer_vk_android"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
@@ -143,6 +144,54 @@ static const char *const kBubbleText = "Hi there! I'm Leo, your friendly 3D desk
 // the bottom-75% zone framing each frame.
 std::atomic<uint32_t> g_win_px_w{0};
 std::atomic<uint32_t> g_win_px_h{0};
+
+// ── Per-pixel gesture/click-through silhouette (windows/main.cpp UpdateSilhouette)
+// Each silhouette tick the renderer draws the tiger (UNION over the rendered
+// views) into a small scratch image with transparent bg → alpha marks the
+// avatar. Published as a coverage bitmap the touch handler samples to gate
+// gestures to the tiger area (and, next, for click-through). Maps to the ZONE
+// rect (bottom-75%) so the scratch is fully covered (no stale top band); the
+// touch handler rebases canvas→zone before sampling.
+struct SilhouetteCoverage
+{
+	std::mutex mtx;
+	std::vector<uint8_t> bits;                        // covW*covH, 1 = tiger present
+	int covW = 0, covH = 0;                           // coverage bitmap dims
+	int zoneX = 0, zoneY = 0, zoneW = 0, zoneH = 0;   // canvas-px rect the bits map to
+	bool ready = false;
+};
+SilhouetteCoverage g_sil;
+ModelImage g_sil_image = {};
+ModelBuffer g_sil_readback = {};
+void *g_sil_mapped = nullptr;
+VkCommandPool g_sil_pool = VK_NULL_HANDLE;
+
+// True if a canvas-space point lands on the tiger silhouette (dilated). Called
+// from nativeOnTouch (UI thread). Fail-OPEN until the first coverage is ready so
+// gestures still work during warmup.
+bool
+sil_hit(float cx, float cy)
+{
+	std::lock_guard<std::mutex> lock(g_sil.mtx);
+	if (!g_sil.ready || g_sil.covW <= 0 || g_sil.covH <= 0 || g_sil.zoneW <= 0 ||
+	    g_sil.zoneH <= 0)
+		return true;  // not measured yet → don't block input
+	const float zx = cx - (float)g_sil.zoneX;
+	const float zy = cy - (float)g_sil.zoneY;
+	if (zx < 0.0f || zy < 0.0f || zx >= (float)g_sil.zoneW || zy >= (float)g_sil.zoneH)
+		return false;  // outside the tiger zone (e.g. the top-25% bubble band)
+	const int sx = (int)(zx * (float)g_sil.covW / (float)g_sil.zoneW);
+	const int sy = (int)(zy * (float)g_sil.covH / (float)g_sil.zoneH);
+	const int R = 2;  // dilation radius in coverage px — forgiving near edges
+	for (int dy = -R; dy <= R; ++dy) {
+		for (int dx = -R; dx <= R; ++dx) {
+			const int x = sx + dx, y = sy + dy;
+			if (x < 0 || y < 0 || x >= g_sil.covW || y >= g_sil.covH) continue;
+			if (g_sil.bits[(size_t)y * g_sil.covW + x]) return true;
+		}
+	}
+	return false;
+}
 
 // ── XR_EXT_view_rig (#396 W7) ───────────────────────────────────────────────
 // When the runtime advertises XR_EXT_view_rig, chain an XrDisplayRigEXT on
@@ -420,6 +469,134 @@ build_splat_model(float angle)
 	// pitch (the billboard owns heading; tilting the avatar looks wrong).
 	return mat4_mul(place,
 	    mat4_mul(push, mat4_mul(roty, mat4_mul(flip, mat4_mul(scale, recenter)))));
+}
+
+// Lazily (re)create the silhouette scratch image + host-visible readback buffer
+// + a transfer command pool. Sized to the downscaled coverage; resized on demand.
+bool
+ensure_sil_targets(uint32_t w, uint32_t h)
+{
+	if (g_sil_image.image != VK_NULL_HANDLE && g_sil_image.width == w &&
+	    g_sil_image.height == h)
+		return true;
+	if (g_sil_image.image != VK_NULL_HANDLE) modelDestroyImage(g_vk_device, g_sil_image);
+	if (g_sil_readback.buffer != VK_NULL_HANDLE) {
+		if (g_sil_mapped) {
+			vkUnmapMemory(g_vk_device, g_sil_readback.memory);
+			g_sil_mapped = nullptr;
+		}
+		modelDestroyBuffer(g_vk_device, g_sil_readback);
+	}
+	g_sil_image = modelCreateImage2D(g_vk_device, g_vk_phys_device, w, h,
+	    VK_FORMAT_R8G8B8A8_UNORM,
+	    VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+	if (g_sil_image.image == VK_NULL_HANDLE) return false;
+	g_sil_readback = modelCreateBuffer(g_vk_device, g_vk_phys_device, (VkDeviceSize)w * h * 4,
+	    VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+	    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+	if (g_sil_readback.buffer == VK_NULL_HANDLE) return false;
+	if (vkMapMemory(g_vk_device, g_sil_readback.memory, 0, (VkDeviceSize)w * h * 4, 0,
+	                &g_sil_mapped) != VK_SUCCESS)
+		return false;
+	if (g_sil_pool == VK_NULL_HANDLE) {
+		VkCommandPoolCreateInfo pci = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+		pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+		pci.queueFamilyIndex = g_vk_queue_family;
+		if (vkCreateCommandPool(g_vk_device, &pci, nullptr, &g_sil_pool) != VK_SUCCESS)
+			return false;
+	}
+	return g_sil_mapped != nullptr;
+}
+
+// Render the tiger (UNION over the rendered views — first+last, like the Windows
+// leg) into the scratch image, read alpha back, publish the coverage bitmap.
+// windows/main.cpp UpdateSilhouette, adapted: the scratch maps to the ZONE rect
+// (bottom-75%), so renderEye fills the WHOLE scratch (no stale top band). imgW/
+// imgH MUST match the atlas dims so the renderer's internal target isn't
+// reallocated (same caveat as the main eye render). (#568)
+void
+update_silhouette(uint32_t imgW, uint32_t imgH, int zoneX, int zoneY, int zoneW, int zoneH,
+                  const Mat4 *evMs, const Mat4 *projMs, const float *clipFars, uint32_t numViews)
+{
+	if (zoneW <= 0 || zoneH <= 0 || numViews == 0) return;
+	uint32_t w = (uint32_t)zoneW / 4;
+	if (w < 64) w = 64; else if (w > 512) w = 512;
+	uint32_t h = (uint32_t)zoneH / 4;
+	if (h < 64) h = 64; else if (h > 512) h = 512;
+	if (!ensure_sil_targets(w, h)) return;
+
+	const uint32_t idx[2] = {0, numViews - 1};  // outermost views bound the disparity spread
+	const uint32_t passes = (numViews > 1) ? 2u : 1u;
+	std::vector<uint8_t> uni((size_t)w * h, 0);
+
+	for (uint32_t p = 0; p < passes; ++p) {
+		const uint32_t v = idx[p];
+		// Draw the tiger into the whole scratch (zone-framed projM → 1:1 with the
+		// zone rect). Transparent bg → alpha is the silhouette.
+		g_model.renderEye(g_sil_image.image, VK_FORMAT_R8G8B8A8_UNORM, imgW, imgH,
+		    0, 0, w, h, evMs[v].m, projMs[v].m, /*transparentBg*/ true, clipFars[v]);
+		// renderEye leaves the scratch in COLOR_ATTACHMENT_OPTIMAL → copy to host.
+		VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+		ai.commandPool = g_sil_pool;
+		ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+		ai.commandBufferCount = 1;
+		VkCommandBuffer cmd = VK_NULL_HANDLE;
+		if (vkAllocateCommandBuffers(g_vk_device, &ai, &cmd) != VK_SUCCESS) return;
+		VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+		bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+		vkBeginCommandBuffer(cmd, &bi);
+		VkImageMemoryBarrier to_src = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+		to_src.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+		to_src.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+		to_src.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+		to_src.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+		to_src.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		to_src.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		to_src.image = g_sil_image.image;
+		to_src.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+		vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+		    VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &to_src);
+		VkBufferImageCopy region = {};
+		region.bufferRowLength = w;
+		region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+		region.imageExtent = {w, h, 1};
+		vkCmdCopyImageToBuffer(cmd, g_sil_image.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+		    g_sil_readback.buffer, 1, &region);
+		vkEndCommandBuffer(cmd);
+		VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
+		si.commandBufferCount = 1;
+		si.pCommandBuffers = &cmd;
+		vkQueueSubmit(g_vk_queue, 1, &si, VK_NULL_HANDLE);
+		vkQueueWaitIdle(g_vk_queue);
+		vkFreeCommandBuffers(g_vk_device, g_sil_pool, 1, &cmd);
+
+		const uint8_t *px = (const uint8_t *)g_sil_mapped;
+		if (!px) return;
+		for (uint32_t i = 0; i < w * h; ++i) {
+			const uint8_t a = px[i * 4 + 3];
+			if (a > uni[i]) uni[i] = a;
+		}
+	}
+
+	uint32_t covered = 0;
+	for (uint32_t i = 0; i < w * h; ++i)
+		if (uni[i] > 40) ++covered;
+	static bool s_sil_logged = false;
+	if (!s_sil_logged && covered > 0) {
+		LOGI("silhouette: cov %ux%u zone=(%d,%d %dx%d) covered=%u%% (gesture gate live)", w, h,
+		     zoneX, zoneY, zoneW, zoneH, covered * 100u / (w * h));
+		s_sil_logged = true;
+	}
+	std::lock_guard<std::mutex> lock(g_sil.mtx);
+	g_sil.bits.resize((size_t)w * h);
+	for (uint32_t i = 0; i < w * h; ++i) g_sil.bits[i] = (uni[i] > 40) ? 1 : 0;
+	g_sil.covW = (int)w;
+	g_sil.covH = (int)h;
+	g_sil.zoneX = zoneX;
+	g_sil.zoneY = zoneY;
+	g_sil.zoneW = zoneW;
+	g_sil.zoneH = zoneH;
+	g_sil.ready = true;
 }
 
 // ─── OpenXR-Android bring-up (reused verbatim from cube_handle_vk_android) ─
@@ -1318,7 +1495,7 @@ render_frame()
 			// is needed, unlike the panel-relative Windows path). Only chase while
 			// eye tracking is LOCKED; hold facing-forward (yaw 0) during warmup.
 			// Time-based exponential smoothing → frame-rate independent.
-			static constexpr float FACE_YAW_SIGN = -1.0f;  // viewer-confirmed; flip if reversed
+			static constexpr float FACE_YAW_SIGN = 1.0f;  // NP02J-confirmed (David, 2026-06-14)
 			static float s_face_yaw = 0.0f;
 			{
 				float cx = 0.0f, cz = 0.0f;
@@ -1371,6 +1548,13 @@ render_frame()
 			// off-axis vertical framing → the avatar rides high ("only legs").
 			// Mirrors the Windows zones path: setPlainViewConvention(zonesFrame).
 			g_model.setPlainViewConvention(g_has_view_rig);
+
+			// Per-view matrices captured for the silhouette pass (gesture gate /
+			// click-through) after the atlas render — same evM/projM/clip the tiger
+			// is drawn with, so the coverage matches the on-screen tiger exactly.
+			Mat4 sil_evM[kViewCount];
+			Mat4 sil_projM[kViewCount];
+			float sil_clip[kViewCount] = {0};
 
 			// ONE atlas swapchain (multiview-tiling invariant): acquire once, render
 			// each tile into its (cols×rows) layout offset, release once. All views
@@ -1443,6 +1627,10 @@ render_frame()
 						const float aspect = (float)tile_w / (float)tile_h;
 						projM = projection_matrix_from_fov(views[i].fov, aspect, 0.01f, 100.0f);
 					}
+					sil_evM[i] = evM;
+					sil_projM[i] = projM;
+					sil_clip[i] = clip_far;
+
 					// Render tile i into its (tile_x,tile_y) sub-rect of the atlas.
 					// #568: transparentBg=true → the renderer clears the tile to
 					// premultiplied (0,0,0,0) and skips the skybox, so everything
@@ -1471,6 +1659,15 @@ render_frame()
 				log_xr_result("xrAcquire/WaitSwapchainImage", res);
 			}
 			rendered = (res == XR_SUCCESS);
+			// Refresh the gesture/click-through silhouette (throttled ~10 Hz —
+			// the tiger moves slowly and only touch-DOWN samples it; each tick is
+			// 1-2 extra downscaled model draws + a readback). Zone frames only.
+			if (rendered && zones_frame && (g_frame_count % 6) == 0) {
+				update_silhouette(g_views[0].width, g_views[0].height,
+				    tiger_zone.rect.offset.x, tiger_zone.rect.offset.y,
+				    tiger_zone.rect.extent.width, tiger_zone.rect.extent.height,
+				    sil_evM, sil_projM, sil_clip, view_count);
+			}
 		} else {
 			log_xr_result("xrLocateViews", res);
 		}
@@ -1576,6 +1773,16 @@ destroy_all()
 		g_model_ready = false;
 	}
 	hud_bar_destroy(g_bubble);
+	if (g_sil_mapped) {
+		vkUnmapMemory(g_vk_device, g_sil_readback.memory);
+		g_sil_mapped = nullptr;
+	}
+	if (g_sil_readback.buffer != VK_NULL_HANDLE) modelDestroyBuffer(g_vk_device, g_sil_readback);
+	if (g_sil_image.image != VK_NULL_HANDLE) modelDestroyImage(g_vk_device, g_sil_image);
+	if (g_sil_pool != VK_NULL_HANDLE) {
+		vkDestroyCommandPool(g_vk_device, g_sil_pool, nullptr);
+		g_sil_pool = VK_NULL_HANDLE;
+	}
 	if (g_session != XR_NULL_HANDLE) {
 		xrDestroySession(g_session);
 		g_session = XR_NULL_HANDLE;
@@ -1689,9 +1896,24 @@ Java_com_displayxr_avatar_1vk_1android_MainActivity_nativeOnTouch(
 {
 	static float pinch_last = 0.0f;
 	static float drag_x = 0.0f, drag_y = 0.0f;
-	static bool drag_valid = false;  // a clean single-finger gesture is in progress
+	static bool drag_valid = false;       // a clean single-finger gesture is in progress
+	static bool gesture_on_tiger = false; // did this gesture start on the tiger silhouette?
 	// AMOTION_EVENT_ACTION_* values match MotionEvent.ACTION_* (0=DOWN,1=UP,2=MOVE,…).
 	constexpr int kDown = 0, kUp = 1, kMove = 2;
+
+	// Gate to the tiger: decide on the FIRST finger down whether this gesture
+	// controls the avatar (initiated over the silhouette). A gesture that began
+	// on the tiger keeps control even if the finger later slides off; one that
+	// began off it is ignored entirely (next step: pass it through to whatever
+	// is behind). Fail-open until the first coverage is published.
+	if (action == kDown) gesture_on_tiger = sil_hit(x0, y0);
+	if (!gesture_on_tiger) {
+		if (action == kUp) {
+			drag_valid = false;
+			pinch_last = 0.0f;
+		}
+		return;
+	}
 
 	if (count >= 2) {
 		// ── two fingers: pinch-to-zoom (scale around the auto-fit size) ──
