@@ -60,6 +60,14 @@ class MainActivity : NativeActivity() {
     // True once the OpenXR instance is up (runtime reached).
     private external fun nativeXrReady(): Boolean
 
+    // True when debug.dxr.overlay=1: the runtime weaves the tiger into a
+    // service-owned overlay over the live launcher, so this Activity should step
+    // to the background (keep-alive foreground service keeps the render loop off
+    // the freezer) instead of sitting on top and pausing the launcher.
+    private external fun nativeOverlayMode(): Boolean
+
+    private var overlayEntered = false
+
     // Touch bridge: one finger = camera controls (depth dolly + lateral strafe),
     // two-finger pinch = zoom (all handled native-side). The MonadoView overlay
     // forwards events here.
@@ -125,12 +133,39 @@ class MainActivity : NativeActivity() {
                         return
                     }
                     val ready = try { nativeXrReady() } catch (_: Throwable) { false }
-                    if (ready) return
+                    if (ready) {
+                        maybeEnterOverlay()
+                        return
+                    }
                     if (tries++ < 15) handler.postDelayed(this, 1000)
                 }
             },
             2000,
         )
+    }
+
+    // #558 overlay mode: once the session is up, start a keep-alive foreground
+    // service (exempts the process from the freezer) and step to the background
+    // so the launcher resumes + stays interactive while the runtime weaves the
+    // tiger into its service overlay on top. One-shot.
+    private fun maybeEnterOverlay() {
+        if (overlayEntered) return
+        val overlay = try { nativeOverlayMode() } catch (_: Throwable) { false }
+        if (!overlay) return
+        overlayEntered = true
+        try {
+            OverlayKeepAliveService.start(this)
+        } catch (t: Throwable) {
+            android.util.Log.e("avatar", "keep-alive service start failed", t)
+        }
+        // Brief beat so the runtime's overlay surface is live before we vacate the
+        // foreground; the native render loop keeps drawing with no window.
+        Handler(Looper.getMainLooper()).postDelayed({
+            if (!isFinishing) {
+                android.util.Log.i("avatar", "overlay mode: moveTaskToBack — launcher resumes")
+                moveTaskToBack(true)
+            }
+        }, 600)
     }
 
     private fun showRuntimeMissingDialog() {
@@ -226,6 +261,10 @@ class MainActivity : NativeActivity() {
         try {
             (getSystemService(Context.DISPLAY_SERVICE) as DisplayManager)
                 .unregisterDisplayListener(displayListener)
+        } catch (_: Throwable) {
+        }
+        try {
+            OverlayKeepAliveService.stop(this)
         } catch (_: Throwable) {
         }
         super.onDestroy()

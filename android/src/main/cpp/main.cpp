@@ -105,6 +105,15 @@ bool g_session_running = false;
 bool g_exit_requested = false;
 XrSpace g_app_space = XR_NULL_HANDLE;
 
+// Overlay mode (#558): the runtime weaves the tiger into a service-owned
+// TYPE_APPLICATION_OVERLAY above the LIVE launcher. The avatar then relinquishes
+// the foreground (MainActivity.moveTaskToBack) so the launcher resumes + stays
+// interactive, and a keep-alive foreground service keeps this process off the
+// Android freezer. In that state the NativeActivity has no window, but in OOP we
+// render to the IPC swapchain (not our own window) — so keep rendering anyway.
+// Gated on `setprop debug.dxr.overlay 1`. Read once at android_main start.
+bool g_overlay_mode = false;
+
 // ── Display rendering-mode switching (XR_EXT_display_info) ─────────────────
 // The runtime advertises a set of display rendering modes (e.g. 3D-stereo,
 // 2D-mono); `setprop debug.dxr.mode N` selects one. Mode requests are async —
@@ -1880,6 +1889,19 @@ Java_com_displayxr_avatar_1vk_1android_MainActivity_nativeXrReady(
 	return (g_instance != XR_NULL_HANDLE) ? JNI_TRUE : JNI_FALSE;
 }
 
+// #558 overlay mode (debug.dxr.overlay): when set, MainActivity starts a
+// keep-alive foreground service + moveTaskToBack so the launcher resumes and the
+// tiger floats on the runtime's service overlay. Reads the prop directly so it
+// doesn't race android_main's read on the render thread.
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_displayxr_avatar_1vk_1android_MainActivity_nativeOverlayMode(
+    JNIEnv * /*env*/, jobject /*thiz*/)
+{
+	char prop[PROP_VALUE_MAX] = {};
+	return (__system_property_get("debug.dxr.overlay", prop) > 0 && prop[0] == '1') ? JNI_TRUE
+	                                                                                 : JNI_FALSE;
+}
+
 // Touch bridge, fed from Java. The runtime's MonadoView overlay is the only
 // window that receives touch (it covers our NativeActivity); David's #499 design
 // forwards each event to the host Activity via dispatchTouchEvent. But a
@@ -1970,6 +1992,15 @@ extern "C" void
 android_main(struct android_app *app)
 {
 	LOGI("avatar_vk_android: android_main entered");
+	{
+		// #558 overlay mode: render while backgrounded so the tiger stays on the
+		// service overlay over the live launcher. `setprop debug.dxr.overlay 1`.
+		char prop[PROP_VALUE_MAX] = {};
+		if (__system_property_get("debug.dxr.overlay", prop) > 0 && prop[0] == '1') {
+			g_overlay_mode = true;
+			LOGI("overlay mode ON: render while backgrounded (foreground-service model)");
+		}
+	}
 	app->onAppCmd = handle_cmd;
 	// Touch is NOT consumed via app->onInputEvent: the runtime's MonadoView
 	// overlay covers our window, so a NativeActivity never sees native input.
@@ -2025,7 +2056,15 @@ android_main(struct android_app *app)
 			// runtime only advances READY->SYNCHRONIZED on the first
 			// xrBeginFrame, so gating on SYNCHRONIZED+ deadlocks at READY ->
 			// black (David's #507). render_frame honors shouldRender.
-			if (app->window != nullptr && g_session_running) {
+			//
+			// #558 overlay mode: once bring-up is done (g_instance up), keep
+			// rendering even with no NativeActivity window — the avatar has
+			// stepped to the background so the launcher is live, and in OOP we
+			// render to the IPC swapchain, not our own window. The keep-alive
+			// foreground service prevents the process from being frozen.
+			const bool have_window = (app->window != nullptr);
+			const bool overlay_bg = g_overlay_mode && g_instance != XR_NULL_HANDLE;
+			if (g_session_running && (have_window || overlay_bg)) {
 				render_frame();
 			}
 		}

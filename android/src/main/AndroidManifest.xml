@@ -43,6 +43,14 @@
          dims and the session pauses. The OOP runtime owns eye tracking/camera. -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
 
+    <!-- #558 overlay mode: a keep-alive foreground service holds the process
+         foreground (off the freezer) while the Activity steps to the background,
+         so the render loop keeps weaving the tiger into the runtime's overlay
+         over the live launcher. specialUse: it's a process-keep-alive for an
+         OpenXR client, not one of the predefined FGS categories. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+
     <application
         android:allowBackup="false"
         android:icon="@mipmap/ic_launcher"
@@ -64,5 +72,15 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- #558 overlay mode keep-alive (see OverlayKeepAliveService.kt). -->
+        <service
+            android:name=".OverlayKeepAliveService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="displayxr_avatar_overlay_keepalive" />
+        </service>
     </application>
 </manifest>
