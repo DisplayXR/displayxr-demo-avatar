@@ -385,6 +385,35 @@ projection_matrix_from_fov(const XrFovf &fov, float aspect_w_over_h, float near_
 	return p;
 }
 
+// #568: derive the zone sub-frustum from the full-canvas off-axis FOV. The
+// Android OOP runtime returns a FULL-CANVAS view_rig FOV — the zone-scoped
+// locate's canvas rebase (ipc_server_handler u_canvas_apply_to_metrics) is gated
+// on Windows-only D3D11 window metrics, so it no-ops on Android — so the app
+// reframes the Kooima to the zone rect itself: take the linear sub-range of the
+// tangent space the zone rect covers. Off-axis (stereo) skew is preserved (a
+// linear sub-range of tangents). canvas px (cw,ch) is y-down; FOV angleUp=+Y so
+// canvas TOP (y=0)→angleUp, BOTTOM (y=ch)→angleDown.
+static XrFovf
+zone_subfrustum_fov(const XrFovf &full, uint32_t cw, uint32_t ch,
+                    int32_t zx, int32_t zy, int32_t zw, int32_t zh)
+{
+	if (cw == 0 || ch == 0) {
+		return full;
+	}
+	const float tl = std::tan(full.angleLeft), tr = std::tan(full.angleRight);
+	const float td = std::tan(full.angleDown), tu = std::tan(full.angleUp);
+	const float fx0 = (float)zx / (float)cw;
+	const float fx1 = (float)(zx + zw) / (float)cw;
+	const float fy0 = (float)zy / (float)ch;        // zone top fraction
+	const float fy1 = (float)(zy + zh) / (float)ch; // zone bottom fraction
+	XrFovf out;
+	out.angleLeft = std::atan(tl + fx0 * (tr - tl));
+	out.angleRight = std::atan(tl + fx1 * (tr - tl));
+	out.angleUp = std::atan(tu + fy0 * (td - tu));
+	out.angleDown = std::atan(tu + fy1 * (td - tu));
+	return out;
+}
+
 Mat4
 mat4_identity()
 {
@@ -1024,18 +1053,29 @@ load_model_path(const char *path)
 		if (ext[2] > maxe) {
 			maxe = ext[2];
 		}
-		// Normalize to kTargetSize metres. Framing depends on the locate path
-		// (#396 W7): under XR_EXT_view_rig the world is display-anchored — the
-		// virtual display plane sits at the identity rig pose (origin), so the
-		// model frames AT screen depth with NO forward push, and the rig's
-		// virtual display height fits the scaled model (extent_y * 1.4, the
-		// desktop auto-fit factor — model fills ~71% of screen height).
-		// Without the rig keep the legacy fixed push (raw views, 0.01/100 clips).
+		// #568: recenter on the ANIMATED visual centre, not the static AABB
+		// centre. The tiger plays a clip; its animated mass centre differs from
+		// the bind-pose AABB centre, so recentering by the static centre rides
+		// the animated tiger high (top truncated). getAnimatedAnchor is the
+		// clip-wide animated centre (visual-centre corrected) — the Android
+		// analog of Windows positioning the rig at the box centre after the
+		// animation starts. Falls back to the static centre if unavailable.
+		float anch[3];
+		if (g_model.getAnimatedAnchor(anch)) {
+			g_scene_center[0] = anch[0];
+			g_scene_center[1] = anch[1];
+			g_scene_center[2] = anch[2];
+		}
 		g_fit_scale = (maxe > 1e-4f) ? kTargetSize / maxe : 1.0f;
 		g_scene_scale.store(g_fit_scale, std::memory_order_relaxed);
 		g_scene_push.store(g_has_view_rig ? 0.0f : 0.45f, std::memory_order_relaxed);
-		const float vh = ext[1] * g_fit_scale * 1.4f;
-		g_rig_vh = (vh > 1e-3f) ? vh : kTargetSize * 1.4f;
+		// 90% fill: the avatar occupies 90% of the virtual-display (zone) height
+		// at start — vHeight = modelHeight / 0.90 = modelHeight × 1.111 (Windows
+		// kAutoFitVerticalComfort). The model is at WORLD scale (ext[1] m tall),
+		// NOT scaled by g_fit_scale, so vh = ext[1] × 1.111 — the old
+		// ext[1]×g_fit_scale×1.4 conflated an unapplied scale → ~76% + off.
+		const float vh = ext[1] * 1.111f;
+		g_rig_vh = (vh > 1e-3f) ? vh : kTargetSize * 1.111f;
 		LOGI("scene center=(%.2f,%.2f,%.2f) extent=(%.2f,%.2f,%.2f) push=%.2f rig_vh=%.2f",
 		     g_scene_center[0], g_scene_center[1], g_scene_center[2],
 		     ext[0], ext[1], ext[2], g_scene_push.load(std::memory_order_relaxed), g_rig_vh);
@@ -1260,14 +1300,6 @@ render_frame()
 			DXR_HW_DBG_ONCE("first xrLocateViews success");
 			submitted_view_count = view_count;
 			if (g_has_view_rig) {
-				static bool rig_logged = false;
-				if (!rig_logged) {
-					rig_logged = true;
-					LOGI("view_rig: located=%u raw_eyes=%u tracking=%d canvas=%dx%dpx %.3fx%.3fm",
-					     located, view_raw.eyeCountOutput, (int)view_raw.isTracking,
-					     view_raw.canvasRectPx.extent.width, view_raw.canvasRectPx.extent.height,
-					     view_raw.canvasSizeMeters.width, view_raw.canvasSizeMeters.height);
-				}
 				// Live window px for the button bar (tap → fraction mapping
 				// and bar aspect) — tracks rotation via the raw channel.
 				if (view_raw.canvasRectPx.extent.width > 0 && view_raw.canvasRectPx.extent.height > 0) {
@@ -1292,6 +1324,16 @@ render_frame()
 					dw = g_views[0].width / cols;
 					dh = g_views[0].height / rows;
 				}
+				// #568: under display-zones the runtime frames the Kooima FOV to the
+				// ZONE rect (bottom-75%), so the render tile must match the ZONE
+				// aspect, not the full canvas — otherwise a full-window-aspect tile
+				// is scaled into the shorter zone rect → vertical squish. Size from
+				// the zone extent (== xrGetDisplayZoneRecommendedViewSizeEXT, which
+				// returns the rect extent 1:1).
+				if (zones_frame) {
+					dw = (uint32_t)tiger_zone.rect.extent.width;
+					dh = (uint32_t)tiger_zone.rect.extent.height;
+				}
 				const float sx = (mode < 8 && g_rmode_scale_x[mode] > 0.0f) ? g_rmode_scale_x[mode] : 1.0f;
 				const float sy = (mode < 8 && g_rmode_scale_y[mode] > 0.0f) ? g_rmode_scale_y[mode] : 1.0f;
 				tile_w = (uint32_t)((float)dw * sx);
@@ -1310,9 +1352,33 @@ render_frame()
 			        ? g_user_yaw.load(std::memory_order_relaxed)
 			        : (float)(g_frame_count - g_spin_base.load(std::memory_order_relaxed)) *
 			              g_spin_speed;
+			// #568: track the ANIMATED visual anchor each frame so the avatar
+			// stays centred in the zone as the clip plays — the load-time static
+			// AABB centre mis-centres the animated tiger (rides high / top-
+			// truncated). getAnimatedAnchor is a smoothed live animated-centroid
+			// (valid only after the first animated frame, hence per-frame here, not
+			// at load). Matches Windows positioning the rig at the animated box
+			// centre. build_splat_model below recenters by g_scene_center.
+			{
+				float anch[3];
+				if (g_model.getAnimatedAnchor(anch)) {
+					g_scene_center[0] = anch[0];
+					g_scene_center[1] = anch[1];
+					g_scene_center[2] = anch[2];
+				}
+			}
 			const Mat4 splat_model = build_splat_model(yaw);
 			// Advance glTF animation (bind pose if the model has none). ~60 fps dt.
 			g_model.updateAnimation(1.0f / 60.0f);
+
+			// #568 rig framing: under XR_EXT_view_rig the XrView pose is already
+			// render-ready (off-axis Kooima), so the renderer must consume it in
+			// the PLAIN convention — no view-stage Y-flip; the Vulkan Y-flip is the
+			// negative-height viewport in renderEye. Without this the legacy
+			// convention (which expects a Y-mirrored display pose) mis-applies the
+			// off-axis vertical framing → the avatar rides high ("only legs").
+			// Mirrors the Windows zones path: setPlainViewConvention(zonesFrame).
+			g_model.setPlainViewConvention(g_has_view_rig);
 
 			// ONE atlas swapchain (multiview-tiling invariant): acquire once, render
 			// each tile into its (cols×rows) layout offset, release once. All views
@@ -1345,7 +1411,33 @@ render_frame()
 						const float ez = rig_local_eye_z(rig_pose, views[i].pose.position);
 						const float near_z = (ez - rig_vh > 1.0e-4f) ? (ez - rig_vh) : 1.0e-4f;
 						const float far_z = ez + 1000.0f * rig_vh;
-						projM = projection_matrix_from_fov(views[i].fov, -1.0f, near_z, far_z);
+						XrFovf eff_fov = views[i].fov;
+						// #568: the Android OOP runtime returns a FULL-CANVAS rig FOV
+						// (its zone canvas rebase is D3D11-gated → no-op on Android),
+						// so reframe the Kooima to the zone rect here; otherwise the
+						// full-window-framed content squishes into the shorter zone.
+						// Guard: only when the returned FOV aspect is closer to the
+						// full canvas than the zone — so this is a no-op (no double-
+						// apply) if the runtime later zone-frames the FOV itself.
+						if (zones_frame) {
+							const uint32_t cw = g_win_px_w.load(std::memory_order_relaxed);
+							const uint32_t ch = g_win_px_h.load(std::memory_order_relaxed);
+							if (cw > 0 && ch > 0 && tiger_zone.rect.extent.height > 0) {
+								const float tw = std::tan(eff_fov.angleRight) - std::tan(eff_fov.angleLeft);
+								const float th = std::tan(eff_fov.angleUp) - std::tan(eff_fov.angleDown);
+								const float fov_aspect = (th != 0.0f) ? tw / th : 0.0f;
+								const float canvas_aspect = (float)cw / (float)ch;
+								const float zone_aspect = (float)tiger_zone.rect.extent.width /
+								                          (float)tiger_zone.rect.extent.height;
+								if (fabsf(fov_aspect - canvas_aspect) < fabsf(fov_aspect - zone_aspect)) {
+									eff_fov = zone_subfrustum_fov(
+									    views[i].fov, cw, ch,
+									    tiger_zone.rect.offset.x, tiger_zone.rect.offset.y,
+									    tiger_zone.rect.extent.width, tiger_zone.rect.extent.height);
+								}
+							}
+						}
+						projM = projection_matrix_from_fov(eff_fov, -1.0f, near_z, far_z);
 					} else {
 						const float aspect = (float)tile_w / (float)tile_h;
 						projM = projection_matrix_from_fov(views[i].fov, aspect, 0.01f, 100.0f);
