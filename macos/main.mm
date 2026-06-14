@@ -1950,6 +1950,52 @@ static void RenderPlaceholder(VkDevice dev, VkQueue queue, VkCommandPool pool,
     vkFreeCommandBuffers(dev, pool, 1, &cmd);
 }
 
+// Clear the ENTIRE acquired swapchain image before a partial-tile render
+// (INV-4.7). The avatar is confined to the bottom band, so the top band is
+// never drawn by renderEye; without this clear that band is undefined GPU
+// memory — opaque magenta on MoltenVK — which the runtime blits into the atlas
+// and a transparent flat-2D Local2D zone then reveals instead of the desktop.
+// Clears to (0,0,0,0) in transparent-bg mode (else opaque black) and leaves the
+// image in COLOR_ATTACHMENT_OPTIMAL, the layout renderEye's non-first-view blit
+// expects (so the cleared band survives the per-eye blits that follow).
+static void ClearSwapchainImage(VkDevice dev, VkQueue queue, VkCommandPool pool,
+                                VkImage image, bool transparentBg) {
+    VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    ai.commandPool = pool; ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; ai.commandBufferCount = 1;
+    VkCommandBuffer cmd;
+    vkAllocateCommandBuffers(dev, &ai, &cmd);
+    VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cmd, &bi);
+
+    VkImageMemoryBarrier barrier = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    barrier.srcAccessMask = 0; barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED; barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED; barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = image; barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        0, 0, nullptr, 0, nullptr, 1, &barrier);
+
+    VkClearColorValue cc = transparentBg ? VkClearColorValue{{0.0f, 0.0f, 0.0f, 0.0f}}
+                                         : VkClearColorValue{{0.0f, 0.0f, 0.0f, 1.0f}};
+    VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vkCmdClearColorImage(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &cc, 1, &range);
+
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barrier.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+
+    vkEndCommandBuffer(cmd);
+    VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.commandBufferCount = 1; si.pCommandBuffers = &cmd;
+    vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE);
+    vkQueueWaitIdle(queue);
+    vkFreeCommandBuffers(dev, pool, 1, &cmd);
+}
+
 // ============================================================================
 // Bundled-scene auto-load
 // ============================================================================
@@ -2905,6 +2951,13 @@ int main(int argc, char** argv) {
 
                             if (g_modelRenderer.hasModel()) {
                                 const bool tbg = g_transparentBg.load();
+                                // INV-4.7: the avatar only draws the bottom band of
+                                // each tile; clear the full image first so the
+                                // undrawn top band is defined (transparent) instead
+                                // of uninitialized magenta the speech-bubble zone
+                                // would reveal.
+                                ClearSwapchainImage(vkDevice, graphicsQueue, cmdPool,
+                                                    targetImage, tbg);
                                 for (int eye = 0; eye < eyeCount; eye++) {
                                     // Transparent mode → cull content behind the ZDP
                                     // (view-space far = eye→display distance, the same
