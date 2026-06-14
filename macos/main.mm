@@ -1106,8 +1106,6 @@ static void PollEvents(AppXrSession& xr);
 static bool BeginFrame(AppXrSession& xr, XrFrameState& frameState);
 static bool AcquireSwapchainImage(AppXrSession& xr, uint32_t& imageIndex);
 static void ReleaseSwapchainImage(AppXrSession& xr);
-static void EndFrame(AppXrSession& xr, XrTime displayTime,
-    XrCompositionLayerProjectionView* projViews, uint32_t viewCount);
 static void CleanupOpenXR(AppXrSession& xr);
 
 // ============================================================================
@@ -1876,26 +1874,6 @@ static bool AcquireSwapchainImage(AppXrSession& xr, uint32_t& imageIndex) {
 static void ReleaseSwapchainImage(AppXrSession& xr) {
     XrSwapchainImageReleaseInfo ri = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
     xrReleaseSwapchainImage(xr.swapchain.swapchain, &ri);
-}
-
-static void EndFrame(AppXrSession& xr, XrTime displayTime,
-    XrCompositionLayerProjectionView* projViews, uint32_t viewCount) {
-    XrCompositionLayerProjection layer = {XR_TYPE_COMPOSITION_LAYER_PROJECTION};
-    layer.space = xr.localSpace;
-    // Blend with source alpha so transparent-bg regions (alpha<1) composite over
-    // the desktop. On the macOS Metal compositor transparency keys off the cocoa
-    // binding flag (not layerFlags / blend mode), so environmentBlendMode stays
-    // OPAQUE per the gauss precedent — but the flag is correct per the OpenXR
-    // contract and harmless when opaque (alpha=1).
-    layer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
-    layer.viewCount = viewCount;
-    layer.views = projViews;
-    const XrCompositionLayerBaseHeader* layers[] = {(const XrCompositionLayerBaseHeader*)&layer};
-    XrFrameEndInfo ei = {XR_TYPE_FRAME_END_INFO};
-    ei.displayTime = displayTime;
-    ei.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
-    ei.layerCount = 1; ei.layers = layers;
-    xrEndFrame(xr.session, &ei);
 }
 
 static void CleanupOpenXR(AppXrSession& xr) {
