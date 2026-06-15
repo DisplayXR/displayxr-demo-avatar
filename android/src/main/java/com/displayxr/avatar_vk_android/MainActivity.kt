@@ -153,6 +153,12 @@ class MainActivity : NativeActivity() {
         val overlay = try { nativeOverlayMode() } catch (_: Throwable) { false }
         if (!overlay) return
         overlayEntered = true
+        // ZTE/MyOS aggressively FREEZES backgrounded processes
+        // (CpuFreezerManagerServiceV2) even with a foreground service — which
+        // suspends our render + eye-tracking loop, so the tiger stops following
+        // the viewer. The battery-optimization (doze) allowlist exempts us from
+        // the freeze; request it once on entering overlay mode.
+        requestBatteryExemption()
         try {
             OverlayKeepAliveService.start(this)
         } catch (t: Throwable) {
@@ -166,6 +172,25 @@ class MainActivity : NativeActivity() {
                 moveTaskToBack(true)
             }
         }, 600)
+    }
+
+    // Ask the system to exempt us from battery optimization / doze (the allowlist
+    // that also lifts ZTE's CpuFreezerManagerServiceV2 background freeze). One-shot
+    // system prompt; no-op if already exempt. Without this the overlay tiger keeps
+    // weaving but stops head-tracking once the OS freezes us a minute in.
+    private fun requestBatteryExemption() {
+        try {
+            val pm = getSystemService(Context.POWER_SERVICE) as android.os.PowerManager
+            if (pm.isIgnoringBatteryOptimizations(packageName)) return
+            startActivity(
+                Intent(
+                    android.provider.Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                    android.net.Uri.parse("package:$packageName"),
+                ),
+            )
+        } catch (t: Throwable) {
+            android.util.Log.w("avatar", "battery-optimization exemption request failed", t)
+        }
     }
 
     private fun showRuntimeMissingDialog() {

@@ -51,6 +51,12 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
 
+    <!-- #558 overlay mode: ZTE/MyOS's CpuFreezerManagerServiceV2 freezes a
+         backgrounded process even with a foreground service, suspending the
+         render + head-tracking loop. The battery-optimization (doze) allowlist
+         lifts that freeze; MainActivity requests it on entering overlay mode. -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+
     <application
         android:allowBackup="false"
         android:icon="@mipmap/ic_launcher"
