@@ -158,7 +158,7 @@ class MainActivity : NativeActivity() {
         // suspends our render + eye-tracking loop, so the tiger stops following
         // the viewer. The battery-optimization (doze) allowlist exempts us from
         // the freeze; request it once on entering overlay mode.
-        requestBatteryExemption()
+        requestPermissionsOnce()
         try {
             OverlayKeepAliveService.start(this)
         } catch (t: Throwable) {
@@ -172,6 +172,20 @@ class MainActivity : NativeActivity() {
                 moveTaskToBack(true)
             }
         }, 600)
+    }
+
+    // Request the two overlay-mode permissions (battery-optimization exemption +
+    // draw-over-other-apps) AT MOST ONCE, ever — persisted in SharedPreferences.
+    // Re-prompting every launch was both annoying and actively harmful: the system
+    // dialog pops up under our touchable input overlay, which ate the "Allow" tap.
+    // Asking once means a granted user is never bothered again; a user who declined
+    // can still enable both in Settings. If already granted, the inner checks no-op.
+    private fun requestPermissionsOnce() {
+        val prefs = getSharedPreferences("avatar_overlay", Context.MODE_PRIVATE)
+        if (prefs.getBoolean("perms_requested", false)) return
+        prefs.edit().putBoolean("perms_requested", true).apply()
+        requestBatteryExemption()
+        requestDrawOverlays()
     }
 
     // Ask the system to exempt us from battery optimization / doze (the allowlist
@@ -190,6 +204,25 @@ class MainActivity : NativeActivity() {
             )
         } catch (t: Throwable) {
             android.util.Log.w("avatar", "battery-optimization exemption request failed", t)
+        }
+    }
+
+    // #13 tiger touch-control: the keep-alive service hosts a TYPE_APPLICATION_OVERLAY
+    // input window over the tiger, which needs the draw-overlays grant. Ask for it
+    // once on entering overlay mode (no-op if already granted; the test recipe also
+    // pre-grants via `appops set <pkg> SYSTEM_ALERT_WINDOW allow`). Without it the
+    // service just skips the input window — the visual overlay still works.
+    private fun requestDrawOverlays() {
+        try {
+            if (android.provider.Settings.canDrawOverlays(this)) return
+            startActivity(
+                Intent(
+                    android.provider.Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                    android.net.Uri.parse("package:$packageName"),
+                ),
+            )
+        } catch (t: Throwable) {
+            android.util.Log.w("avatar", "draw-overlays permission request failed", t)
         }
     }
 

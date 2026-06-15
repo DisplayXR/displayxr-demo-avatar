@@ -57,6 +57,12 @@
          lifts that freeze; MainActivity requests it on entering overlay mode. -->
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 
+    <!-- #13 tiger touch-control: OverlayKeepAliveService hosts a small
+         TYPE_APPLICATION_OVERLAY input window over the tiger's bbox (the runtime's
+         visual overlay is FLAG_NOT_TOUCHABLE, so the tiger itself gets no touch).
+         MainActivity requests the grant on entering overlay mode. -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+
     <application
         android:allowBackup="false"
         android:icon="@mipmap/ic_launcher"

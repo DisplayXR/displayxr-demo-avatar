@@ -168,6 +168,11 @@ struct SilhouetteCoverage
 	int covW = 0, covH = 0;                           // coverage bitmap dims
 	int zoneX = 0, zoneY = 0, zoneW = 0, zoneH = 0;   // canvas-px rect the bits map to
 	bool ready = false;
+	// #13 tiger touch-control: tight bounding box of the silhouette in CANVAS px,
+	// the rect the service-hosted input overlay window is laid out to so the tiger
+	// area is touchable and everything outside it falls through to the launcher.
+	int bboxX = 0, bboxY = 0, bboxW = 0, bboxH = 0;
+	bool bbox_valid = false;                          // false when the tiger covers 0 px
 };
 SilhouetteCoverage g_sil;
 ModelImage g_sil_image = {};
@@ -200,6 +205,24 @@ sil_hit(float cx, float cy)
 		}
 	}
 	return false;
+}
+
+// #13 tiger touch-control: the tiger's current bounding box in CANVAS px (the
+// frame the service input overlay window is sized/positioned to). Returns false
+// until a non-empty silhouette is published, so the window stays collapsed during
+// warmup (captures nothing) instead of eating a default-sized rect of launcher
+// touches. Called from OverlayKeepAliveService's bbox follower.
+bool
+get_tiger_bbox(int *x, int *y, int *w, int *h)
+{
+	std::lock_guard<std::mutex> lock(g_sil.mtx);
+	if (!g_sil.ready || !g_sil.bbox_valid || g_sil.bboxW <= 0 || g_sil.bboxH <= 0)
+		return false;
+	*x = g_sil.bboxX;
+	*y = g_sil.bboxY;
+	*w = g_sil.bboxW;
+	*h = g_sil.bboxH;
+	return true;
 }
 
 // ── XR_EXT_view_rig (#396 W7) ───────────────────────────────────────────────
@@ -588,8 +611,18 @@ update_silhouette(uint32_t imgW, uint32_t imgH, int zoneX, int zoneY, int zoneW,
 	}
 
 	uint32_t covered = 0;
-	for (uint32_t i = 0; i < w * h; ++i)
-		if (uni[i] > 40) ++covered;
+	// Track the tiger's tight bbox in coverage-px while counting coverage (#13).
+	int minCx = (int)w, minCy = (int)h, maxCx = -1, maxCy = -1;
+	for (uint32_t i = 0; i < w * h; ++i) {
+		if (uni[i] > 40) {
+			++covered;
+			const int cx = (int)(i % w), cy = (int)(i / w);
+			if (cx < minCx) minCx = cx;
+			if (cy < minCy) minCy = cy;
+			if (cx > maxCx) maxCx = cx;
+			if (cy > maxCy) maxCy = cy;
+		}
+	}
 	static bool s_sil_logged = false;
 	if (!s_sil_logged && covered > 0) {
 		LOGI("silhouette: cov %ux%u zone=(%d,%d %dx%d) covered=%u%% (gesture gate live)", w, h,
@@ -605,6 +638,25 @@ update_silhouette(uint32_t imgW, uint32_t imgH, int zoneX, int zoneY, int zoneW,
 	g_sil.zoneY = zoneY;
 	g_sil.zoneW = zoneW;
 	g_sil.zoneH = zoneH;
+	// Map the coverage-px bbox back to canvas px (zone rect). Inclusive max → +1.
+	// A small pad (kept in coverage px before scaling) makes the input window a
+	// touch forgiving at the silhouette edge, matching sil_hit's R=2 dilation. (#13)
+	if (maxCx >= minCx && maxCy >= minCy) {
+		const int pad = 2;
+		int x0 = minCx - pad, y0 = minCy - pad;
+		int x1 = maxCx + 1 + pad, y1 = maxCy + 1 + pad;
+		if (x0 < 0) x0 = 0;
+		if (y0 < 0) y0 = 0;
+		if (x1 > (int)w) x1 = (int)w;
+		if (y1 > (int)h) y1 = (int)h;
+		g_sil.bboxX = zoneX + (int)((float)x0 * (float)zoneW / (float)w);
+		g_sil.bboxY = zoneY + (int)((float)y0 * (float)zoneH / (float)h);
+		g_sil.bboxW = (int)((float)(x1 - x0) * (float)zoneW / (float)w);
+		g_sil.bboxH = (int)((float)(y1 - y0) * (float)zoneH / (float)h);
+		g_sil.bbox_valid = (g_sil.bboxW > 0 && g_sil.bboxH > 0);
+	} else {
+		g_sil.bbox_valid = false;  // tiger covers nothing this frame
+	}
 	g_sil.ready = true;
 }
 
@@ -1713,7 +1765,9 @@ render_frame()
 			// bubble taller than the band → it spilled into the tiger zone and the
 			// 2D region read as ">25%" (#570). Constrain by height first, then
 			// width, whichever binds.
-			float bwf = (float)cw * 0.70f;
+			// 2/3 of the former 0.70·cw width (David: smaller bubble). Aspect-locked,
+			// so height scales with it; the height clamp below still guards landscape.
+			float bwf = (float)cw * (0.70f * 2.0f / 3.0f);
 			float bhf = bwf * bubble_aspect;
 			const float max_bh = band_h * 0.90f;  // leave a 10% margin in the band
 			if (bhf > max_bh) {
@@ -1722,7 +1776,18 @@ render_frame()
 			}
 			const int bw = (int)bwf;
 			const int bh = (int)bhf;
-			int bx0 = (int)(((float)cw - (float)bw) * 0.5f);
+			// Slide the bubble horizontally WITH the tiger on a swipe, at the same
+			// speed: the lateral drag offsets the rig by g_cam_pan_x world-units and
+			// g_rig_vh frames the tiger zone's px height, so the tiger's on-screen
+			// shift = g_cam_pan_x · (zone_h_px / g_rig_vh). Drive the bubble off the
+			// same continuous pan value (not the noisier silhouette bbox) so the two
+			// move in lockstep. Flip the sign here if it lags the wrong way. (#13)
+			const float pan = g_cam_pan_x.load(std::memory_order_relaxed);
+			const float zone_h_px = (float)ch * (1.0f - kBubbleBandFrac);
+			const float pan_px = (g_rig_vh > 1e-3f) ? pan * (zone_h_px / g_rig_vh) : 0.0f;
+			int bx0 = (int)(((float)cw - (float)bw) * 0.5f + pan_px);
+			if (bx0 < 0) bx0 = 0;
+			if (bx0 + bw > (int)cw) bx0 = (int)cw - bw;
 			int by0 = (int)((band_h - (float)bh) * 0.5f);       // centred in the band
 			const int top_margin = (int)(band_h * 0.05f);
 			if (by0 < top_margin) {
@@ -1911,10 +1976,12 @@ Java_com_displayxr_avatar_1vk_1android_MainActivity_nativeOverlayMode(
 // One finger = camera controls (depth dolly + lateral strafe, Windows parity);
 // two fingers = pinch-to-zoom. action = MotionEvent.getActionMasked(); count =
 // pointerCount.
-extern "C" JNIEXPORT void JNICALL
-Java_com_displayxr_avatar_1vk_1android_MainActivity_nativeOnTouch(
-    JNIEnv * /*env*/, jobject /*thiz*/, jint action, jint count,
-    jfloat x0, jfloat y0, jfloat x1, jfloat y1)
+// Shared touch logic in CANVAS px, fed from both paths: MainActivity's forwarded
+// MonadoView events (foreground) and the service-hosted bbox input overlay
+// (#558 overlay mode, where the Activity is backgrounded). Both report canvas px
+// — the overlay window offsets window-local coords by its origin before calling.
+static void
+handle_touch(jint action, jint count, jfloat x0, jfloat y0, jfloat x1, jfloat y1)
 {
 	static float pinch_last = 0.0f;
 	static float drag_x = 0.0f, drag_y = 0.0f;
@@ -1959,9 +2026,20 @@ Java_com_displayxr_avatar_1vk_1android_MainActivity_nativeOnTouch(
 	// (cameraPosZ). The avatar never rotates. Per-pixel gains are the on-device
 	// tuning knobs (screencap is blind — David eyeballs); flip a sign here or
 	// kPanSign / the dolly sign in the render loop if a direction feels reversed.
-	constexpr float kPanPerPx = 0.002f;    // lateral units per px (≈500px → 1 unit)
-	constexpr float kDollyPerPx = 0.004f;  // depth   units per px (≈250px → 1 unit)
+	// Lateral drag tracks the tiger 1:1 (the finger stays ON the tiger): the rig
+	// offset is in world units and g_rig_vh frames the tiger zone's pixel height,
+	// so world-units-per-px = g_rig_vh / zone_h_px. Recompute at gesture start from
+	// the live silhouette zone; fall back to the old fixed gain pre-warmup. A fixed
+	// gain (old 0.002) moved the tiger faster than the finger, so it slid off. (#13)
+	static float s_pan_per_px = 0.002f;
+	constexpr float kDollyPerPx = 0.004f;  // depth per px (unchanged; depth ≠ screen-plane)
 	if (action == kDown) {
+		int zone_h = 0;
+		{
+			std::lock_guard<std::mutex> lock(g_sil.mtx);
+			zone_h = g_sil.zoneH;
+		}
+		if (zone_h > 0 && g_rig_vh > 1e-3f) s_pan_per_px = g_rig_vh / (float)zone_h;
 		drag_x = x0;
 		drag_y = y0;
 		drag_valid = true;
@@ -1969,13 +2047,22 @@ Java_com_displayxr_avatar_1vk_1android_MainActivity_nativeOnTouch(
 		const float dx = x0 - drag_x, dy = y0 - drag_y;
 		drag_x = x0;
 		drag_y = y0;
-		g_cam_pan_x.store(g_cam_pan_x.load(std::memory_order_relaxed) + dx * kPanPerPx,
+		g_cam_pan_x.store(g_cam_pan_x.load(std::memory_order_relaxed) + dx * s_pan_per_px,
 		                  std::memory_order_relaxed);
 		g_cam_dolly_z.store(g_cam_dolly_z.load(std::memory_order_relaxed) + dy * kDollyPerPx,
 		                    std::memory_order_relaxed);
 	} else if (action == kUp) {
 		drag_valid = false;
 	}
+}
+
+// Foreground path: MonadoView events forwarded via MainActivity.dispatchTouchEvent.
+extern "C" JNIEXPORT void JNICALL
+Java_com_displayxr_avatar_1vk_1android_MainActivity_nativeOnTouch(
+    JNIEnv * /*env*/, jobject /*thiz*/, jint action, jint count,
+    jfloat x0, jfloat y0, jfloat x1, jfloat y1)
+{
+	handle_touch(action, count, x0, y0, x1, y1);
 }
 
 // Double-tap (from Java's GestureDetector) recenters the camera (pan/dolly/zoom
@@ -1986,6 +2073,55 @@ Java_com_displayxr_avatar_1vk_1android_MainActivity_nativeResetView(
     JNIEnv * /*env*/, jobject /*thiz*/)
 {
 	g_reset_view_request.store(true, std::memory_order_relaxed);
+}
+
+// ── #558 overlay-mode touch path (service-hosted bbox input overlay) ──
+// The avatar Activity is backgrounded (moveTaskToBack), so its dispatchTouchEvent
+// no longer fires and the service overlay is FLAG_NOT_TOUCHABLE. Instead
+// OverlayKeepAliveService hosts a small TYPE_APPLICATION_OVERLAY input View laid
+// out to the tiger bbox; it offsets window-local coords by the window origin to
+// canvas px before calling these. Same native lib, same process → these resolve.
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_displayxr_avatar_1vk_1android_OverlayKeepAliveService_nativeOnTouch(
+    JNIEnv * /*env*/, jobject /*thiz*/, jint action, jint count,
+    jfloat x0, jfloat y0, jfloat x1, jfloat y1)
+{
+	handle_touch(action, count, x0, y0, x1, y1);
+}
+
+// True if a canvas-px point lands on the tiger silhouette. The input overlay
+// window is a rectangle (the tiger bbox), but the tiger is not — so the service
+// asks this on the first finger-down and, if it MISSES the tiger, declines the
+// gesture (returns false from onTouch) so the tap can fall through to whatever is
+// under the bbox corner (launcher icon, another app, a system dialog) instead of
+// being silently eaten. (#13 silhouette-gated passthrough)
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_displayxr_avatar_1vk_1android_OverlayKeepAliveService_nativeHitTiger(
+    JNIEnv * /*env*/, jobject /*thiz*/, jfloat x, jfloat y)
+{
+	return sil_hit(x, y) ? JNI_TRUE : JNI_FALSE;
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_displayxr_avatar_1vk_1android_OverlayKeepAliveService_nativeResetView(
+    JNIEnv * /*env*/, jobject /*thiz*/)
+{
+	g_reset_view_request.store(true, std::memory_order_relaxed);
+}
+
+// Fills out[0..3] = tiger bbox (x,y,w,h) in canvas px, returns true when valid.
+// The service polls this each frame to follow the tiger with the input window.
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_displayxr_avatar_1vk_1android_OverlayKeepAliveService_nativeGetTigerBounds(
+    JNIEnv *env, jobject /*thiz*/, jintArray out)
+{
+	if (out == nullptr || env->GetArrayLength(out) < 4) return JNI_FALSE;
+	int x = 0, y = 0, w = 0, h = 0;
+	if (!get_tiger_bbox(&x, &y, &w, &h)) return JNI_FALSE;
+	jint vals[4] = {x, y, w, h};
+	env->SetIntArrayRegion(out, 0, 4, vals);
+	return JNI_TRUE;
 }
 
 extern "C" void
