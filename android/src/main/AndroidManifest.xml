@@ -69,6 +69,15 @@
         android:roundIcon="@mipmap/ic_launcher_round"
         android:label="DisplayXR Avatar">
 
+        <!-- #558 per-app overlay mode: this app weaves a see-through avatar over the
+             live desktop, so the DisplayXR runtime gives it a service overlay (and
+             this app backgrounds itself) instead of an opaque own-window. The runtime
+             reads this flag (application-level metadata) from the connecting client;
+             normal apps omit it and render in their own window — no global toggle. -->
+        <meta-data
+            android:name="com.displayxr.overlay_mode"
+            android:value="true" />
+
         <activity
             android:name=".MainActivity"
             android:exported="true"
