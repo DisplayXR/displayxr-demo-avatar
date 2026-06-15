@@ -124,11 +124,17 @@ state, so the Khronos loader's broker lookup excludes it →
 deployment where the runtime has run at least once doesn't hit this.)
 
 ### 3.7 Overlay lifecycle is ours to manage
-The runtime keeps the service overlay surface process-wide. On a clean exit
-(`onTaskRemoved` → stop the FGS → process reaped → IPC client disconnects) the
-runtime tears the overlay down on the **last-client disconnect**. A *rapid*
-force-stop→immediate-relaunch can still race (a developer action, not a normal
-quit).
+The runtime keeps the service overlay surface process-wide while a session is
+live. On a clean exit (`onTaskRemoved` → stop the FGS → process reaped → IPC
+client disconnects → the runtime service goes idle), the runtime tears the
+overlay down from its **service `onDestroy`** (`MonadoImpl.shutdown` →
+`nativeDestroyServiceOverlay`). Two Android subtleties make this fragile and are
+worth knowing if you re-touch it: removal must be **synchronous on the UI
+thread** via `WindowManager.removeViewImmediate()` (plain `removeView()` only
+schedules a traversal that never runs while the looper is shutting down → frozen
+frame); and an IPC-thread teardown at disconnect *races* this lifecycle, so it
+was removed. A *rapid* force-stop→immediate-relaunch can still reuse the overlay
+before the service idles (a developer action, not a normal quit).
 
 ### 3.8 Vendor services are system apps we cannot patch
 The LeiaSR device-config service (`com.leialoft.display.config`,
