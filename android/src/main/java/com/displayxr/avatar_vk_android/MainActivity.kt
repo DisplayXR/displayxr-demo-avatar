@@ -150,7 +150,11 @@ class MainActivity : NativeActivity() {
     // tiger into its service overlay on top. One-shot.
     private fun maybeEnterOverlay() {
         if (overlayEntered) return
-        val overlay = try { nativeOverlayMode() } catch (_: Throwable) { false }
+        // #558 per-app: this app declares com.displayxr.overlay_mode=true in its
+        // manifest (the same flag the runtime reads to give us a service overlay),
+        // so background ourselves based on that. nativeOverlayMode() (debug.dxr.overlay)
+        // stays as a dev force override.
+        val overlay = isOverlayApp() || try { nativeOverlayMode() } catch (_: Throwable) { false }
         if (!overlay) return
         overlayEntered = true
         // ZTE/MyOS aggressively FREEZES backgrounded processes
@@ -172,6 +176,22 @@ class MainActivity : NativeActivity() {
                 moveTaskToBack(true)
             }
         }, 600)
+    }
+
+    // #558 per-app: true if this app declares com.displayxr.overlay_mode=true in its
+    // manifest — the single source of truth shared with the runtime's per-client
+    // overlay decision. No global sysprop needed.
+    private fun isOverlayApp(): Boolean {
+        return try {
+            val ai =
+                packageManager.getApplicationInfo(
+                    packageName,
+                    android.content.pm.PackageManager.GET_META_DATA,
+                )
+            ai.metaData?.getBoolean("com.displayxr.overlay_mode", false) ?: false
+        } catch (_: Throwable) {
+            false
+        }
     }
 
     // Request the two overlay-mode permissions (battery-optimization exemption +

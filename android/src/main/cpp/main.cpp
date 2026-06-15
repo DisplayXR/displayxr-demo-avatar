@@ -2124,15 +2124,76 @@ Java_com_displayxr_avatar_1vk_1android_OverlayKeepAliveService_nativeGetTigerBou
 	return JNI_TRUE;
 }
 
+// #558 per-app: true if this app declares com.displayxr.overlay_mode=true in its
+// manifest. Queried via JNI through the NativeActivity's VM + clazz (the
+// MainActivity, a Context). The android_main thread may not be JNI-attached, so
+// attach/detach around the call.
+static bool
+app_declares_overlay_mode(struct android_app *app)
+{
+	if (app == nullptr || app->activity == nullptr || app->activity->vm == nullptr ||
+	    app->activity->clazz == nullptr) {
+		return false;
+	}
+	JavaVM *vm = app->activity->vm;
+	JNIEnv *env = nullptr;
+	bool attached = false;
+	if (vm->GetEnv((void **)&env, JNI_VERSION_1_6) == JNI_EDETACHED) {
+		if (vm->AttachCurrentThread(&env, nullptr) != JNI_OK) return false;
+		attached = true;
+	}
+	bool result = false;
+	if (env != nullptr) {
+		jobject ctx = app->activity->clazz;
+		jclass ctxCls = env->GetObjectClass(ctx);
+		jmethodID mGetPkg = env->GetMethodID(ctxCls, "getPackageName", "()Ljava/lang/String;");
+		jmethodID mGetPM =
+		    env->GetMethodID(ctxCls, "getPackageManager", "()Landroid/content/pm/PackageManager;");
+		jstring pkg = (jstring)env->CallObjectMethod(ctx, mGetPkg);
+		jobject pm = env->CallObjectMethod(ctx, mGetPM);
+		if (pkg != nullptr && pm != nullptr) {
+			jclass pmCls = env->GetObjectClass(pm);
+			jmethodID mGetAI = env->GetMethodID(
+			    pmCls, "getApplicationInfo",
+			    "(Ljava/lang/String;I)Landroid/content/pm/ApplicationInfo;");
+			jobject ai = env->CallObjectMethod(pm, mGetAI, pkg, 0x00000080 /*GET_META_DATA*/);
+			if (env->ExceptionCheck()) {
+				env->ExceptionClear();
+			} else if (ai != nullptr) {
+				jclass aiCls = env->GetObjectClass(ai);
+				jfieldID fMeta = env->GetFieldID(aiCls, "metaData", "Landroid/os/Bundle;");
+				jobject bundle = env->GetObjectField(ai, fMeta);
+				if (bundle != nullptr) {
+					jclass bCls = env->GetObjectClass(bundle);
+					jmethodID mGetBool =
+					    env->GetMethodID(bCls, "getBoolean", "(Ljava/lang/String;Z)Z");
+					jstring key = env->NewStringUTF("com.displayxr.overlay_mode");
+					result = env->CallBooleanMethod(bundle, mGetBool, key, JNI_FALSE) == JNI_TRUE;
+				}
+			}
+		}
+		if (env->ExceptionCheck()) {
+			env->ExceptionClear();
+		}
+	}
+	if (attached) {
+		vm->DetachCurrentThread();
+	}
+	return result;
+}
+
 extern "C" void
 android_main(struct android_app *app)
 {
 	LOGI("avatar_vk_android: android_main entered");
 	{
-		// #558 overlay mode: render while backgrounded so the tiger stays on the
-		// service overlay over the live launcher. `setprop debug.dxr.overlay 1`.
+		// #558 per-app overlay mode: render while backgrounded so the tiger stays on
+		// the service overlay over the live launcher. Per-app via this app's own
+		// manifest flag (com.displayxr.overlay_mode) — the same flag MainActivity +
+		// the runtime read — with debug.dxr.overlay as a dev force override.
 		char prop[PROP_VALUE_MAX] = {};
-		if (__system_property_get("debug.dxr.overlay", prop) > 0 && prop[0] == '1') {
+		bool force = __system_property_get("debug.dxr.overlay", prop) > 0 && prop[0] == '1';
+		if (force || app_declares_overlay_mode(app)) {
 			g_overlay_mode = true;
 			LOGI("overlay mode ON: render while backgrounded (foreground-service model)");
 		}
