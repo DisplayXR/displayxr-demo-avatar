@@ -1,17 +1,27 @@
 name: Build macOS
 
-# macOS .pkg build — currently MANUAL-ONLY (workflow_dispatch).
+# macOS .pkg build. Mirrors build-windows.yml (and the BuildInstaller job in
+# displayxr-runtime's build-macos.yml). The demo's release cadence is manual —
+# devs push a v* tag when ready; on a v* tag this workflow builds
+# DisplayXRAvatar-<version>.pkg and attaches it to the GitHub Release.
+# workflow_dispatch lets the build be exercised without cutting a tag.
 #
-# The avatar shell's macOS (Cocoa/MoltenVK) port is still in progress: the
-# macos/ target + manifest are not yet retargeted from the modelviewer
-# scaffold, so this workflow would build a non-existent target and fail. To
-# keep the Windows-only v0.x releases green it does NOT run on push/PR/tags.
-# Re-enable the `pull_request` / `push` (branches+tags) triggers below once the
-# macOS port lands (and retarget the ModelViewer/.pkg names in this file +
-# macos/CMakeLists.txt + installer/macos/). The pattern mirrors the modelviewer
-# demo's build-macos.yml.
+# PR + push-to-main runs are validation only: they compile the app + installer
+# to catch breakage before a release, but the release-attach step stays gated
+# on a v* ref so it only fires on tags.
+#
+# The DetectChanges job + docs_only step gating let this workflow be a required
+# status check (the "Build macOS" job always runs and reports success in ~30s
+# on doc-only PRs, skipping the heavy build) without blocking doc PRs. Mirrors
+# the sentinel pattern in displayxr-runtime + the Windows workflow.
 
 on:
+  pull_request: {}
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
   workflow_dispatch: {}
 
 concurrency:
@@ -45,6 +55,13 @@ jobs:
             BASE=${{ github.event.pull_request.base.sha }}
           else
             BASE=${{ github.event.before }}
+          fi
+          # First push to a new repo/branch (or any push with no parent): the
+          # before-SHA is all-zeros / not a real object, so there is nothing to
+          # diff against — treat as a full (non-doc) build instead of erroring.
+          if [ "$BASE" = "0000000000000000000000000000000000000000" ] || ! git cat-file -e "$BASE^{commit}" 2>/dev/null; then
+            echo "docs_only=false" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
           CHANGED=$(git diff --name-only "$BASE" HEAD)
           NON_DOC=$(echo "$CHANGED" | grep -vE '^(docs/|.*\.md$|LICENSE$|\.github/ISSUE_TEMPLATE/)' || true)
@@ -107,18 +124,18 @@ jobs:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
-          PKG=$(find _package -maxdepth 1 -name "DisplayXRModelViewer-*.pkg" -type f | head -1)
+          PKG=$(find _package -maxdepth 1 -name "DisplayXRAvatar-*.pkg" -type f | head -1)
           if [ -z "$PKG" ] || [ ! -f "$PKG" ]; then
-            echo "::error::DisplayXRModelViewer-*.pkg missing from _package/"
+            echo "::error::DisplayXRAvatar-*.pkg missing from _package/"
             ls -la _package/ || true
             exit 1
           fi
           echo "Found installer: $PKG"
           EXPAND_DIR=$(mktemp -d)
           pkgutil --expand "$PKG" "$EXPAND_DIR/expand"
-          PAYLOAD="$EXPAND_DIR/expand/modelviewer.pkg/Payload"
+          PAYLOAD="$EXPAND_DIR/expand/avatar.pkg/Payload"
           if [ ! -f "$PAYLOAD" ]; then
-            echo "::error::modelviewer.pkg/Payload not found inside .pkg"
+            echo "::error::avatar.pkg/Payload not found inside .pkg"
             ls -la "$EXPAND_DIR/expand/" || true
             exit 1
           fi
@@ -133,12 +150,12 @@ jobs:
               MISSING=1
             fi
           }
-          assert_present 'Applications/3D Model Viewer\.app/Contents/MacOS/3D Model Viewer' "launcher"
-          assert_present 'Applications/3D Model Viewer\.app/Contents/Resources/model_viewer_handle_vk_macos' "demo binary"
-          assert_present 'Applications/3D Model Viewer\.app/Contents/Resources/sample\.glb' "bundled scene"
-          assert_present 'Applications/3D Model Viewer\.app/Contents/Resources/lib/libMoltenVK' "MoltenVK"
-          assert_present 'Applications/3D Model Viewer\.app/Contents/Resources/lib/libvulkan' "Vulkan loader"
-          assert_present 'Applications/3D Model Viewer\.app/Contents/Resources/lib/libopenxr_loader' "OpenXR loader"
+          assert_present 'Applications/3D Avatar\.app/Contents/MacOS/3D Avatar' "launcher"
+          assert_present 'Applications/3D Avatar\.app/Contents/Resources/avatar_handle_vk_macos' "demo binary"
+          assert_present 'Applications/3D Avatar\.app/Contents/Resources/sample\.glb' "bundled scene"
+          assert_present 'Applications/3D Avatar\.app/Contents/Resources/lib/libMoltenVK' "MoltenVK"
+          assert_present 'Applications/3D Avatar\.app/Contents/Resources/lib/libvulkan' "Vulkan loader"
+          assert_present 'Applications/3D Avatar\.app/Contents/Resources/lib/libopenxr_loader' "OpenXR loader"
           if [ "$MISSING" -ne 0 ]; then
             echo "Payload listing:"
             cat "$EXPAND_DIR/files"
@@ -151,9 +168,9 @@ jobs:
         uses: actions/upload-artifact@v6
         with:
           retention-days: 3
-          name: DisplayXRModelViewer-macOS
+          name: DisplayXRAvatar-macOS
           if-no-files-found: error
-          path: _package/DisplayXRModelViewer-*.pkg
+          path: _package/DisplayXRAvatar-*.pkg
 
       # softprops/action-gh-release@v3 create-or-updates the GitHub
       # Release on v* tag push and attaches the .pkg. If a Windows
@@ -163,7 +180,7 @@ jobs:
         if: needs.DetectChanges.outputs.docs_only != 'true' && startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v3
         with:
-          files: _package/DisplayXRModelViewer-*.pkg
+          files: _package/DisplayXRAvatar-*.pkg
           fail_on_unmatched_files: true
           draft: false
           prerelease: false
