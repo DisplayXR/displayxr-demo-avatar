@@ -116,7 +116,9 @@ jobs:
         if: needs.DetectChanges.outputs.docs_only != 'true'
         env:
           DISPLAYXR_VERSION: ${{ steps.version.outputs.version }}
-        run: ./scripts/build_macos.sh --installer
+        # Invoke via `bash` rather than `./...` so the build doesn't depend on
+        # the script carrying the git executable bit (it's tracked 100644).
+        run: bash ./scripts/build_macos.sh --installer
 
       - name: Assert .pkg payload (regression guard)
         if: needs.DetectChanges.outputs.docs_only != 'true'
