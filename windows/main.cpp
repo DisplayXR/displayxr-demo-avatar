@@ -1862,16 +1862,13 @@ static void RenderThreadFunc(
                     }
                 }
 
-                // ── Speech bubble: a flat 2D nameplate pill in the top ~30% band,
-                //    submitted as a Local2D layer (implicit M=0 mask) so the tiger
-                //    keeps weaving in the bottom 75%. RenderBubbleToTexture draws the
-                //    rounded panel + balanced text into g_animBtnSwapchain (slot name
-                //    predates the chrome-button strip); composited post-weave. ──
+                // ── Speech bubble: a flat 2D nameplate pill in the top ~25% band,
+                //    submitted as a single Local2D layer. On the zones path the tiger
+                //    weaves only inside the bottom-75% zone rect, so the band is pure
+                //    2D and no full-band backer is needed. RenderBubbleToTexture draws
+                //    the rounded panel + balanced text into g_animBtnSwapchain (slot
+                //    name predates the chrome-button strip); composited post-weave. ──
                 XrCompositionLayerLocal2DEXT bubbleLayer = {(XrStructureType)XR_TYPE_COMPOSITION_LAYER_LOCAL_2D_EXT};
-                // Transparent backer spanning the FULL top 25%: extends the implicit
-                // mask (M=0) across the whole band so the untouched top-25% weave is
-                // hidden in the panel's rounded-corner cut-outs.
-                XrCompositionLayerLocal2DEXT bubbleBgLayer = {(XrStructureType)XR_TYPE_COMPOSITION_LAYER_LOCAL_2D_EXT};
                 bool bubbleReady = false;
                 if (g_animBtnReady && g_hasAnimBtnSwapchain && g_hasLocal3DZone) {
                     // The top-25% band is bandW×bandH; its aspect varies with the
@@ -1957,18 +1954,6 @@ static void RenderThreadFunc(
                         bubbleLayer.rect.offset = {0, 0};
                         bubbleLayer.rect.extent = {bandW, bandH};
 
-                        // Transparent backer over the WHOLE band: sample a transparent
-                        // texel from the panel's inset margin (texture (0,0) is outside
-                        // the panel) so M=0 + alpha 0 extends into the rounded-corner
-                        // cut-outs — no weave bleeds through there.
-                        bubbleBgLayer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
-                        bubbleBgLayer.subImage.swapchain = g_animBtnSwapchain.swapchain;
-                        bubbleBgLayer.subImage.imageRect.offset = {0, 0};
-                        bubbleBgLayer.subImage.imageRect.extent = {2, 2};
-                        bubbleBgLayer.subImage.imageArrayIndex = 0;
-                        bubbleBgLayer.rect.offset = {0, 0};
-                        bubbleBgLayer.rect.extent = {bandW, bandH};
-
                         bubbleReady = true;
                         // Publish the full-band bubble rect so the shaped window keeps it.
                         std::lock_guard<std::mutex> bl(g_bubbleMtx);
@@ -2003,17 +1988,15 @@ static void RenderThreadFunc(
                         tigerZone.next = nullptr;
                         proj.next = &tigerZone;
                     }
-                    const XrCompositionLayerBaseHeader* layers[3];
+                    const XrCompositionLayerBaseHeader* layers[2];
                     uint32_t layerN = 0;
                     layers[layerN++] = (const XrCompositionLayerBaseHeader*)&proj;
                     if (bubbleReady) {
-                        // Background (full-band transparent) first, then the bubble on
-                        // top — Local2D layers flatten in list order. (In a zones
-                        // frame the implicit-mask rule is inert — Local2D is pure 2D
-                        // content — so the backer's mask-extension purpose is moot,
-                        // but it stays harmless: bubble code unchanged per the P6
-                        // migration spec.)
-                        layers[layerN++] = (const XrCompositionLayerBaseHeader*)&bubbleBgLayer;
+                        // Single Local2D bubble in the top 25%. On the zones path the
+                        // tiger weaves only inside the bottom-75% zone rect (a local 3D
+                        // zone confines its content to the zone by definition), so the
+                        // top band is already pure 2D — the old full-band transparent
+                        // backer that extended the implicit mask is redundant and gone.
                         layers[layerN++] = (const XrCompositionLayerBaseHeader*)&bubbleLayer;
                     }
                     XrFrameEndInfo endInfo = {XR_TYPE_FRAME_END_INFO};
