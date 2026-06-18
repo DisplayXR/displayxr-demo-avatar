@@ -217,41 +217,37 @@ jobs:
           draft: false
           prerelease: false
 
-  # NOTE: versions.json autobump is DEFERRED for the avatar demo — and it must
-  # stay deferred until the *runtime* side is ready. displayxr-runtime's
-  # versions-bump.yml hard-fails ("versions.json has no field 'avatar_demo'")
-  # when the dispatched field is absent from versions.json, and there is no
-  # `avatar_demo` field there yet. Adding that field is a separate change in
-  # displayxr-runtime (and the displayxr-installer mirror + components.sh asset
-  # table); enabling the dispatch here first would just make every avatar v*
-  # tag's bump dispatch fail.
+  # On v* tag push, after BuildInstaller succeeds, tell
+  # displayxr-runtime to bump versions.json[avatar_demo] to
+  # this tag. Only the Windows workflow dispatches — the macOS
+  # workflow racing on the same tag would just no-op against the
+  # idempotent handler, but a single dispatch is cleaner.
   #
-  # Once `avatar_demo` exists in displayxr-runtime/versions.json, append a
-  # DispatchVersionsBump job here that mirrors the mediaplayer demo's canonical
-  # form (displayxr-demo-mediaplayer/.github/workflows/build-windows.yml):
-  #
-  #   DispatchVersionsBump:
-  #     if: ${{ startsWith(github.ref, 'refs/tags/v') && github.repository == 'DisplayXR/displayxr-demo-avatar' }}
-  #     needs: [BuildInstaller]
-  #     runs-on: ubuntu-latest
-  #     steps:
-  #       - name: Mint dispatch token
-  #         id: dispatch-token
-  #         uses: actions/create-github-app-token@v3
-  #         with:
-  #           app-id: ${{ secrets.DISPLAYXR_APP_ID }}
-  #           private-key: ${{ secrets.DISPLAYXR_APP_PRIVATE_KEY }}
-  #           owner: DisplayXR
-  #           repositories: displayxr-runtime
-  #       - name: Dispatch versions.json bump
-  #         uses: peter-evans/repository-dispatch@v4
-  #         with:
-  #           token: ${{ steps.dispatch-token.outputs.token }}
-  #           repository: DisplayXR/displayxr-runtime
-  #           event-type: versions-bump
-  #           client-payload: |
-  #             {
-  #               "field":       "avatar_demo",
-  #               "tag":         "${{ github.ref_name }}",
-  #               "source_repo": "${{ github.repository }}"
-  #             }
+  # Spec: DisplayXR/displayxr-runtime
+  # docs/specs/runtime/versions-json-autobump.md.
+  DispatchVersionsBump:
+    if: ${{ startsWith(github.ref, 'refs/tags/v') && github.repository == 'DisplayXR/displayxr-demo-avatar' }}
+    needs: [BuildInstaller]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mint dispatch token
+        id: dispatch-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.DISPLAYXR_APP_ID }}
+          private-key: ${{ secrets.DISPLAYXR_APP_PRIVATE_KEY }}
+          owner: DisplayXR
+          repositories: displayxr-runtime
+
+      - name: Dispatch versions.json bump
+        uses: peter-evans/repository-dispatch@v4
+        with:
+          token: ${{ steps.dispatch-token.outputs.token }}
+          repository: DisplayXR/displayxr-runtime
+          event-type: versions-bump
+          client-payload: |
+            {
+              "field":       "avatar_demo",
+              "tag":         "${{ github.ref_name }}",
+              "source_repo": "${{ github.repository }}"
+            }
