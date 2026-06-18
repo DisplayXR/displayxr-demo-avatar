@@ -632,6 +632,15 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             ToggleDecoration(hwnd);
             return 0;
         }
+        // V key = cycle display rendering mode (2D/3D/...). Standalone only —
+        // under the workspace the controller owns the V toggle and routes mode
+        // changes over IPC, so this never fires there. Main loop reads the flag
+        // and computes the target from the runtime's current mode.
+        if (wParam == 'V') {
+            std::lock_guard<std::mutex> lock(g_inputMutex);
+            g_inputState.cycleRenderingModeRequested = true;
+            return 0;
+        }
         // I key = capture multi-view atlas
         if (wParam == 'I' || wParam == 'i') {
             g_captureAtlasRequested.store(true);
