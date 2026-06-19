@@ -53,6 +53,7 @@
 #include <sys/stat.h>
 
 #include "view_params.h"
+#include "mode_switch.h" // dxr::ModeSwitch — smooth 2D<->3D disparity ramp (inline on macOS)
 #include "display3d_view.h"
 #include "camera3d_view.h"
 #include "projection_depth.h"
@@ -170,6 +171,12 @@ static volatile bool g_running = true;
 static NSWindow *g_window = nil;
 static NSView *g_metalView = nil;
 static InputState g_input;
+// Smooth 2D<->3D disparity ramp, driven inline (macOS app-owned mode model).
+// g_msLastMode tracks the runtime-confirmed mode (synced on fire + event) so the
+// sequencer knows the ramp direction.
+static dxr::ModeSwitch g_modeSwitch;
+static bool g_modeSwitchConfigured = false;
+static uint32_t g_msLastMode = 1; // matches g_input.currentRenderingMode default
 
 // Transparent-background mode — ON by default: the avatar floats over the live
 // desktop. The session-level flag (transparentBackgroundEnabled, set permanently
@@ -705,15 +712,19 @@ static void OpenLoadDialog() {
             g_input.loadRequested = true;
             break;
         case '-': case '_': {
-            float v = g_input.viewParams.ipdFactor - 0.1f;
+            // Edit steadyIpdFactor (the ModeSwitch ramp target); seed ipdFactor
+            // in lockstep for the idle/non-ramp render path.
+            float v = g_input.viewParams.steadyIpdFactor - 0.1f;
             if (v < 0.1f) v = 0.1f;
+            g_input.viewParams.steadyIpdFactor = v;
             g_input.viewParams.ipdFactor = v;
             g_input.viewParams.parallaxFactor = v;
             break;
         }
         case '=': case '+': {
-            float v = g_input.viewParams.ipdFactor + 0.1f;
+            float v = g_input.viewParams.steadyIpdFactor + 0.1f;
             if (v > 1.0f) v = 1.0f;
+            g_input.viewParams.steadyIpdFactor = v;
             g_input.viewParams.ipdFactor = v;
             g_input.viewParams.parallaxFactor = v;
             break;
@@ -1843,6 +1854,7 @@ static void PollEvents(AppXrSession& xr) {
             auto* rmc = (XrEventDataRenderingModeChangedEXT*)&event;
             if (rmc->currentModeIndex < xr.renderingModeCount) {
                 g_input.currentRenderingMode = rmc->currentModeIndex;
+                g_msLastMode = rmc->currentModeIndex; // keep the ramp's from-mode in sync
                 UpdateTopBarButtonTitles(xr);
                 LOG_INFO("Rendering mode changed: %u -> %u (%s)",
                     rmc->previousModeIndex, rmc->currentModeIndex,
@@ -2565,15 +2577,47 @@ int main(int argc, char** argv) {
         g_modelRenderer.updateAnimation(deltaTime);
 
         // Handle rendering mode change (V=cycle, 0-3=direct, Mode button, or the
-        // startup default-mode request). Held until the session is running so the
-        // request reaches a begun session rather than being dropped (this handler
-        // runs before PollEvents, which is what begins the session).
-        if (g_input.renderingModeChangeRequested && xr.sessionRunning) {
-            g_input.renderingModeChangeRequested = false;
-            if (xr.pfnRequestDisplayRenderingModeEXT && xr.session != XR_NULL_HANDLE) {
-                xr.pfnRequestDisplayRenderingModeEXT(xr.session, g_input.currentRenderingMode);
+        // startup default-mode request) through the dxr::ModeSwitch sequencer:
+        // it eases g_input.viewParams.ipdFactor around the switch and fires the
+        // request on the right frame. Held until the session is running so the
+        // request reaches a begun session (this handler runs before PollEvents).
+        if (!g_modeSwitchConfigured) {
+            g_modeSwitch.configure(0.18f, dxr::ModeSwitchEasing::SmoothStep);
+            g_modeSwitchConfigured = true;
+        }
+        {
+            const float steady = g_input.viewParams.steadyIpdFactor;
+            auto vcOf = [&](uint32_t m) -> uint32_t {
+                return (m < xr.renderingModeCount && xr.renderingModeViewCounts[m] > 0)
+                           ? xr.renderingModeViewCounts[m] : 1;
+            };
+            if (g_input.renderingModeChangeRequested && xr.sessionRunning &&
+                xr.pfnRequestDisplayRenderingModeEXT && xr.session != XR_NULL_HANDLE) {
+                g_input.renderingModeChangeRequested = false;
+                const uint32_t target = g_input.currentRenderingMode;
+                if (target == g_msLastMode) {
+                    // Startup / re-assert / same mode: fire directly, no ramp.
+                    xr.pfnRequestDisplayRenderingModeEXT(xr.session, target);
+                    g_msLastMode = target;
+                    UpdateTopBarButtonTitles(xr);
+                } else {
+                    const float curIpd = g_modeSwitch.active() ? g_modeSwitch.ipd() : steady;
+                    g_modeSwitch.request(target, vcOf(target), g_msLastMode, vcOf(g_msLastMode),
+                                         curIpd, steady);
+                }
             }
-            UpdateTopBarButtonTitles(xr);
+            if (g_modeSwitch.active()) {
+                float ipd = steady; bool fire = false; uint32_t mode = g_msLastMode;
+                g_modeSwitch.update(deltaTime, &ipd, &fire, &mode);
+                g_input.viewParams.ipdFactor = ipd;
+                if (fire && xr.pfnRequestDisplayRenderingModeEXT && xr.session != XR_NULL_HANDLE) {
+                    xr.pfnRequestDisplayRenderingModeEXT(xr.session, mode);
+                    g_msLastMode = mode;
+                    UpdateTopBarButtonTitles(xr);
+                }
+            } else {
+                g_input.viewParams.ipdFactor = steady;
+            }
         }
 
         // Handle eye tracking mode toggle
