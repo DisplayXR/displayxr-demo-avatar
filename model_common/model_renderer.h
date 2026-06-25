@@ -180,8 +180,10 @@ private:
     // ── Render targets (internal; blitted to the swapchain viewport) ─────
     VkFormat colorFormat_ = VK_FORMAT_R8G8B8A8_UNORM;
     VkFormat depthFormat_ = VK_FORMAT_D32_SFLOAT;
-    ModelImage colorImage_;
+    ModelImage colorImageMS_;  // MSAA color target; resolved into colorImage_ at pass end
+    ModelImage colorImage_;    // 1-sample resolve target (also sole target when MSAA=1)
     ModelImage depthImage_;
+    VkSampleCountFlagBits msaaSamples_ = VK_SAMPLE_COUNT_4_BIT;
     VkRenderPass renderPass_ = VK_NULL_HANDLE;
     VkFramebuffer framebuffer_ = VK_NULL_HANDLE;
 
