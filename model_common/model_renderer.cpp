@@ -191,56 +191,85 @@ bool ModelRenderer::init(VkInstance instance,
 }
 
 bool ModelRenderer::createRenderTargets() {
-    // Render pass (format-only; size-independent). Clears colour+depth, leaves
-    // colour in TRANSFER_SRC for the per-eye viewport blit.
-    VkAttachmentDescription atts[2] = {};
-    atts[0].format = colorFormat_;
-    atts[0].samples = VK_SAMPLE_COUNT_1_BIT;
-    atts[0].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-    atts[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-    atts[0].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    // Clamp msaaSamples_ to what the device actually supports.
+    {
+        VkPhysicalDeviceProperties props;
+        vkGetPhysicalDeviceProperties(physDevice_, &props);
+        VkSampleCountFlags sc = props.limits.framebufferColorSampleCounts
+                              & props.limits.framebufferDepthSampleCounts;
+        if (!(sc & msaaSamples_)) {
+            std::fprintf(stderr, "ModelRenderer: 4x MSAA not supported on this device; AA disabled\n");
+            msaaSamples_ = VK_SAMPLE_COUNT_1_BIT;
+        }
+    }
+    const bool useMsaa = (msaaSamples_ != VK_SAMPLE_COUNT_1_BIT);
+
+    // Render pass: 3 attachments (MSAA) or 2 (fallback 1x).
+    //   [0] color render target (msaaSamples_) — cleared; DONT_CARE store (MSAA) or STORE (1x)
+    //   [1] depth (msaaSamples_) — cleared; discarded after pass
+    //   [2] resolve/1-sample color (MSAA path only) — blit source after pass
+    VkAttachmentDescription atts[3] = {};
+    atts[0].format  = colorFormat_;
+    atts[0].samples = msaaSamples_;
+    atts[0].loadOp  = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    atts[0].storeOp = useMsaa ? VK_ATTACHMENT_STORE_OP_DONT_CARE : VK_ATTACHMENT_STORE_OP_STORE;
+    atts[0].stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
     atts[0].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-    atts[0].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    atts[0].finalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    atts[0].initialLayout  = VK_IMAGE_LAYOUT_UNDEFINED;
+    atts[0].finalLayout    = useMsaa ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+                                     : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
 
-    atts[1].format = depthFormat_;
-    atts[1].samples = VK_SAMPLE_COUNT_1_BIT;
-    atts[1].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    atts[1].format  = depthFormat_;
+    atts[1].samples = msaaSamples_;
+    atts[1].loadOp  = VK_ATTACHMENT_LOAD_OP_CLEAR;
     atts[1].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-    atts[1].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    atts[1].stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
     atts[1].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-    atts[1].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    atts[1].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    atts[1].initialLayout  = VK_IMAGE_LAYOUT_UNDEFINED;
+    atts[1].finalLayout    = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
 
-    VkAttachmentReference colorRef = {0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
-    VkAttachmentReference depthRef = {1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
+    // Attachment [2]: 1-sample resolve target (MSAA path only).
+    atts[2].format  = colorFormat_;
+    atts[2].samples = VK_SAMPLE_COUNT_1_BIT;
+    atts[2].loadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    atts[2].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    atts[2].stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    atts[2].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    atts[2].initialLayout  = VK_IMAGE_LAYOUT_UNDEFINED;
+    atts[2].finalLayout    = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+
+    VkAttachmentReference colorRef   = {0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+    VkAttachmentReference depthRef   = {1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
+    VkAttachmentReference resolveRef = {2, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+
     VkSubpassDescription sub = {};
-    sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
-    sub.colorAttachmentCount = 1;
-    sub.pColorAttachments = &colorRef;
+    sub.pipelineBindPoint       = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    sub.colorAttachmentCount    = 1;
+    sub.pColorAttachments       = &colorRef;
     sub.pDepthStencilAttachment = &depthRef;
+    sub.pResolveAttachments     = useMsaa ? &resolveRef : nullptr;
 
     VkSubpassDependency deps[2] = {};
-    deps[0].srcSubpass = VK_SUBPASS_EXTERNAL;
-    deps[0].dstSubpass = 0;
-    deps[0].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
-    deps[0].dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
+    deps[0].srcSubpass    = VK_SUBPASS_EXTERNAL;
+    deps[0].dstSubpass    = 0;
+    deps[0].srcStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+    deps[0].dstStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
     deps[0].srcAccessMask = 0;
     deps[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-    deps[1].srcSubpass = 0;
-    deps[1].dstSubpass = VK_SUBPASS_EXTERNAL;
-    deps[1].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-    deps[1].dstStageMask = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    deps[1].srcSubpass    = 0;
+    deps[1].dstSubpass    = VK_SUBPASS_EXTERNAL;
+    deps[1].srcStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    deps[1].dstStageMask  = VK_PIPELINE_STAGE_TRANSFER_BIT;
     deps[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
     deps[1].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
 
     VkRenderPassCreateInfo rpci = {VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
-    rpci.attachmentCount = 2;
-    rpci.pAttachments = atts;
-    rpci.subpassCount = 1;
-    rpci.pSubpasses = &sub;
+    rpci.attachmentCount = useMsaa ? 3 : 2;
+    rpci.pAttachments    = atts;
+    rpci.subpassCount    = 1;
+    rpci.pSubpasses      = &sub;
     rpci.dependencyCount = 2;
-    rpci.pDependencies = deps;
+    rpci.pDependencies   = deps;
     if (vkCreateRenderPass(device_, &rpci, nullptr, &renderPass_) != VK_SUCCESS) return false;
 
     return ensureTargets(width_, height_);
@@ -254,24 +283,50 @@ bool ModelRenderer::ensureTargets(uint32_t w, uint32_t h) {
     if (w == 0) w = 1;
     if (h == 0) h = 1;
     if (device_ != VK_NULL_HANDLE) vkDeviceWaitIdle(device_);
-    if (framebuffer_ != VK_NULL_HANDLE) { vkDestroyFramebuffer(device_, framebuffer_, nullptr); framebuffer_ = VK_NULL_HANDLE; }
-    if (colorImage_.image != VK_NULL_HANDLE) modelDestroyImage(device_, colorImage_);
-    if (depthImage_.image != VK_NULL_HANDLE) modelDestroyImage(device_, depthImage_);
+    if (framebuffer_    != VK_NULL_HANDLE) { vkDestroyFramebuffer(device_, framebuffer_, nullptr); framebuffer_ = VK_NULL_HANDLE; }
+    if (colorImageMS_.image != VK_NULL_HANDLE) { modelDestroyImage(device_, colorImageMS_); colorImageMS_ = {}; }
+    if (colorImage_.image   != VK_NULL_HANDLE) modelDestroyImage(device_, colorImage_);
+    if (depthImage_.image   != VK_NULL_HANDLE) modelDestroyImage(device_, depthImage_);
     width_ = w; height_ = h;
 
+    const bool useMsaa = (msaaSamples_ != VK_SAMPLE_COUNT_1_BIT);
+
+    // MSAA color render target (attachment 0 in MSAA path) — resolved at pass end.
+    if (useMsaa) {
+        VkImageCreateInfo mci = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        mci.imageType = VK_IMAGE_TYPE_2D; mci.format = colorFormat_;
+        mci.extent = {w, h, 1}; mci.mipLevels = 1; mci.arrayLayers = 1;
+        mci.samples = msaaSamples_; mci.tiling = VK_IMAGE_TILING_OPTIMAL;
+        mci.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT; mci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        if (vkCreateImage(device_, &mci, nullptr, &colorImageMS_.image) != VK_SUCCESS) return false;
+        VkMemoryRequirements mmr; vkGetImageMemoryRequirements(device_, colorImageMS_.image, &mmr);
+        VkMemoryAllocateInfo mai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        mai.allocationSize  = mmr.size;
+        mai.memoryTypeIndex = modelFindMemoryType(physDevice_, mmr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        if (vkAllocateMemory(device_, &mai, nullptr, &colorImageMS_.memory) != VK_SUCCESS) return false;
+        vkBindImageMemory(device_, colorImageMS_.image, colorImageMS_.memory, 0);
+        VkImageViewCreateInfo mvc = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        mvc.image = colorImageMS_.image; mvc.viewType = VK_IMAGE_VIEW_TYPE_2D; mvc.format = colorFormat_;
+        mvc.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        if (vkCreateImageView(device_, &mvc, nullptr, &colorImageMS_.view) != VK_SUCCESS) return false;
+        colorImageMS_.width = w; colorImageMS_.height = h;
+    }
+
+    // 1-sample resolve target (MSAA: attachment 2, blit source) or sole color target (1x: attachment 0).
     colorImage_ = modelCreateImage2D(device_, physDevice_, w, h, colorFormat_,
         VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
     if (colorImage_.image == VK_NULL_HANDLE) return false;
 
+    // Depth — same sample count as the color render target.
     VkImageCreateInfo ici = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     ici.imageType = VK_IMAGE_TYPE_2D; ici.format = depthFormat_;
     ici.extent = {w, h, 1}; ici.mipLevels = 1; ici.arrayLayers = 1;
-    ici.samples = VK_SAMPLE_COUNT_1_BIT; ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ici.samples = msaaSamples_; ici.tiling = VK_IMAGE_TILING_OPTIMAL;
     ici.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT; ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     if (vkCreateImage(device_, &ici, nullptr, &depthImage_.image) != VK_SUCCESS) return false;
     VkMemoryRequirements mr; vkGetImageMemoryRequirements(device_, depthImage_.image, &mr);
     VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-    ai.allocationSize = mr.size;
+    ai.allocationSize  = mr.size;
     ai.memoryTypeIndex = modelFindMemoryType(physDevice_, mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     if (vkAllocateMemory(device_, &ai, nullptr, &depthImage_.memory) != VK_SUCCESS) return false;
     vkBindImageMemory(device_, depthImage_.image, depthImage_.memory, 0);
@@ -281,9 +336,23 @@ bool ModelRenderer::ensureTargets(uint32_t w, uint32_t h) {
     if (vkCreateImageView(device_, &vci, nullptr, &depthImage_.view) != VK_SUCCESS) return false;
     depthImage_.width = w; depthImage_.height = h;
 
-    VkImageView fbViews[2] = {colorImage_.view, depthImage_.view};
+    // Framebuffer view order must match the render pass attachment order:
+    //   MSAA: [0]=MSAA color, [1]=MSAA depth, [2]=resolve color
+    //   1x:   [0]=color,      [1]=depth
+    VkImageView fbViews[3];
+    uint32_t    fbCount;
+    if (useMsaa) {
+        fbViews[0] = colorImageMS_.view;
+        fbViews[1] = depthImage_.view;
+        fbViews[2] = colorImage_.view;
+        fbCount = 3;
+    } else {
+        fbViews[0] = colorImage_.view;
+        fbViews[1] = depthImage_.view;
+        fbCount = 2;
+    }
     VkFramebufferCreateInfo fbci = {VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
-    fbci.renderPass = renderPass_; fbci.attachmentCount = 2; fbci.pAttachments = fbViews;
+    fbci.renderPass = renderPass_; fbci.attachmentCount = fbCount; fbci.pAttachments = fbViews;
     fbci.width = w; fbci.height = h; fbci.layers = 1;
     if (vkCreateFramebuffer(device_, &fbci, nullptr, &framebuffer_) != VK_SUCCESS) return false;
     return true;
@@ -393,7 +462,7 @@ bool ModelRenderer::createPipeline() {
     rs.lineWidth = 1.0f;
 
     VkPipelineMultisampleStateCreateInfo ms = {VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
-    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    ms.rasterizationSamples = msaaSamples_;
 
     VkPipelineDepthStencilStateCreateInfo ds = {VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
     ds.depthTestEnable = VK_TRUE;
@@ -1564,17 +1633,20 @@ void ModelRenderer::renderEye(VkImage swapchainImage,
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(cmd, &bi);
 
-    VkClearValue clears[2];
+    // MSAA path has 3 attachments: [0]=MSAA color (CLEAR), [1]=depth (CLEAR),
+    // [2]=resolve (DONT_CARE — slot must exist but value is ignored by the driver).
+    VkClearValue clears[3];
     if (transparentBg) clears[0].color = {{0.0f, 0.0f, 0.0f, 0.0f}};
     else               clears[0].color = {{0.05f, 0.05f, 0.06f, 1.0f}};
     clears[1].depthStencil = {1.0f, 0};
+    clears[2] = {};
 
     VkRenderPassBeginInfo rpbi = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
     rpbi.renderPass = renderPass_;
     rpbi.framebuffer = framebuffer_;
     rpbi.renderArea.offset = {0, 0};
     rpbi.renderArea.extent = {viewportWidth, viewportHeight};
-    rpbi.clearValueCount = 2;
+    rpbi.clearValueCount = (msaaSamples_ != VK_SAMPLE_COUNT_1_BIT) ? 3 : 2;
     rpbi.pClearValues = clears;
     vkCmdBeginRenderPass(cmd, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
 
@@ -1778,8 +1850,9 @@ void ModelRenderer::cleanup() {
     if (jointSetLayout_ != VK_NULL_HANDLE) { vkDestroyDescriptorSetLayout(device_, jointSetLayout_, nullptr); jointSetLayout_ = VK_NULL_HANDLE; }
     if (framebuffer_ != VK_NULL_HANDLE) { vkDestroyFramebuffer(device_, framebuffer_, nullptr); framebuffer_ = VK_NULL_HANDLE; }
     if (renderPass_ != VK_NULL_HANDLE) { vkDestroyRenderPass(device_, renderPass_, nullptr); renderPass_ = VK_NULL_HANDLE; }
-    if (colorImage_.image != VK_NULL_HANDLE) modelDestroyImage(device_, colorImage_);
-    if (depthImage_.image != VK_NULL_HANDLE) modelDestroyImage(device_, depthImage_);
+    if (colorImageMS_.image != VK_NULL_HANDLE) { modelDestroyImage(device_, colorImageMS_); colorImageMS_ = {}; }
+    if (colorImage_.image   != VK_NULL_HANDLE) modelDestroyImage(device_, colorImage_);
+    if (depthImage_.image   != VK_NULL_HANDLE) modelDestroyImage(device_, depthImage_);
     if (cmdPool_ != VK_NULL_HANDLE) { vkDestroyCommandPool(device_, cmdPool_, nullptr); cmdPool_ = VK_NULL_HANDLE; }
 
     initialized_ = false;
