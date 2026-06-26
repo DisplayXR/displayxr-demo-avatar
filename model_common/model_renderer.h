@@ -187,6 +187,20 @@ private:
     VkRenderPass renderPass_ = VK_NULL_HANDLE;
     VkFramebuffer framebuffer_ = VK_NULL_HANDLE;
 
+    // ── Edge-softening post-pass (Step B AA) ──────────────────────────────
+    // Reads the MSAA-resolved colorImage_ and applies a 3×3 alpha-weighted
+    // Gaussian to widen the silhouette transition band from ~1 px to ~3 px.
+    // softenColorImage_ replaces colorImage_ as the blit source each frame.
+    ModelImage            softenColorImage_;
+    VkRenderPass          softenRenderPass_      = VK_NULL_HANDLE;
+    VkFramebuffer         softenFramebuffer_     = VK_NULL_HANDLE;
+    VkSampler             softenSampler_         = VK_NULL_HANDLE;
+    VkDescriptorSetLayout softenDsLayout_        = VK_NULL_HANDLE;
+    VkDescriptorPool      softenPool_            = VK_NULL_HANDLE;
+    VkDescriptorSet       softenSet_             = VK_NULL_HANDLE;
+    VkPipelineLayout      softenPipelineLayout_  = VK_NULL_HANDLE;
+    VkPipeline            softenPipeline_        = VK_NULL_HANDLE;
+
     // ── Pipeline ──────────────────────────────────────────────────────────
     VkDescriptorSetLayout dsLayout_ = VK_NULL_HANDLE;
     VkPipelineLayout pipelineLayout_ = VK_NULL_HANDLE;
