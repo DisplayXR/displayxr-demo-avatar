@@ -191,15 +191,20 @@ bool ModelRenderer::init(VkInstance instance,
 }
 
 bool ModelRenderer::createRenderTargets() {
-    // Clamp msaaSamples_ to what the device actually supports.
+    // Clamp msaaSamples_ to what the device actually supports: try 8x → 4x → 1x.
     {
         VkPhysicalDeviceProperties props;
         vkGetPhysicalDeviceProperties(physDevice_, &props);
         VkSampleCountFlags sc = props.limits.framebufferColorSampleCounts
                               & props.limits.framebufferDepthSampleCounts;
         if (!(sc & msaaSamples_)) {
-            std::fprintf(stderr, "ModelRenderer: 4x MSAA not supported on this device; AA disabled\n");
-            msaaSamples_ = VK_SAMPLE_COUNT_1_BIT;
+            if (sc & VK_SAMPLE_COUNT_4_BIT) {
+                std::fprintf(stderr, "ModelRenderer: 8x MSAA not supported; falling back to 4x\n");
+                msaaSamples_ = VK_SAMPLE_COUNT_4_BIT;
+            } else {
+                std::fprintf(stderr, "ModelRenderer: 8x/4x MSAA not supported; AA disabled\n");
+                msaaSamples_ = VK_SAMPLE_COUNT_1_BIT;
+            }
         }
     }
     const bool useMsaa = (msaaSamples_ != VK_SAMPLE_COUNT_1_BIT);
