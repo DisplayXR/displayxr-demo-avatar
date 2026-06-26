@@ -365,8 +365,9 @@ bool ModelRenderer::ensureTargets(uint32_t w, uint32_t h) {
     }
 
     // 1-sample resolve target (MSAA: attachment 2, blit source) or sole color target (1x: attachment 0).
+    // SAMPLED_BIT is required because edge_soften.frag reads this image as a texture.
     colorImage_ = modelCreateImage2D(device_, physDevice_, w, h, colorFormat_,
-        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
     if (colorImage_.image == VK_NULL_HANDLE) return false;
 
     // Depth — same sample count as the color render target.
