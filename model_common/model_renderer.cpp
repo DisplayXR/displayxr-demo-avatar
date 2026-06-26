@@ -31,6 +31,7 @@
 #include "irradiance.frag.h"
 #include "prefilter.frag.h"
 #include "edge_fade.frag.h"
+#include "edge_soften.frag.h"
 
 #include <glm/glm.hpp>
 #include <glm/gtc/type_ptr.hpp>
@@ -277,6 +278,50 @@ bool ModelRenderer::createRenderTargets() {
     rpci.pDependencies   = deps;
     if (vkCreateRenderPass(device_, &rpci, nullptr, &renderPass_) != VK_SUCCESS) return false;
 
+    // Edge-soften post-pass render pass: 1 color attachment (softenColorImage_),
+    // no depth. Reads colorImage_ as a shader sampler (barrier in renderEye);
+    // leaves softenColorImage_ in TRANSFER_SRC_OPTIMAL for the blit.
+    {
+        VkAttachmentDescription att = {};
+        att.format         = colorFormat_;
+        att.samples        = VK_SAMPLE_COUNT_1_BIT;
+        att.loadOp         = VK_ATTACHMENT_LOAD_OP_DONT_CARE;   // overwrite every pixel
+        att.storeOp        = VK_ATTACHMENT_STORE_OP_STORE;
+        att.stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        att.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        att.initialLayout  = VK_IMAGE_LAYOUT_UNDEFINED;
+        att.finalLayout    = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+
+        VkAttachmentReference ref = {0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+        VkSubpassDescription sub = {};
+        sub.pipelineBindPoint    = VK_PIPELINE_BIND_POINT_GRAPHICS;
+        sub.colorAttachmentCount = 1;
+        sub.pColorAttachments    = &ref;
+
+        VkSubpassDependency sdeps[2] = {};
+        sdeps[0].srcSubpass    = VK_SUBPASS_EXTERNAL;
+        sdeps[0].dstSubpass    = 0;
+        sdeps[0].srcStageMask  = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+        sdeps[0].dstStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        sdeps[0].srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        sdeps[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        sdeps[1].srcSubpass    = 0;
+        sdeps[1].dstSubpass    = VK_SUBPASS_EXTERNAL;
+        sdeps[1].srcStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        sdeps[1].dstStageMask  = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        sdeps[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        sdeps[1].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+
+        VkRenderPassCreateInfo srpci = {VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+        srpci.attachmentCount = 1;
+        srpci.pAttachments    = &att;
+        srpci.subpassCount    = 1;
+        srpci.pSubpasses      = &sub;
+        srpci.dependencyCount = 2;
+        srpci.pDependencies   = sdeps;
+        if (vkCreateRenderPass(device_, &srpci, nullptr, &softenRenderPass_) != VK_SUCCESS) return false;
+    }
+
     return ensureTargets(width_, height_);
 }
 
@@ -288,6 +333,8 @@ bool ModelRenderer::ensureTargets(uint32_t w, uint32_t h) {
     if (w == 0) w = 1;
     if (h == 0) h = 1;
     if (device_ != VK_NULL_HANDLE) vkDeviceWaitIdle(device_);
+    if (softenFramebuffer_    != VK_NULL_HANDLE) { vkDestroyFramebuffer(device_, softenFramebuffer_, nullptr); softenFramebuffer_ = VK_NULL_HANDLE; }
+    if (softenColorImage_.image != VK_NULL_HANDLE) { modelDestroyImage(device_, softenColorImage_); softenColorImage_ = {}; }
     if (framebuffer_    != VK_NULL_HANDLE) { vkDestroyFramebuffer(device_, framebuffer_, nullptr); framebuffer_ = VK_NULL_HANDLE; }
     if (colorImageMS_.image != VK_NULL_HANDLE) { modelDestroyImage(device_, colorImageMS_); colorImageMS_ = {}; }
     if (colorImage_.image   != VK_NULL_HANDLE) modelDestroyImage(device_, colorImage_);
@@ -360,6 +407,37 @@ bool ModelRenderer::ensureTargets(uint32_t w, uint32_t h) {
     fbci.renderPass = renderPass_; fbci.attachmentCount = fbCount; fbci.pAttachments = fbViews;
     fbci.width = w; fbci.height = h; fbci.layers = 1;
     if (vkCreateFramebuffer(device_, &fbci, nullptr, &framebuffer_) != VK_SUCCESS) return false;
+
+    // Edge-soften post-pass: 1-sample output (blit source after the soften pass).
+    softenColorImage_ = modelCreateImage2D(device_, physDevice_, w, h, colorFormat_,
+        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+    if (softenColorImage_.image == VK_NULL_HANDLE) return false;
+
+    if (softenRenderPass_ != VK_NULL_HANDLE) {
+        VkFramebufferCreateInfo sfbci = {VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+        sfbci.renderPass      = softenRenderPass_;
+        sfbci.attachmentCount = 1;
+        sfbci.pAttachments    = &softenColorImage_.view;
+        sfbci.width = w; sfbci.height = h; sfbci.layers = 1;
+        if (vkCreateFramebuffer(device_, &sfbci, nullptr, &softenFramebuffer_) != VK_SUCCESS) return false;
+    }
+
+    // If the pipeline is already initialised (resize path), update the soften
+    // descriptor set to point at the new colorImage_ view.
+    if (softenSet_ != VK_NULL_HANDLE) {
+        VkDescriptorImageInfo dii = {};
+        dii.sampler     = softenSampler_;
+        dii.imageView   = colorImage_.view;
+        dii.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        VkWriteDescriptorSet wr = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        wr.dstSet          = softenSet_;
+        wr.dstBinding      = 0;
+        wr.descriptorCount = 1;
+        wr.descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        wr.pImageInfo      = &dii;
+        vkUpdateDescriptorSets(device_, 1, &wr, 0, nullptr);
+    }
+
     return true;
 }
 
@@ -586,6 +664,109 @@ bool ModelRenderer::createPipeline() {
         vkDestroyShaderModule(device_, fvs, nullptr);
         vkDestroyShaderModule(device_, ffs, nullptr);
         if (fpr != VK_SUCCESS) { std::fprintf(stderr, "ModelRenderer: failed to create edge-fade pipeline (%d)\n", fpr); return false; }
+    }
+
+    // Edge-soften post-pass pipeline: reads colorImage_ as a sampler, writes to
+    // softenColorImage_. Runs in its own render pass (softenRenderPass_) after the
+    // main MSAA render pass. softenColorImage_ replaces colorImage_ as blit source.
+    {
+        // CLAMP_TO_EDGE sampler — prevents the main sampler's REPEAT wrapping
+        // from pulling in content from the opposite atlas edge at the viewport boundary.
+        VkSamplerCreateInfo ssci = {VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+        ssci.magFilter    = VK_FILTER_NEAREST;
+        ssci.minFilter    = VK_FILTER_NEAREST;
+        ssci.mipmapMode   = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+        ssci.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        ssci.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        ssci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        ssci.maxLod       = 0.0f;
+        if (vkCreateSampler(device_, &ssci, nullptr, &softenSampler_) != VK_SUCCESS) return false;
+
+        VkDescriptorSetLayoutBinding sdslb = {};
+        sdslb.binding        = 0;
+        sdslb.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        sdslb.descriptorCount = 1;
+        sdslb.stageFlags     = VK_SHADER_STAGE_FRAGMENT_BIT;
+        VkDescriptorSetLayoutCreateInfo sdlci = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        sdlci.bindingCount = 1;
+        sdlci.pBindings    = &sdslb;
+        if (vkCreateDescriptorSetLayout(device_, &sdlci, nullptr, &softenDsLayout_) != VK_SUCCESS) return false;
+
+        VkDescriptorPoolSize sdps = {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1};
+        VkDescriptorPoolCreateInfo sdpci = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+        sdpci.maxSets       = 1;
+        sdpci.poolSizeCount = 1;
+        sdpci.pPoolSizes    = &sdps;
+        if (vkCreateDescriptorPool(device_, &sdpci, nullptr, &softenPool_) != VK_SUCCESS) return false;
+
+        VkDescriptorSetAllocateInfo sdsai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        sdsai.descriptorPool     = softenPool_;
+        sdsai.descriptorSetCount = 1;
+        sdsai.pSetLayouts        = &softenDsLayout_;
+        if (vkAllocateDescriptorSets(device_, &sdsai, &softenSet_) != VK_SUCCESS) return false;
+
+        VkDescriptorImageInfo sdii = {};
+        sdii.sampler     = softenSampler_;
+        sdii.imageView   = colorImage_.view;
+        sdii.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        VkWriteDescriptorSet swr = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        swr.dstSet          = softenSet_;
+        swr.dstBinding      = 0;
+        swr.descriptorCount = 1;
+        swr.descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        swr.pImageInfo      = &sdii;
+        vkUpdateDescriptorSets(device_, 1, &swr, 0, nullptr);
+
+        VkPipelineLayoutCreateInfo splci = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        splci.setLayoutCount = 1;
+        splci.pSetLayouts    = &softenDsLayout_;
+        if (vkCreatePipelineLayout(device_, &splci, nullptr, &softenPipelineLayout_) != VK_SUCCESS) return false;
+
+        VkShaderModule spvs = createShaderModule(device_, fullscreen_vert_data, sizeof(fullscreen_vert_data));
+        VkShaderModule spfs = createShaderModule(device_, edge_soften_frag_data, sizeof(edge_soften_frag_data));
+        if (spvs == VK_NULL_HANDLE || spfs == VK_NULL_HANDLE) return false;
+
+        VkPipelineShaderStageCreateInfo sst[2] = {};
+        sst[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        sst[0].stage = VK_SHADER_STAGE_VERTEX_BIT;   sst[0].module = spvs; sst[0].pName = "main";
+        sst[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        sst[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; sst[1].module = spfs; sst[1].pName = "main";
+
+        VkPipelineVertexInputStateCreateInfo svi4 = {VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+        VkPipelineInputAssemblyStateCreateInfo sia4 = {VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+        sia4.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+        VkPipelineViewportStateCreateInfo svp4 = {VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+        svp4.viewportCount = 1; svp4.scissorCount = 1;
+        VkPipelineRasterizationStateCreateInfo srs4 = {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+        srs4.polygonMode = VK_POLYGON_MODE_FILL; srs4.cullMode = VK_CULL_MODE_NONE;
+        srs4.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE; srs4.lineWidth = 1.0f;
+        VkPipelineMultisampleStateCreateInfo sms4 = {VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+        sms4.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+        VkPipelineDepthStencilStateCreateInfo sds4 = {VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+        sds4.depthTestEnable = VK_FALSE; sds4.depthWriteEnable = VK_FALSE;
+        VkPipelineColorBlendAttachmentState scba4 = {};
+        scba4.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                               VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+        scba4.blendEnable = VK_FALSE;
+        VkPipelineColorBlendStateCreateInfo scb4 = {VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+        scb4.attachmentCount = 1; scb4.pAttachments = &scba4;
+        VkDynamicState sdyn4[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+        VkPipelineDynamicStateCreateInfo sdynci4 = {VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+        sdynci4.dynamicStateCount = 2; sdynci4.pDynamicStates = sdyn4;
+
+        VkGraphicsPipelineCreateInfo spci = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+        spci.stageCount          = 2;           spci.pStages             = sst;
+        spci.pVertexInputState   = &svi4;        spci.pInputAssemblyState = &sia4;
+        spci.pViewportState      = &svp4;        spci.pRasterizationState = &srs4;
+        spci.pMultisampleState   = &sms4;        spci.pDepthStencilState  = &sds4;
+        spci.pColorBlendState    = &scb4;        spci.pDynamicState       = &sdynci4;
+        spci.layout              = softenPipelineLayout_;
+        spci.renderPass          = softenRenderPass_;
+        spci.subpass             = 0;
+        VkResult sepr = vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &spci, nullptr, &softenPipeline_);
+        vkDestroyShaderModule(device_, spvs, nullptr);
+        vkDestroyShaderModule(device_, spfs, nullptr);
+        if (sepr != VK_SUCCESS) { std::fprintf(stderr, "ModelRenderer: failed to create edge-soften pipeline (%d)\n", sepr); return false; }
     }
 
     // Descriptor pool + set + the host-visible uniform buffer.
@@ -1732,6 +1913,47 @@ void ModelRenderer::renderEye(VkImage swapchainImage,
     vkCmdEndRenderPass(cmd);
     // colorImage_ is now in TRANSFER_SRC_OPTIMAL (render-pass finalLayout).
 
+    // ── Edge-softening post-pass ────────────────────────────────────────────
+    // Transition colorImage_ TRANSFER_SRC_OPTIMAL → SHADER_READ_ONLY_OPTIMAL so
+    // the soften shader can sample it; softenColorImage_ ends TRANSFER_SRC_OPTIMAL
+    // (via softenRenderPass_ finalLayout) and replaces colorImage_ as blit source.
+    if (softenPipeline_ != VK_NULL_HANDLE) {
+        VkImageMemoryBarrier rdBarrier = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        rdBarrier.srcAccessMask       = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        rdBarrier.dstAccessMask       = VK_ACCESS_SHADER_READ_BIT;
+        rdBarrier.oldLayout           = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        rdBarrier.newLayout           = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        rdBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        rdBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        rdBarrier.image               = colorImage_.image;
+        rdBarrier.subresourceRange    = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        vkCmdPipelineBarrier(cmd,
+            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+            0, 0, nullptr, 0, nullptr, 1, &rdBarrier);
+
+        VkRenderPassBeginInfo srpbi = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+        srpbi.renderPass        = softenRenderPass_;
+        srpbi.framebuffer       = softenFramebuffer_;
+        srpbi.renderArea.offset = {0, 0};
+        srpbi.renderArea.extent = {viewportWidth, viewportHeight};
+        srpbi.clearValueCount   = 0;   // loadOp = DONT_CARE
+        vkCmdBeginRenderPass(cmd, &srpbi, VK_SUBPASS_CONTENTS_INLINE);
+
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, softenPipeline_);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, softenPipelineLayout_,
+                                0, 1, &softenSet_, 0, nullptr);
+        // Always positive-height viewport: gl_FragCoord-based UV doesn't care about
+        // the Y-flip convention (the soften pass is a pure image-to-image operation).
+        VkViewport softenVp = {0.0f, 0.0f, (float)viewportWidth, (float)viewportHeight, 0.0f, 1.0f};
+        VkRect2D   softenSc = {{0, 0}, {viewportWidth, viewportHeight}};
+        vkCmdSetViewport(cmd, 0, 1, &softenVp);
+        vkCmdSetScissor(cmd,  0, 1, &softenSc);
+        vkCmdDraw(cmd, 3, 1, 0, 0);   // fullscreen triangle
+        vkCmdEndRenderPass(cmd);
+        // softenColorImage_ is now in TRANSFER_SRC_OPTIMAL (softenRenderPass_ finalLayout).
+    }
+
     // Swapchain → TRANSFER_DST. First view of the image (top-left tile):
     // UNDEFINED ok. Later views: preserve the prior tiles by treating the
     // contents as COLOR_ATTACHMENT. (vpX alone misfires on row-tiled 2x2
@@ -1760,8 +1982,12 @@ void ModelRenderer::renderEye(VkImage swapchainImage,
     blit.dstOffsets[0] = {(int32_t)viewportX, (int32_t)viewportY, 0};
     blit.dstOffsets[1] = {(int32_t)(viewportX + viewportWidth),
                           (int32_t)(viewportY + viewportHeight), 1};
+    // Use softenColorImage_ as the blit source when the soften pass ran;
+    // fall back to colorImage_ if the pipeline wasn't available.
+    VkImage blitSrc = (softenPipeline_ != VK_NULL_HANDLE)
+                    ? softenColorImage_.image : colorImage_.image;
     vkCmdBlitImage(cmd,
-        colorImage_.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        blitSrc, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
         swapchainImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
         1, &blit, VK_FILTER_LINEAR);
 
@@ -1853,6 +2079,16 @@ void ModelRenderer::cleanup() {
     if (pipelineLayout_ != VK_NULL_HANDLE) { vkDestroyPipelineLayout(device_, pipelineLayout_, nullptr); pipelineLayout_ = VK_NULL_HANDLE; }
     if (dsLayout_ != VK_NULL_HANDLE) { vkDestroyDescriptorSetLayout(device_, dsLayout_, nullptr); dsLayout_ = VK_NULL_HANDLE; }
     if (jointSetLayout_ != VK_NULL_HANDLE) { vkDestroyDescriptorSetLayout(device_, jointSetLayout_, nullptr); jointSetLayout_ = VK_NULL_HANDLE; }
+    // Edge-soften post-pass resources (pipeline → layout → pool → layout → sampler → fb → image → rp).
+    if (softenPipeline_       != VK_NULL_HANDLE) { vkDestroyPipeline(device_, softenPipeline_, nullptr);             softenPipeline_      = VK_NULL_HANDLE; }
+    if (softenPipelineLayout_ != VK_NULL_HANDLE) { vkDestroyPipelineLayout(device_, softenPipelineLayout_, nullptr); softenPipelineLayout_= VK_NULL_HANDLE; }
+    if (softenPool_           != VK_NULL_HANDLE) { vkDestroyDescriptorPool(device_, softenPool_, nullptr);           softenPool_          = VK_NULL_HANDLE; softenSet_ = VK_NULL_HANDLE; }
+    if (softenDsLayout_       != VK_NULL_HANDLE) { vkDestroyDescriptorSetLayout(device_, softenDsLayout_, nullptr);  softenDsLayout_      = VK_NULL_HANDLE; }
+    if (softenSampler_        != VK_NULL_HANDLE) { vkDestroySampler(device_, softenSampler_, nullptr);               softenSampler_       = VK_NULL_HANDLE; }
+    if (softenFramebuffer_    != VK_NULL_HANDLE) { vkDestroyFramebuffer(device_, softenFramebuffer_, nullptr);       softenFramebuffer_   = VK_NULL_HANDLE; }
+    if (softenColorImage_.image != VK_NULL_HANDLE) { modelDestroyImage(device_, softenColorImage_); softenColorImage_ = {}; }
+    if (softenRenderPass_     != VK_NULL_HANDLE) { vkDestroyRenderPass(device_, softenRenderPass_, nullptr);         softenRenderPass_    = VK_NULL_HANDLE; }
+
     if (framebuffer_ != VK_NULL_HANDLE) { vkDestroyFramebuffer(device_, framebuffer_, nullptr); framebuffer_ = VK_NULL_HANDLE; }
     if (renderPass_ != VK_NULL_HANDLE) { vkDestroyRenderPass(device_, renderPass_, nullptr); renderPass_ = VK_NULL_HANDLE; }
     if (colorImageMS_.image != VK_NULL_HANDLE) { modelDestroyImage(device_, colorImageMS_); colorImageMS_ = {}; }
