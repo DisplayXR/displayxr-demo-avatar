@@ -645,6 +645,14 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         if (wParam == 'I' || wParam == 'i') {
             g_captureAtlasRequested.store(true);
         }
+        // G key = toggle the alpha edge-softening post-pass (Gaussian silhouette
+        // blur). 8× MSAA is always on; this extra per-eye pass is opt-in so the
+        // softening / its cost can be A/B'd live on the display.
+        if (wParam == 'G') {
+            bool now = !g_modelRenderer.edgeSoftenEnabled();
+            g_modelRenderer.setEdgeSoftenEnabled(now);
+            LOG_INFO("Edge-soften post-pass: %s (G)", now ? "ON" : "OFF");
+        }
         break;
 
     case WM_SIZE:
@@ -2294,7 +2302,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     LOG_INFO("");
     LOG_INFO("=== Entering main loop ===");
-    LOG_INFO("Controls: A/D=Move L/R  W/S=Dolly depth  Ctrl+T=Transparency");
+    LOG_INFO("Controls: A/D=Move L/R  W/S=Dolly depth  Ctrl+T=Transparency  G=Edge-soften");
     LOG_INFO("          Space=Reset  V=Mode  N=Clip  K=Play/Pause");
     LOG_INFO("          B=Decoration(move/resize)  I=Capture  F11=Fullscreen  ESC=Quit");
     LOG_INFO("");

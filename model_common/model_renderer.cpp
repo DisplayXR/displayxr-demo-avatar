@@ -1915,10 +1915,13 @@ void ModelRenderer::renderEye(VkImage swapchainImage,
     // colorImage_ is now in TRANSFER_SRC_OPTIMAL (render-pass finalLayout).
 
     // ── Edge-softening post-pass ────────────────────────────────────────────
+    // Opt-in (key G, default off): 8× MSAA is always on; this extra per-eye pass
+    // is the costly fullscreen Gaussian, so it only runs when toggled on.
     // Transition colorImage_ TRANSFER_SRC_OPTIMAL → SHADER_READ_ONLY_OPTIMAL so
     // the soften shader can sample it; softenColorImage_ ends TRANSFER_SRC_OPTIMAL
     // (via softenRenderPass_ finalLayout) and replaces colorImage_ as blit source.
-    if (softenPipeline_ != VK_NULL_HANDLE) {
+    const bool runSoften = (softenPipeline_ != VK_NULL_HANDLE) && edgeSoftenEnabled_.load();
+    if (runSoften) {
         VkImageMemoryBarrier rdBarrier = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
         rdBarrier.srcAccessMask       = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
         rdBarrier.dstAccessMask       = VK_ACCESS_SHADER_READ_BIT;
@@ -1983,10 +1986,9 @@ void ModelRenderer::renderEye(VkImage swapchainImage,
     blit.dstOffsets[0] = {(int32_t)viewportX, (int32_t)viewportY, 0};
     blit.dstOffsets[1] = {(int32_t)(viewportX + viewportWidth),
                           (int32_t)(viewportY + viewportHeight), 1};
-    // Use softenColorImage_ as the blit source when the soften pass ran;
-    // fall back to colorImage_ if the pipeline wasn't available.
-    VkImage blitSrc = (softenPipeline_ != VK_NULL_HANDLE)
-                    ? softenColorImage_.image : colorImage_.image;
+    // Use softenColorImage_ as the blit source only when the soften pass ran
+    // this frame (toggled on); otherwise blit the MSAA-resolved colorImage_.
+    VkImage blitSrc = runSoften ? softenColorImage_.image : colorImage_.image;
     vkCmdBlitImage(cmd,
         blitSrc, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
         swapchainImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
