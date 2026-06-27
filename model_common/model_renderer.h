@@ -23,6 +23,7 @@
 #include <string>
 #include <cstdint>
 #include <vector>
+#include <atomic>
 #include "model_vulkan_utils.h"
 #include "model_loader.h"
 
@@ -91,6 +92,14 @@ struct ModelRenderer {
     // negative-height viewport in renderEye. Default off = legacy convention
     // (view-stage Y mirror, positive viewport) used by the macOS port.
     void setPlainViewConvention(bool plain) { plainViewConvention_ = plain; }
+
+    // Toggle the alpha edge-softening post-pass (the 3×3 Gaussian that widens
+    // the silhouette band, see softenPipeline_). 8× MSAA is always on; this
+    // pass is the extra per-eye render pass + fullscreen blur, so it is opt-in
+    // (default off) and flipped live via a key (G) for A/B-ing on the display.
+    // Atomic: set from the Win32 message thread, read on the render thread.
+    void setEdgeSoftenEnabled(bool e) { edgeSoftenEnabled_.store(e); }
+    bool edgeSoftenEnabled() const { return edgeSoftenEnabled_.load(); }
 
     // edgeFadePx > 0 fades the rendered CONTENT alpha (premultiplied: RGB and
     // A together) to 0 over that many pixels at the viewport edges — the
@@ -166,6 +175,7 @@ private:
     bool initialized_ = false;
     bool modelLoaded_ = false;
     bool plainViewConvention_ = false;   // see setPlainViewConvention
+    std::atomic<bool> edgeSoftenEnabled_{false};  // soften post-pass opt-in (key G)
     std::string loadedModelPath_;
     uint32_t numPrimitives_ = 0;
 
