@@ -108,7 +108,9 @@ jobs:
         run: |
           # The demo links the OpenXR loader. Mirror the runtime repo: grab the
           # prebuilt Khronos loader and point CMake at it via OpenXR_ROOT.
-          $openxrVersion = "1.1.43"
+          # Pinned to the same spec rev as the vendored openxr_includes/ headers
+          # (XR_CURRENT_API_VERSION = 1.1.51) and scripts/build-with-deps.bat.
+          $openxrVersion = "1.1.51"
           $openxrUrl = "https://github.com/KhronosGroup/OpenXR-SDK-Source/releases/download/release-$openxrVersion/openxr_loader_windows-$openxrVersion.zip"
           Invoke-WebRequest -Uri $openxrUrl -OutFile openxr_loader.zip
           Expand-Archive -Path openxr_loader.zip -DestinationPath openxr_sdk -Force
