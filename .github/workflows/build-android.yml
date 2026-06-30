@@ -1,0 +1,137 @@
+name: Build Android
+
+# Android APK build for the avatar demo (com.displayxr.avatar_vk_android, the
+# OpenXR client that binds the installed DisplayXR runtime out-of-process).
+# Mirrors build-windows.yml / build-macos.yml: PR + push-to-main runs are validation
+# only; on a v* tag this builds a RELEASE-SIGNED APK and attaches it to the GitHub
+# Release alongside the .exe / .pkg. (The Android leg had no CI before — releases
+# shipped desktop installers only; this closes that gap.)
+#
+# Signing is driven entirely by repo secrets — no keystore lives in the repo:
+#   ANDROID_KEYSTORE_BASE64  ANDROID_KEYSTORE_PASSWORD  ANDROID_KEY_ALIAS  ANDROID_KEY_PASSWORD
+# build.gradle reads ANDROID_KEYSTORE_FILE + the passwords from the env (set below).
+# A build with those unset (e.g. a fork) produces an UNSIGNED release APK and skips
+# the attach, so it never fails for want of the key.
+#
+# versions.json DispatchVersionsBump is intentionally NOT here — build-windows.yml
+# already bumps the demo on a tag; duplicating it would double-dispatch.
+
+on:
+  pull_request: {}
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  workflow_dispatch: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  DetectChanges:
+    runs-on: ubuntu-latest
+    outputs:
+      docs_only: ${{ steps.filter.outputs.docs_only }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - id: filter
+        run: |
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            echo "docs_only=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE=${{ github.event.pull_request.base.sha }}
+          else
+            BASE=${{ github.event.before }}
+          fi
+          if [ -z "$BASE" ] || ! git cat-file -e "$BASE" 2>/dev/null; then
+            echo "docs_only=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          CHANGED=$(git diff --name-only "$BASE" HEAD)
+          NON_DOC=$(echo "$CHANGED" | grep -vE '^(docs/|.*\.md$|LICENSE$|\.github/ISSUE_TEMPLATE/)' || true)
+          if [ -n "$CHANGED" ] && [ -z "$NON_DOC" ]; then
+            echo "docs_only=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "docs_only=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  BuildApk:
+    name: Build Android
+    needs: DetectChanges
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Doc-only short-circuit
+        if: needs.DetectChanges.outputs.docs_only == 'true'
+        run: echo "docs_only=true; build steps will skip and report success."
+
+      - uses: actions/checkout@v5
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+
+      - name: Set up JDK 17
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        uses: android-actions/setup-android@v3
+
+      - name: Install glslangValidator (shader compile)
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: sudo apt-get update && sudo apt-get install -y glslang-tools
+
+      - name: Decode release keystore
+        if: needs.DetectChanges.outputs.docs_only != 'true' && env.ANDROID_KEYSTORE_BASE64 != ''
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          echo "$ANDROID_KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
+          echo "ANDROID_KEYSTORE_FILE=$RUNNER_TEMP/release.jks" >> "$GITHUB_ENV"
+
+      - name: Build release APK
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        env:
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: ./gradlew :android:assembleRelease --no-daemon
+
+      - name: Stage the APK with a release name
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: |
+          VER="${GITHUB_REF_NAME#v}"
+          [ "$GITHUB_REF_TYPE" = "tag" ] || VER="dev-${GITHUB_SHA::8}"
+          APK=$(find android/build/outputs/apk/release -name '*.apk' | head -1)
+          mkdir -p out
+          cp "$APK" "out/DisplayXRAvatar-${VER}.apk"
+          ls -la out
+
+      - name: Upload APK artifact
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: DisplayXRAvatar-apk
+          path: out/*.apk
+
+      # Attach to the GitHub Release on a v* tag (alongside the .exe / .pkg). Only
+      # when the APK is release-signed (keystore secret present) — never publish an
+      # unsigned APK to a release.
+      - name: Attach APK to GitHub release on tag
+        if: needs.DetectChanges.outputs.docs_only != 'true' && startsWith(github.ref, 'refs/tags/v') && env.ANDROID_KEYSTORE_FILE != ''
+        uses: softprops/action-gh-release@v3
+        with:
+          files: out/DisplayXRAvatar-*.apk
+          fail_on_unmatched_files: true
