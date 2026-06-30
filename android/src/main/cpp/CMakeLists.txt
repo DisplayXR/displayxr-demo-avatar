@@ -52,7 +52,7 @@ if(NOT GLSLANGVALIDATOR_COMMAND)
 endif()
 set(SHADER_DIR "${MODEL_COMMON}/shaders")
 set(MV_SHADERS pbr.vert pbr.frag skybox.frag fullscreen.vert
-    brdf_lut.frag irradiance.frag prefilter.frag edge_fade.frag)
+    brdf_lut.frag irradiance.frag prefilter.frag edge_fade.frag edge_soften.frag)
 set(SHADER_HEADERS "")
 foreach(S ${MV_SHADERS})
     string(REPLACE "." "_" VN "${S}")          # pbr.vert -> pbr_vert
