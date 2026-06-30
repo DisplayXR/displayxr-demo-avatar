@@ -10,3 +10,7 @@ local.properties
 .gradle/
 android/build/
 android/.cxx/
+
+# Android signing keystores — never commit (CI uses GitHub secrets)
+*.jks
+*.keystore
