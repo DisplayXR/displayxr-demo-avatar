@@ -1,5 +1,5 @@
 // Copyright 2026, Leia Inc.
-// SPDX-License-Identifier: BSL-1.0
+// SPDX-License-Identifier: Apache-2.0
 //
 // Metallic-roughness PBR vertex shader. Static geometry uses the per-primitive
 // push-constant model matrix; skinned primitives (mrParams.z > 0.5) use linear-

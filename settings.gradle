@@ -1,5 +1,5 @@
 // Copyright 2026, Leia Inc.
-// SPDX-License-Identifier: BSL-1.0
+// SPDX-License-Identifier: Apache-2.0
 //
 // Gradle settings for the Android leg of displayxr-demo-avatar. The
 // windows/ + macos/ legs build via the top-level CMakeLists.txt; the android/

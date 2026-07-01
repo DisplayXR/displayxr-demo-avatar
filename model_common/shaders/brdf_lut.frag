@@ -1,5 +1,5 @@
 // Copyright 2026, Leia Inc.
-// SPDX-License-Identifier: BSL-1.0
+// SPDX-License-Identifier: Apache-2.0
 //
 // Split-sum BRDF integration LUT (Karis). x = NdotV, y = roughness → (scale, bias).
 #version 450

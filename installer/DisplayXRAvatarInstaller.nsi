@@ -1,6 +1,6 @@
 ; DisplayXR 3D Avatar Demo — Windows Installer
 ; Copyright 2026, DisplayXR
-; SPDX-License-Identifier: BSL-1.0
+; SPDX-License-Identifier: Apache-2.0
 ;
 ; Build: makensis /DVERSION=1.2.0 /DBIN_DIR=<demo-build-dir> /DSOURCE_DIR=<demo-repo-root> /DOUTPUT_DIR=<output-dir> DisplayXRAvatarInstaller.nsi
 ;

@@ -1,5 +1,5 @@
 // Copyright 2026, Leia Inc.
-// SPDX-License-Identifier: BSL-1.0
+// SPDX-License-Identifier: Apache-2.0
 //
 // Zone edge-fade post-pass (ADR-027 rule 4: blends are CONTENT alpha). Drawn
 // as the last fullscreen triangle of the eye render pass with blend factors

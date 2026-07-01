@@ -1,5 +1,5 @@
 // Copyright 2026, Leia Inc.
-// SPDX-License-Identifier: BSL-1.0
+// SPDX-License-Identifier: Apache-2.0
 //
 // Alpha edge-softening post-pass (Step B of PM0034 anti-aliasing).
 // Reads the MSAA-resolved color image and applies a 3×3 alpha-weighted Gaussian

@@ -1,5 +1,5 @@
 // Copyright 2026, Leia Inc.
-// SPDX-License-Identifier: BSL-1.0
+// SPDX-License-Identifier: Apache-2.0
 //
 // Background skybox. Reconstructs a world-space view ray per pixel from
 // inverse(viewProj) and samples the PREFILTERED environment cube at a high mip

@@ -1,5 +1,5 @@
 // Copyright 2025, Leia Inc.
-// SPDX-License-Identifier: BSL-1.0
+// SPDX-License-Identifier: Apache-2.0
 /*!
  * @file
  * @brief  OpenXR session management for Vulkan with XR_EXT_win32_window_binding

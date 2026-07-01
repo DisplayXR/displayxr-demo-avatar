@@ -1,5 +1,5 @@
 // Copyright 2026, DisplayXR
-// SPDX-License-Identifier: BSL-1.0
+// SPDX-License-Identifier: Apache-2.0
 /*!
  * @file
  * @brief  Header for XR_EXT_spatial_workspace extension (Phase 2.A subset)

@@ -1,6 +1,6 @@
 <!--
 Copyright 2026, Leia Inc.
-SPDX-License-Identifier: BSL-1.0
+SPDX-License-Identifier: Apache-2.0
 -->
 
 # Android overlay-mode: platform idiosyncrasies & workarounds (#558)

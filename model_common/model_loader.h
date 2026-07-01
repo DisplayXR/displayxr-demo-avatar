@@ -1,5 +1,5 @@
 // Copyright 2026, Leia Inc.
-// SPDX-License-Identifier: BSL-1.0
+// SPDX-License-Identifier: Apache-2.0
 /*!
  * @file
  * @brief  CPU-side glTF 2.0 loader (tinygltf) → flat GPU-upload-friendly form.
