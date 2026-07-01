@@ -59,7 +59,7 @@ relative path (like `windows/` + `macos/`), scaffolded from the
   through everything around the avatar. The Android analog of Windows'
   `WS_EX_NOREDIRECTIONBITMAP` + null brush; the runtime renders the avatar into a
   translucent SurfaceFlinger overlay (no DComp, no IPC handback — see the runtime
-  `#568` work). 2D verified; 3D weave (Leia) is pending the DP alpha-gate.
+  `#568` work). 2D verified; 3D weave (Leia SR) is pending the DP alpha-gate.
 - **Bundled tiger** `assets/tiger/avatar.fbx` via the ufbx backend (its `rgb.jpg`
   is staged alongside). OBJ/STL/USD are desktop-only (gated under `__ANDROID__`).
 - **Worst-case view sizing** — one atlas swapchain sized for the runtime's max

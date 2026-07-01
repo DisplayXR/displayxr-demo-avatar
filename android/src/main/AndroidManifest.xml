@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-    Copyright 2026, Leia Inc.
+    Copyright 2026, The DisplayXR Project and its contributors
     SPDX-License-Identifier: Apache-2.0
 
     Android leg of displayxr-demo-avatar. A vendor-neutral OpenXR client:

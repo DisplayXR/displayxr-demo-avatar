@@ -1,4 +1,4 @@
-# Copyright 2026, Leia Inc.
+# Copyright 2026, The DisplayXR Project and its contributors
 # SPDX-License-Identifier: Apache-2.0
 #
 # Standalone build (displayxr-demo-modelviewer repo). Builds the
@@ -38,7 +38,7 @@ FetchContent_MakeAvailable(tinygltf)
 
 # ── glm (math, header-only) ───────────────────────────────────────────────
 # The PBR reference renderer uses glm for matrices/quaternions. The demo's
-# own Kooima view math lives in common/leia_math.h; glm is for the model
+# own Kooima view math lives in common/dxr_math.h; glm is for the model
 # node hierarchy / skinning transforms inside model_common only.
 FetchContent_Declare(glm
     GIT_REPOSITORY https://github.com/g-truc/glm.git

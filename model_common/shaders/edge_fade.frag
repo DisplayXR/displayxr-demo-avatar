@@ -1,4 +1,4 @@
-// Copyright 2026, Leia Inc.
+// Copyright 2026, The DisplayXR Project and its contributors
 // SPDX-License-Identifier: Apache-2.0
 //
 // Zone edge-fade post-pass (ADR-027 rule 4: blends are CONTENT alpha). Drawn

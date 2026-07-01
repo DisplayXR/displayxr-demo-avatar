@@ -1,11 +1,11 @@
-# Copyright 2025, Leia Inc.
+# Copyright 2025, The DisplayXR Project and its contributors
 # SPDX-License-Identifier: Apache-2.0
 #
 # Standalone build (displayxr-demo-* repo). The shared C++ scaffolding
 # (logging / input / window / xr_session_common / HUD / D3D11 renderer /
 # atlas-capture helper / stb) AND the off-axis Kooima math now come from
 # displayxr-common, pinned by tag instead of vendored here (epic #396 W3
-# math, W4 scaffolding). Only leia_math.h (app-local reference math) stays
+# math, W4 scaffolding). Only dxr_math.h (app-local reference math) stays
 # in this directory.
 
 cmake_minimum_required(VERSION 3.21)

@@ -1,5 +1,5 @@
 <!--
-Copyright 2026, Leia Inc.
+Copyright 2026, The DisplayXR Project and its contributors
 SPDX-License-Identifier: Apache-2.0
 -->
 

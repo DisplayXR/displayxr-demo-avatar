@@ -1,4 +1,4 @@
-// Copyright 2025, Leia Inc.
+// Copyright 2025, The DisplayXR Project and its contributors
 // SPDX-License-Identifier: Apache-2.0
 // Copied from DisplayXR SDK reference example (parallax_toggle)
 
@@ -9,7 +9,7 @@
 
 #pragma pack(push,1)
 
-namespace leia {
+namespace dxr {
 
 struct vec3f
 {
@@ -278,6 +278,6 @@ inline mat4f CalculateMVP(const vec3f& eye, float screenWidthMM, float screenHei
     return mvp;
 }
 
-} // namespace leia
+} // namespace dxr
 
 #pragma pack(pop)
