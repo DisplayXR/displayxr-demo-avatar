@@ -34,13 +34,45 @@
 !endif
 
 ;--------------------------------
+; Code signing (SIGN_CMD passed from build-installer.bat; empty/absent =
+; unsigned build). SIGN_CMD carries no secret — on a signing-capable build
+; machine it points at the configured signer; elsewhere it is absent and the
+; build is unsigned.
+;
+; The installer .exe is signed via !finalize. The UNINSTALLER is signed via a
+; two-pass build instead of !uninstfinalize (which is unreliable — the
+; uninstaller NSIS writes at install time inherits the signed installer's
+; cert-table pointer, which can dangle past the smaller uninstaller file =>
+; effectively unsigned): compile an INNER installer whose only job is to
+; WriteUninstaller to %TEMP% and Quit; run it; sign that %TEMP%\Uninstall.exe;
+; then File-include the pre-signed uninstaller in the real pass. INNER is
+; RequestExecutionLevel user so it never triggers UAC from makensis.
+!ifndef INNER
+    !ifdef SIGN_CMD
+        !if "${SIGN_CMD}" != ""
+            !finalize '${SIGN_CMD} "%1"'
+            !makensis '-DINNER "-DVERSION=${VERSION}" "-DVERSION_MAJOR=${VERSION_MAJOR}" "-DVERSION_MINOR=${VERSION_MINOR}" "-DVERSION_PATCH=${VERSION_PATCH}" "-DSOURCE_DIR=${SOURCE_DIR}" "-DBIN_DIR=${BIN_DIR}" "-DOUTPUT_DIR=${OUTPUT_DIR}" "${__FILE__}"' = 0
+            !system '"$%TEMP%\DisplayXRAvatarSetup_inner.exe"' = 2
+            !system '${SIGN_CMD} "$%TEMP%\Uninstall.exe"' = 0
+            !define USE_PRESIGNED_UNINST
+        !endif
+    !endif
+!endif
+
+;--------------------------------
 ; General
 
 Name "DisplayXR 3D Avatar Demo ${VERSION}"
-OutFile "${OUTPUT_DIR}\DisplayXRAvatarSetup-${VERSION}.exe"
+!ifdef INNER
+    ; Throwaway inner installer: only emits the uninstaller to %TEMP%.
+    OutFile "$%TEMP%\DisplayXRAvatarSetup_inner.exe"
+    RequestExecutionLevel user
+!else
+    OutFile "${OUTPUT_DIR}\DisplayXRAvatarSetup-${VERSION}.exe"
+    RequestExecutionLevel admin
+!endif
 InstallDir "$PROGRAMFILES64\DisplayXR\Demos\Avatar"
 InstallDirRegKey HKLM "Software\DisplayXR\Demos\Avatar" "InstallPath"
-RequestExecutionLevel admin
 ShowInstDetails show
 ShowUninstDetails show
 
@@ -81,6 +113,14 @@ ShowUninstDetails show
 ; Pre-flight: hard-prereq the runtime
 
 Function .onInit
+!ifdef INNER
+    ; Inner pass only: emit the uninstaller to %TEMP% (the binary that gets
+    ; signed and File-included by the real pass) then bail — no UI, no install.
+    ; This whole path is absent from the real installer.
+    SetSilent silent
+    WriteUninstaller "$%TEMP%\Uninstall.exe"
+    Quit
+!endif
     ${IfNot} ${RunningX64}
         MessageBox MB_ICONSTOP "DisplayXR requires 64-bit Windows."
         Abort
@@ -187,7 +227,17 @@ Section "3D Avatar Demo" SecDemo
     WriteRegStr HKLM "Software\DisplayXR\Demos\Avatar" "Version" "${VERSION}"
 
     ; Add/Remove Programs entry.
+    ; In a signed build, install the pre-signed uninstaller produced by the
+    ; inner pass (two-pass signing — see the code-signing block in the header);
+    ; otherwise (unsigned build / CI) write it normally. File /oname respects
+    ; the current $OUTDIR (set to $APPDATA\DisplayXR\apps above), so point it
+    ; back at $INSTDIR where the UninstallString entries below expect it.
+!ifdef USE_PRESIGNED_UNINST
+    SetOutPath "$INSTDIR"
+    File "/oname=Uninstall.exe" "$%TEMP%\Uninstall.exe"
+!else
     WriteUninstaller "$INSTDIR\Uninstall.exe"
+!endif
     WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\DisplayXRAvatar" \
         "DisplayName" "DisplayXR 3D Avatar Demo"
     WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\DisplayXRAvatar" \

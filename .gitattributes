@@ -1,0 +1,8 @@
+# Force Windows shell scripts to be checked out with CRLF line endings.
+# Without this, cross-platform git (or contributor configs without autocrlf)
+# can land .bat files with LF endings, which cmd.exe parses incorrectly ???
+# fragments like 'EM' (from REM with stripped 'R') get executed as commands.
+# See scripts\dev_register.bat for the original reproducer.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
