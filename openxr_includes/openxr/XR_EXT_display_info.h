@@ -1,5 +1,5 @@
 // Copyright 2025-2026, Leia Inc.
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
  * @brief  Header for XR_EXT_display_info extension
