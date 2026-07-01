@@ -1,5 +1,5 @@
 // Copyright 2026, Leia Inc.
-// SPDX-License-Identifier: BSL-1.0
+// SPDX-License-Identifier: Apache-2.0
 //
 // Metallic-roughness PBR fragment shader (Cook-Torrance GGX) with the full
 // glTF material texture set (base-color, metallic-roughness, normal, occlusion,

@@ -1,0 +1,10 @@
+DisplayXR Avatar Demo
+Copyright (c) 2024-2026 Leia, Inc. and the DisplayXR project contributors
+
+This product includes software developed by Leia, Inc. and the DisplayXR
+project contributors. It is licensed under the Apache License, Version 2.0;
+see the LICENSE file for the full text.
+
+This repository also vendors OpenXR extension headers under openxr_includes/
+that are Copyright Collabora, Ltd. and contributors and remain licensed under
+the Boost Software License 1.0 (BSL-1.0); see each file's SPDX-License-Identifier.

@@ -1,5 +1,5 @@
 // Copyright 2026, Leia Inc.
-// SPDX-License-Identifier: BSL-1.0
+// SPDX-License-Identifier: Apache-2.0
 //
 // Fullscreen-triangle vertex shader for the IBL generation passes. Emits a
 // single oversized triangle covering the viewport; outUV spans [-1,1] across

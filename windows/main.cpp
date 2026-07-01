@@ -1,5 +1,5 @@
 // Copyright 2025, Leia Inc.
-// SPDX-License-Identifier: BSL-1.0
+// SPDX-License-Identifier: Apache-2.0
 /*!
  * @file
  * @brief  SR 3DGS OpenXR Ext VK - glTF 2.0 PBR model viewer with OpenXR (Vulkan)

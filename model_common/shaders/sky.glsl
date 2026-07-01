@@ -1,5 +1,5 @@
 // Copyright 2026, Leia Inc.
-// SPDX-License-Identifier: BSL-1.0
+// SPDX-License-Identifier: Apache-2.0
 //
 // Procedural analytic sky used as the IBL environment source (irradiance +
 // prefilter generation). Sun direction matches the main pass's directional

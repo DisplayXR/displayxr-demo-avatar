@@ -1,5 +1,5 @@
 // Copyright 2026, Leia Inc.
-// SPDX-License-Identifier: BSL-1.0
+// SPDX-License-Identifier: Apache-2.0
 //
 // On-screen button bar for the Android leg, drawn into an XR_EXT window-space
 // composition layer (the same single full-width top-bar model as the Windows

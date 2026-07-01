@@ -1,5 +1,5 @@
 // Copyright 2026, Leia Inc.
-// SPDX-License-Identifier: BSL-1.0
+// SPDX-License-Identifier: Apache-2.0
 //
 // #558 overlay mode: a foreground service with two jobs while the avatar's
 // Activity is backgrounded (MainActivity.moveTaskToBack):

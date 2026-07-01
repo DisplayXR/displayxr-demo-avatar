@@ -1,5 +1,5 @@
 // Copyright 2026, Leia Inc.
-// SPDX-License-Identifier: BSL-1.0
+// SPDX-License-Identifier: Apache-2.0
 //
 // Diffuse irradiance cubemap: cosine-weighted integration of the analytic sky
 // over the hemisphere about each output direction. Stores E/π (the main pass

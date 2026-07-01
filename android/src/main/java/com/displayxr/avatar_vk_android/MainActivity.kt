@@ -1,5 +1,5 @@
 // Copyright 2026, Leia Inc.
-// SPDX-License-Identifier: BSL-1.0
+// SPDX-License-Identifier: Apache-2.0
 //
 // Thin NativeActivity wrapper for the avatar demo. Three jobs:
 //   1. Push the authoritative 4-way display rotation to native on launch and on

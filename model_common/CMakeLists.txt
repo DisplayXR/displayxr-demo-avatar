@@ -1,5 +1,5 @@
 # Copyright 2026, Leia Inc.
-# SPDX-License-Identifier: BSL-1.0
+# SPDX-License-Identifier: Apache-2.0
 #
 # Standalone build (displayxr-demo-modelviewer repo). Builds the
 # vendor-neutral glTF/PBR model renderer library (`model_renderer`) that the

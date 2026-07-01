@@ -1,5 +1,5 @@
 # Copyright 2025, Leia Inc.
-# SPDX-License-Identifier: BSL-1.0
+# SPDX-License-Identifier: Apache-2.0
 #
 # Standalone build (displayxr-demo-* repo). The shared C++ scaffolding
 # (logging / input / window / xr_session_common / HUD / D3D11 renderer /

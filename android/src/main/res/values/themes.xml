@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
     Copyright 2026, Leia Inc.
-    SPDX-License-Identifier: BSL-1.0
+    SPDX-License-Identifier: Apache-2.0
 
     Transparency (#568): the avatar Activity hosts the OpenXR session + the
     runtime's MonadoView overlay (which the OOP service renders the weaved

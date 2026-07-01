@@ -1,5 +1,5 @@
 // Copyright 2026, Leia Inc.
-// SPDX-License-Identifier: BSL-1.0
+// SPDX-License-Identifier: Apache-2.0
 //
 // Prefiltered specular environment: GGX importance-sample the analytic sky for
 // the mip's roughness. One mip per roughness level (set via push constant).

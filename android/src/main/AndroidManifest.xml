@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
     Copyright 2026, Leia Inc.
-    SPDX-License-Identifier: BSL-1.0
+    SPDX-License-Identifier: Apache-2.0
 
     Android leg of displayxr-demo-avatar. A vendor-neutral OpenXR client:
     no CNSDK, no SR SDK — it binds to whatever DisplayXR runtime is installed

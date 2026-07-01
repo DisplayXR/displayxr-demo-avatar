@@ -1,5 +1,5 @@
 // Copyright 2026, Leia Inc.
-// SPDX-License-Identifier: BSL-1.0
+// SPDX-License-Identifier: Apache-2.0
 //
 // CPU-rasterized button bar uploaded into an OpenXR swapchain — see hud_bar.h.
 

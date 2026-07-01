@@ -1,5 +1,5 @@
 // Copyright 2026, Leia Inc.
-// SPDX-License-Identifier: BSL-1.0
+// SPDX-License-Identifier: Apache-2.0
 //
 // Android leg of displayxr-demo-avatar. A vendor-neutral OpenXR client
 // (Vulkan, NativeActivity): NO CNSDK / SR SDK — it binds to the installed

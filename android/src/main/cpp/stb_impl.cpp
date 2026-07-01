@@ -1,5 +1,5 @@
 // Copyright 2026, Leia Inc.
-// SPDX-License-Identifier: BSL-1.0
+// SPDX-License-Identifier: Apache-2.0
 //
 // stb_image implementation TU. The glTF loader builds tinygltf with
 // TINYGLTF_NO_STB_IMAGE and supplies a custom image loader that calls stbi_*;
