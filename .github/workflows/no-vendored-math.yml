@@ -40,7 +40,7 @@ jobs:
         shell: bash
         run: |
           # W4 (#396): the C++ scaffolding lives in displayxr::common.
-          # leia_math.h is intentionally absent (app-local reference).
+          # dxr_math.h is intentionally absent (app-local reference).
           hits=$(git ls-files | grep -E '(^|/)(logging|input_handler|window_manager|xr_session_common|xr_window_space_hud|atlas_capture|atlas_capture_macos|hud_renderer|hud_renderer_macos|text_overlay|d3d11_renderer|mip_chain|optimus_dgpu_hint|view_params|stb_image|stb_image_write|stb_image_impl_macos)\.(c|cpp|h|mm)$|(^|/)displayxr_manifest\.cmake$' || true)
           if [ -n "$hits" ]; then
             echo "::error::Re-vendored displayxr::common scaffolding found. The shared C++"

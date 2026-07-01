@@ -1,4 +1,4 @@
-// Copyright 2025, Leia Inc.
+// Copyright 2025, The DisplayXR Project and its contributors
 // SPDX-License-Identifier: Apache-2.0
 
 #include <winver.h>
@@ -16,11 +16,11 @@ BEGIN
     BEGIN
         BLOCK "040904B0"
         BEGIN
-            VALUE "CompanyName",      "Leia Inc."
+            VALUE "CompanyName",      "The DisplayXR Project"
             VALUE "FileDescription",  "DisplayXR 3D Avatar"
             VALUE "FileVersion",      "1.0.0.0"
             VALUE "InternalName",     "avatar_handle_vk_win"
-            VALUE "LegalCopyright",   "Copyright 2026 Leia Inc."
+            VALUE "LegalCopyright",   "Copyright 2026 The DisplayXR Project and its contributors"
             VALUE "OriginalFilename", "avatar_handle_vk_win.exe"
             VALUE "ProductName",      "DisplayXR 3D Avatar"
             VALUE "ProductVersion",   "1.0.0.0"

@@ -1,4 +1,4 @@
-// Copyright 2026, Leia Inc.
+// Copyright 2026, The DisplayXR Project and its contributors
 // SPDX-License-Identifier: Apache-2.0
 //
 // Prefiltered specular environment: GGX importance-sample the analytic sky for
