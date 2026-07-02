@@ -1,6 +1,7 @@
 @echo off
 setlocal
-call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat" >nul 2>&1
+for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSPATH=%%i"
+call "%VSPATH%\VC\Auxiliary\Build\vcvars64.bat" >nul 2>&1
 if %ERRORLEVEL% NEQ 0 (
     echo ERROR: VS 2022 not found
     exit /b 1
