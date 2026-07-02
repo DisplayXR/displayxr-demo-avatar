@@ -46,10 +46,11 @@ function Test-Signed($file) {
 }
 
 function Invoke-Sign($file) {
-    $parts = $SignCmd -split '\s+'
+    # Guard single-token SIGN_CMD: 1..0 is a DESCENDING range -> mis-ordered args.
+    $parts = @($SignCmd -split '\s+' | Where-Object { $_ -ne '' })
     $exe   = $parts[0]
-    $args  = @($parts[1..($parts.Length - 1)]) + $file
-    & $exe @args
+    $rest  = if ($parts.Count -gt 1) { $parts[1..($parts.Count - 1)] } else { @() }
+    & $exe @rest $file
     if ($LASTEXITCODE -ne 0) { throw "Signing failed for $file (exit $LASTEXITCODE)" }
 }
 
