@@ -159,6 +159,20 @@ Vulkan/MoltenVK via brew). Run via **`./scripts/run_macos_dev.sh`**, not the
 bare binary (the dev launcher aligns the app + runtime on one Vulkan loader).
 `./scripts/build_macos.sh --installer` builds the `.pkg`.
 
+### Linux (local dev — build-green only, #21)
+`./scripts/build_linux.sh` (builds the OpenXR loader from source pinned to
+1.1.43, uses system `libvulkan-dev`). Produces `build/linux/avatar_handle_vk_linux`
+and runs via **`./scripts/run_avatar_linux.sh`**. The Linux entry point is
+`linux/main.cpp` — a minimal Vulkan + OpenXR frame loop driving the same
+cross-platform `model_common/ModelRenderer` the macOS/Windows peers use.
+Windowing is **hosted-NULL** (the runtime self-creates its window); the faithful
+app-owned X11 window via `XR_EXT_xlib_window_binding` (header already vendored in
+`openxr_includes/`) is **Phase-3** work, gated on the Linux runtime + a GPU + an
+X server. This is **build-green only** — CI compiles it on `ubuntu-latest`
+(`build-linux.yml`, dispatch/`linux*`-branch only, not required); on-screen
+validation is deferred. Recipe: `docs/guides/linux-demo-port.md` in
+`displayxr-runtime`.
+
 ### CI (`.github/workflows/`)
 `build-windows.yml` + `build-macos.yml` run on **`pull_request` + push to main**
 (build-validation — they compile the app + installer/.pkg, nothing publishes)
