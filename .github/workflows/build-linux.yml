@@ -1,0 +1,66 @@
+name: Build Linux
+
+# avatar Linux build-green dev loop (issue #21; part of the M8 Linux epic, meta
+# displayxr-runtime#699; recipe: the runtime repo's docs/guides/linux-demo-port.md).
+#
+# DELIBERATELY NOT a required check. It does NOT run on PRs or pushes to main —
+# only on manual dispatch and `linux*` branches — so it can't gate unrelated
+# work while the port is in progress. Promote to a PR-triggered required check
+# (with the DetectChanges docs_only short-circuit the macOS/Windows jobs use)
+# only once it passes reliably.
+#
+# Build-green scope: compile avatar_handle_vk_linux on ubuntu-latest. CI has no
+# display/GPU, so the app is never run here; on-screen validation is a separate
+# pass gated on the runtime's Linux Phase 1b/3b + hardware.
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches:
+      - 'linux'
+      - 'linux-**'
+      - 'feature/linux-**'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  Build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # Base list (docs/guides/linux-demo-port.md): the toolchain + system
+      # Vulkan + glslang (model_common compiles its PBR SPIR-V with
+      # glslangValidator, hard-required). The avatar demo is a Vulkan model/PBR
+      # renderer with NO media deps, so — unlike the mediaplayer — no FFmpeg.
+      #
+      # X11 / Wayland / ALSA dev headers + the GLX-flip pair (libxxf86vm-dev +
+      # libxcb-glx0-dev): the app itself is hosted-NULL (links no window toolkit
+      # yet), but these are the standard demo-port deps and guard the from-source
+      # OpenXR-SDK loader build against the GLX-flip gotcha should GL/EGL headers
+      # ever be pulled in (see the playbook).
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential cmake ninja-build pkg-config \
+            libvulkan-dev vulkan-validationlayers glslang-tools \
+            libx11-dev libxcb1-dev libx11-xcb-dev \
+            libwayland-dev libasound2-dev \
+            libxxf86vm-dev libxcb-glx0-dev
+
+      - name: Build (build-green; app is not run — no display on CI)
+        run: ./scripts/build_linux.sh
+
+      # Guard against a hollow green: Vulkan must have resolved (the renderer is
+      # 100% Vulkan) and the binary must exist. build_linux.sh already errors if
+      # the binary is missing; assert Vulkan here so a silent FindVulkan miss
+      # fails loudly rather than compiling out.
+      - name: Assert Vulkan resolved + binary built
+        run: |
+          grep -q "Vulkan_LIBRARY:.*=.*/" build/CMakeCache.txt || {
+            echo "::error::Vulkan was not found via find_package — the model renderer cannot build"; exit 1; }
+          test -x build/linux/avatar_handle_vk_linux || {
+            echo "::error::avatar_handle_vk_linux was not produced"; exit 1; }

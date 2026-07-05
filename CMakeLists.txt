@@ -28,6 +28,10 @@ if(APPLE)
     add_subdirectory(macos)
 elseif(WIN32)
     add_subdirectory(windows)
+elseif(UNIX)
+    # Desktop Linux — build-green vehicle for the M8 Linux epic (#21). Hosted-NULL
+    # windowing; the app-owned X11 window (XR_EXT_xlib_window_binding) is Phase 3.
+    add_subdirectory(linux)
 else()
-    message(FATAL_ERROR "displayxr-demo-avatar supports macOS and Windows only.")
+    message(FATAL_ERROR "displayxr-demo-avatar supports macOS, Windows and Linux only.")
 endif()
