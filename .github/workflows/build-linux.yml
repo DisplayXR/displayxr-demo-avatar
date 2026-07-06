@@ -3,15 +3,22 @@ name: Build Linux
 # avatar Linux build-green dev loop (issue #21; part of the M8 Linux epic, meta
 # displayxr-runtime#699; recipe: the runtime repo's docs/guides/linux-demo-port.md).
 #
+# TRI-LTS MATRIX (mirrors displayxr-demo-modelviewer): the deployment target is
+# Ubuntu 26.04 + Intel iGPU, but we also keep 22.04 (where render can be
+# validated on hand today) and 24.04 green — so "build-green" means "builds on
+# every supported toolchain (GCC 11 / 13 / 15)", not just whatever
+# ubuntu-latest happens to be. 22.04/24.04 use hosted runners; 26.04 runs in a
+# container (no hosted 26.04 runner yet).
+#
 # DELIBERATELY NOT a required check. It does NOT run on PRs or pushes to main —
 # only on manual dispatch and `linux*` branches — so it can't gate unrelated
 # work while the port is in progress. Promote to a PR-triggered required check
 # (with the DetectChanges docs_only short-circuit the macOS/Windows jobs use)
 # only once it passes reliably.
 #
-# Build-green scope: compile avatar_handle_vk_linux on ubuntu-latest. CI has no
-# display/GPU, so the app is never run here; on-screen validation is a separate
-# pass gated on the runtime's Linux Phase 1b/3b + hardware.
+# Build-green scope: compile avatar_handle_vk_linux. CI has no display/GPU, so
+# the app is never run here; on-screen validation is a separate pass gated on
+# the runtime's Linux Phase 1b/3b + hardware.
 
 on:
   workflow_dispatch: {}
@@ -27,8 +34,29 @@ concurrency:
 
 jobs:
   Build:
-    runs-on: ubuntu-latest
+    name: Build (Ubuntu ${{ matrix.lts }})
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.container }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - lts: "22.04"
+            runner: ubuntu-22.04
+          - lts: "24.04"
+            runner: ubuntu-24.04
+          - lts: "26.04"
+            runner: ubuntu-latest
+            container: ubuntu:26.04
     steps:
+      # In the 26.04 container we start as root with a bare image — install git
+      # BEFORE checkout (which shells out to git). No-op on the hosted runners.
+      - name: Bootstrap container (git for checkout)
+        run: |
+          if [ "$(id -u)" = "0" ] && ! command -v git >/dev/null; then
+            apt-get update && apt-get install -y --no-install-recommends git ca-certificates
+          fi
+
       - uses: actions/checkout@v5
 
       # Base list (docs/guides/linux-demo-port.md): the toolchain + system
@@ -41,11 +69,14 @@ jobs:
       # yet), but these are the standard demo-port deps and guard the from-source
       # OpenXR-SDK loader build against the GLX-flip gotcha should GL/EGL headers
       # ever be pulled in (see the playbook).
+      # SUDO shim so the same step works on hosted runners (non-root, has sudo)
+      # and in the container (root, no sudo).
       - name: Install dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential cmake ninja-build pkg-config \
+          SUDO=""; [ "$(id -u)" != "0" ] && SUDO=sudo
+          $SUDO apt-get update
+          $SUDO apt-get install -y \
+            build-essential cmake ninja-build pkg-config git ca-certificates curl \
             libvulkan-dev vulkan-validationlayers glslang-tools \
             libx11-dev libxcb1-dev libx11-xcb-dev \
             libwayland-dev libasound2-dev \
