@@ -66,6 +66,34 @@ set(TINYUSDZ_WITH_AUDIO         OFF CACHE INTERNAL "" FORCE)
 set(TINYUSDZ_WITH_EXR           OFF CACHE INTERNAL "" FORCE)
 FetchContent_MakeAvailable(tinyusdz)
 
+# tinyusdz v0.9.4 builds with -Werror; we don't control upstream's warning
+# flags, so demote the diagnostics newer toolchains trip on (mirrors
+# displayxr-demo-modelviewer's model_common/CMakeLists.txt).
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    # Newer Apple clang (CLT 26.x) promotes -Wthread-safety-negative inside
+    # its logger.hh. Clang-only flag — GCC errors on it, so gate on Clang.
+    foreach(_tu tinyusdz_static tinyusdz)
+        if(TARGET ${_tu})
+            target_compile_options(${_tu} PRIVATE
+                -Wno-error=thread-safety-negative -Wno-thread-safety-negative)
+        endif()
+    endforeach()
+elseif(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    # GCC (Linux): upstream injects "-Wall -Werror" through a property that
+    # lands AFTER this target's COMPILE_OPTIONS on the command line, so a
+    # blanket -Wno-error appended here loses to it. The diagnostic-specific
+    # -Wno-error=<diag> form overrides a blanket -Werror regardless of
+    # position. GCC 15 (Ubuntu 26.04) flags tinyusdz's
+    # TypedTimeSamples<T>::Sample with -Wmaybe-uninitialized ("may be used")
+    # and, for the bool specialization, its sibling -Wuninitialized.
+    foreach(_tu tinyusdz_static tinyusdz)
+        if(TARGET ${_tu})
+            target_compile_options(${_tu} PRIVATE
+                -Wno-error -Wno-error=maybe-uninitialized -Wno-error=uninitialized)
+        endif()
+    endforeach()
+endif()
+
 # ── SPIR-V shader compilation ─────────────────────────────────────────────
 find_program(GLSLANGVALIDATOR_COMMAND glslangValidator)
 if(NOT GLSLANGVALIDATOR_COMMAND)
