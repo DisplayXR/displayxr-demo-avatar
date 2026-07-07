@@ -129,6 +129,44 @@ static void mat4_view_from_xr_pose(float* m, const XrPosef& pose) {
     m[3]  = 0.0f; m[7]  = 0.0f; m[11] = 0.0f; m[15] = 1.0f;
 }
 
+// out = a * b (column-major, OpenGL layout — same convention as above).
+static void mat4_mul(float* out, const float* a, const float* b) {
+    for (int c = 0; c < 4; c++)
+        for (int r = 0; r < 4; r++)
+            out[c * 4 + r] = a[0 * 4 + r] * b[c * 4 + 0] + a[1 * 4 + r] * b[c * 4 + 1] +
+                             a[2 * 4 + r] * b[c * 4 + 2] + a[3 * 4 + r] * b[c * 4 + 3];
+}
+
+// Model-fit transform: world = s * (model - center). The runtime's plain XR
+// views are Kooima poses in METERS with the virtual display at the origin
+// (~0.19 m tall panel, viewer at ~0.45 m) — a human-scale FBX drawn raw fills
+// meters of world, which is why hardware validation saw only the lower legs
+// (avatar#21). macOS/Windows fix framing by growing their virtual-display rig
+// (ApplyAutoFitForLoadedScene); with plain views the equivalent is shrinking
+// the model into panel scale.
+static float g_fitMat[16];
+static bool g_fitValid = false;
+
+static void ComputeModelFit() {
+    float center[3], extent[3];
+    if (!g_modelRenderer.getRobustSceneBounds(0.05f, 0.95f, center, extent) || !(extent[1] > 1e-3f)) {
+        return;
+    }
+    // Panel-scale target height; hardware-tune if the framing still feels off
+    // (George's #21 confirm called the old framing "large/near the camera").
+    const float kFitHeightM = 0.15f;
+    const float s = kFitHeightM / extent[1];
+    for (int i = 0; i < 16; i++) g_fitMat[i] = 0.0f;
+    g_fitMat[0] = g_fitMat[5] = g_fitMat[10] = s;
+    g_fitMat[15] = 1.0f;
+    g_fitMat[12] = -s * center[0];
+    g_fitMat[13] = -s * center[1];
+    g_fitMat[14] = -s * center[2];
+    g_fitValid = true;
+    LOG_INFO("Auto-fit: center=(%.3f,%.3f,%.3f) extentY=%.3f -> scale=%.5f (target %.2f m)",
+             center[0], center[1], center[2], extent[1], s, kFitHeightM);
+}
+
 // ============================================================================
 // OpenXR session state
 // ============================================================================
@@ -517,6 +555,7 @@ int main(int argc, char** argv) {
         g_modelRenderer.loadDebugModel();
     }
     g_modelRenderer.setPlainViewConvention(true);
+    ComputeModelFit();
 
     LOG_INFO("=== Entering main loop (Ctrl+C to exit) ===");
     auto lastTime = std::chrono::high_resolution_clock::now();
@@ -570,6 +609,11 @@ int main(int argc, char** argv) {
                             float viewMat[16], projMat[16];
                             mat4_view_from_xr_pose(viewMat, views[i].pose);
                             mat4_from_xr_fov(projMat, views[i].fov, 0.01f, 100.0f);
+                            if (g_fitValid) { // bake the model-fit into the view (MV = V * F)
+                                float fitted[16];
+                                mat4_mul(fitted, viewMat, g_fitMat);
+                                memcpy(viewMat, fitted, sizeof(fitted));
+                            }
                             // Draw the avatar into this eye's SBS viewport region.
                             g_modelRenderer.renderEye(
                                 swapchainImages[imageIndex].image,
