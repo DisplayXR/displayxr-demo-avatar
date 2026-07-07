@@ -46,6 +46,9 @@
 #include <string>
 #include <vector>
 #include <unistd.h>
+#include <libgen.h>
+#include <limits.h>
+#include <sys/stat.h>
 
 #include "model_renderer.h"
 #include "model_loader.h"
@@ -487,12 +490,30 @@ int main(int argc, char** argv) {
                               queueFamilyIndex, xr.viewWidth, xr.viewHeight))
         LOG_WARN("model renderer init failed (no GPU on CI — expected)");
 
-    // Load the bundled avatar if present (copied next to the exe by CMake), or
-    // a CLI-supplied model, else the built-in debug model.
-    const char* modelPath = (argc > 1) ? argv[1] : "avatar.fbx";
-    if (g_modelRenderer.hasModel() || g_modelRenderer.loadModel(modelPath)) {
+    // Load a CLI-supplied model, else the bundled avatar (copied next to the
+    // exe by CMake — resolve it against the EXE dir, not the CWD: the run
+    // scripts exec from arbitrary directories, which is exactly the avatar#21
+    // "no model auto-loads" failure), else the built-in debug model. Mirrors
+    // modelviewer's ExeDir/TryAutoLoadBundledScene and the macOS
+    // _NSGetExecutablePath / Windows GetModuleFileNameA peers.
+    std::string modelPath = (argc > 1) ? argv[1] : "";
+    if (modelPath.empty()) {
+        char buf[PATH_MAX];
+        ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+        if (n > 0) {
+            buf[n] = '\0';
+            std::string bundled = std::string(dirname(buf)) + "/avatar.fbx";
+            struct stat st;
+            if (stat(bundled.c_str(), &st) == 0 && S_ISREG(st.st_mode)) {
+                modelPath = bundled;
+            }
+        }
+        if (modelPath.empty()) modelPath = "avatar.fbx"; // CWD fallback (old behavior)
+    }
+    if (g_modelRenderer.hasModel() || g_modelRenderer.loadModel(modelPath.c_str())) {
         LOG_INFO("Loaded model: %s", g_modelRenderer.modelPath().c_str());
     } else {
+        LOG_WARN("No model at %s — using the built-in debug model", modelPath.c_str());
         g_modelRenderer.loadDebugModel();
     }
     g_modelRenderer.setPlainViewConvention(true);
@@ -590,8 +611,15 @@ int main(int argc, char** argv) {
     }
 
     LOG_INFO("=== Shutting down ===");
+    // Teardown order matters (avatar#21 SIGABRT): release the global
+    // renderer's device objects and idle the device BEFORE destroying it —
+    // otherwise ~ModelRenderer's static-dtor cleanup() runs vkDeviceWaitIdle
+    // + resource destroys on a dead VkDevice. Mirrors modelviewer.
+    g_modelRenderer.cleanup();
+    if (vkDevice) vkDeviceWaitIdle(vkDevice);
     CleanupOpenXR(xr);
-    vkDestroyDevice(vkDevice, nullptr);
-    vkDestroyInstance(vkInstance, nullptr);
+    if (vkDevice) vkDestroyDevice(vkDevice, nullptr);
+    if (vkInstance) vkDestroyInstance(vkInstance, nullptr);
+    LOG_INFO("Clean exit");
     return 0;
 }
