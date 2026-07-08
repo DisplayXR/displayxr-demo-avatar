@@ -31,6 +31,12 @@ extern bool g_hasDisplayZonesExt;
 extern PFN_xrGetDisplayZoneCapabilitiesEXT g_pfnGetDisplayZoneCaps;
 extern PFN_xrGetDisplayZoneRecommendedViewSizeEXT g_pfnGetDisplayZoneViewSize;
 
+// 3D-panel top-left in virtual-desktop pixels (XrDisplayDesktopPositionEXT,
+// XR_EXT_display_info v16, runtime#715), captured in InitializeOpenXR. (0,0)
+// = primary monitor or unknown (older runtime) — the safe default.
+extern int32_t g_displayDesktopLeft;
+extern int32_t g_displayDesktopTop;
+
 // Initialize OpenXR instance with Vulkan + win32_window_binding extensions
 bool InitializeOpenXR(XrSessionManager& xr);
 

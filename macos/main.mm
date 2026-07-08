@@ -808,20 +808,41 @@ static void SignalHandler(int sig) {
     g_running = false;
 }
 
-static bool CreateMacOSWindow(uint32_t width, uint32_t height) {
+static bool CreateMacOSWindow(uint32_t width, uint32_t height, int32_t panelLeft, int32_t panelTop) {
     [NSApplication sharedApplication];
     [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
 
     AppDelegate *delegate = [[AppDelegate alloc] init];
     [NSApp setDelegate:delegate];
 
-    // Clamp the requested size to the screen's visible area, preserving the
-    // portrait aspect. macOS auto-clamps TITLED windows to the screen but NOT
-    // borderless ones, so an 811x1421 portrait request on a shorter laptop
+    // INV-1.3 (runtime#715): open on the 3D panel, not the primary screen —
+    // the window-relative weave is only correct on the panel itself.
+    // (panelLeft, panelTop) is the panel top-left in top-down global
+    // coordinates with the origin at the primary screen's top-left
+    // (XrDisplayDesktopPositionEXT, display_info v16); AppKit is bottom-up,
+    // so flip via the primary screen's height and pick the NSScreen that
+    // contains the point. (0,0) = primary/unknown → mainScreen, the old
+    // behavior (safe default on pre-v16 runtimes).
+    NSScreen *targetScreen = [NSScreen mainScreen];
+    if (panelLeft != 0 || panelTop != 0) {
+        NSScreen *primary = [NSScreen screens].firstObject;
+        if (primary != nil) {
+            // Nudge 1pt inside the panel so the point isn't on a frame edge.
+            NSPoint p = NSMakePoint((CGFloat)panelLeft + 1.0,
+                                    primary.frame.size.height - (CGFloat)panelTop - 1.0);
+            for (NSScreen *s in [NSScreen screens]) {
+                if (NSPointInRect(p, s.frame)) { targetScreen = s; break; }
+            }
+        }
+    }
+
+    // Clamp the requested size to the panel screen's visible area, preserving
+    // the portrait aspect. macOS auto-clamps TITLED windows to the screen but
+    // NOT borderless ones, so an 811x1421 portrait request on a shorter laptop
     // screen would otherwise stay oversized (avatar + bubble render huge / partly
     // off-screen) until the B-toggle made it titled. Clamp up-front instead.
+    NSRect vis = [targetScreen visibleFrame];
     {
-        NSRect vis = [[NSScreen mainScreen] visibleFrame];
         const float ar = (float)width / (float)height;  // portrait (<1)
         float w = (float)width, h = (float)height;
         if (h > (float)vis.size.height) { h = (float)vis.size.height; w = h * ar; }
@@ -830,14 +851,17 @@ static bool CreateMacOSWindow(uint32_t width, uint32_t height) {
         height = (uint32_t)(h + 0.5f);
     }
 
-    NSRect frame = NSMakeRect(100, 100, width, height);
+    // Center on the panel screen explicitly — [NSWindow center] would put the
+    // window back on the main screen.
+    NSRect frame = NSMakeRect(vis.origin.x + (vis.size.width  - (CGFloat)width)  * 0.5,
+                              vis.origin.y + (vis.size.height - (CGFloat)height) * 0.5,
+                              width, height);
     // Borderless by default — the floating avatar (B toggles a draggable titled
     // frame; see the B handler). AvatarWindow keeps it focusable while borderless.
     g_window = [[AvatarWindow alloc] initWithContentRect:frame
         styleMask:NSWindowStyleMaskBorderless backing:NSBackingStoreBuffered defer:NO];
     [g_window setTitle:@"DisplayXR 3D Avatar"];
     [g_window setDelegate:delegate];
-    [g_window center];
 
     // Float above other windows so the avatar stays on top even when another app
     // takes focus (mirrors the Windows leg's WS_EX_TOPMOST). CanJoinAllSpaces so
@@ -963,6 +987,10 @@ struct AppXrSession {
     float nominalViewerX = 0, nominalViewerY = 0, nominalViewerZ = 0.5f;
     float recommendedViewScaleX = 0.5f, recommendedViewScaleY = 1.0f;
     uint32_t displayPixelWidth = 0, displayPixelHeight = 0;
+    // 3D-panel top-left in top-down virtual-desktop coordinates, origin at the
+    // primary screen's top-left (XrDisplayDesktopPositionEXT, display_info v16,
+    // runtime#715). (0,0) = primary/unknown (older runtimes leave the zero-init).
+    int32_t displayScreenLeft = 0, displayScreenTop = 0;
 
     // Eye tracking
     float eyePositions[8][3] = {};  // [view][x,y,z] — raw per-eye positions in display space
@@ -1170,7 +1198,12 @@ static bool InitializeOpenXR(AppXrSession& xr) {
         XrSystemProperties sp = {XR_TYPE_SYSTEM_PROPERTIES};
         XrDisplayInfoEXT di = {(XrStructureType)XR_TYPE_DISPLAY_INFO_EXT};
         XrEyeTrackingModeCapabilitiesEXT ec = {(XrStructureType)XR_TYPE_EYE_TRACKING_MODE_CAPABILITIES_EXT};
-        di.next = &ec; sp.next = &di;
+        // INV-1.3 (runtime#715): panel desktop position, so the window opens
+        // ON the 3D panel. Zero-init: a pre-v16 runtime skips the unknown
+        // chain entry and (0,0) = primary keeps the old placement.
+        XrDisplayDesktopPositionEXT dp = {};
+        dp.type = XR_TYPE_DISPLAY_DESKTOP_POSITION_EXT;
+        di.next = &dp; dp.next = &ec; sp.next = &di;
         if (XR_SUCCEEDED(xrGetSystemProperties(xr.instance, xr.systemId, &sp))) {
             xr.recommendedViewScaleX = di.recommendedViewScaleX;
             xr.recommendedViewScaleY = di.recommendedViewScaleY;
@@ -1182,6 +1215,9 @@ static bool InitializeOpenXR(AppXrSession& xr) {
             xr.displayPixelWidth = di.displayPixelWidth;
             xr.displayPixelHeight = di.displayPixelHeight;
             xr.supportedEyeTrackingModes = (uint32_t)ec.supportedModes;
+            xr.displayScreenLeft = dp.left;
+            xr.displayScreenTop = dp.top;
+            LOG_INFO("Display desktop position: (%d, %d)", xr.displayScreenLeft, xr.displayScreenTop);
         }
         xrGetInstanceProcAddr(xr.instance, "xrRequestDisplayModeEXT", (PFN_xrVoidFunction*)&xr.pfnRequestDisplayModeEXT);
         if (xr.supportedEyeTrackingModes != 0)
@@ -2395,13 +2431,21 @@ int main(int argc, char** argv) {
         }
     }
 
-    // Step 1: Create macOS window. Portrait, matching the Windows avatar leg
-    // (811×1421 logical points → the bottom 75% frames the avatar, top 25% is the
-    // speech-bubble band). The drawable px size is recomputed from the realized
-    // contentView × backingScale just below.
+    // Step 1: Initialize OpenXR FIRST — xrGetSystemProperties needs only
+    // instance + system id, and returns the 3D panel's desktop position the
+    // window below is created at (INV-1.3 ordering: instance → system →
+    // properties → window → session; runtime#715).
+    AppXrSession xr = {};
+    if (!InitializeOpenXR(xr)) { LOG_ERROR("OpenXR init failed"); return 1; }
+
+    // Step 2: Create macOS window ON the 3D panel. Portrait, matching the
+    // Windows avatar leg (811×1421 logical points → the bottom 75% frames the
+    // avatar, top 25% is the speech-bubble band). The drawable px size is
+    // recomputed from the realized contentView × backingScale just below.
     g_windowW = 811; g_windowH = 1421;
-    if (!CreateMacOSWindow(g_windowW, g_windowH)) {
+    if (!CreateMacOSWindow(g_windowW, g_windowH, xr.displayScreenLeft, xr.displayScreenTop)) {
         LOG_ERROR("Failed to create macOS window");
+        CleanupOpenXR(xr);
         return 1;
     }
 
@@ -2410,10 +2454,6 @@ int main(int argc, char** argv) {
       g_windowW = (uint32_t)(cs.width * bs);
       g_windowH = (uint32_t)(cs.height * bs);
       LOG_INFO("Window drawable: %ux%u", g_windowW, g_windowH); }
-
-    // Step 2: Initialize OpenXR
-    AppXrSession xr = {};
-    if (!InitializeOpenXR(xr)) { LOG_ERROR("OpenXR init failed"); return 1; }
 
     // Try to find sim_display_set_output_mode
     { void *rtHandle = NULL;
