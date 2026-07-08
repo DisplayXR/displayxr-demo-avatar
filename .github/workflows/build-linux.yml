@@ -10,11 +10,10 @@ name: Build Linux
 # ubuntu-latest happens to be. 22.04/24.04 use hosted runners; 26.04 runs in a
 # container (no hosted 26.04 runner yet).
 #
-# DELIBERATELY NOT a required check. It does NOT run on PRs or pushes to main —
-# only on manual dispatch and `linux*` branches — so it can't gate unrelated
-# work while the port is in progress. Promote to a PR-triggered required check
-# (with the DetectChanges docs_only short-circuit the macOS/Windows jobs use)
-# only once it passes reliably.
+# PROMOTED to a PR-triggered required check (runtime #722): runs on every PR
+# (plus manual dispatch and `linux*` branches), with the DetectChanges
+# docs_only short-circuit the macOS/Windows jobs use so doc-only PRs report
+# success in seconds without building.
 #
 # Build-green scope: compile avatar_handle_vk_linux. CI has no display/GPU, so
 # the app is never run here; on-screen validation is a separate pass gated on
@@ -22,6 +21,7 @@ name: Build Linux
 
 on:
   workflow_dispatch: {}
+  pull_request: {}
   push:
     branches:
       - 'linux'
@@ -29,12 +29,37 @@ on:
       - 'feature/linux-**'
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
+  DetectChanges:
+    runs-on: ubuntu-latest
+    outputs:
+      docs_only: ${{ steps.filter.outputs.docs_only }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - id: filter
+        run: |
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "docs_only=false" >> "$GITHUB_OUTPUT"
+            echo "Detected non-PR trigger — docs_only=false"
+            exit 0
+          fi
+          CHANGED=$(git diff --name-only "${{ github.event.pull_request.base.sha }}" HEAD)
+          NON_DOC=$(echo "$CHANGED" | grep -vE '^(docs/|.*\.md$|LICENSE$|\.github/ISSUE_TEMPLATE/)' || true)
+          if [ -z "$NON_DOC" ]; then
+            echo "docs_only=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "docs_only=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "Detected docs_only=$(grep ^docs_only= "$GITHUB_OUTPUT" | cut -d= -f2)"
+
   Build:
     name: Build (Ubuntu ${{ matrix.lts }})
+    needs: DetectChanges
     runs-on: ${{ matrix.runner }}
     container: ${{ matrix.container }}
     strategy:
@@ -49,15 +74,21 @@ jobs:
             runner: ubuntu-latest
             container: ubuntu:26.04
     steps:
+      - name: Docs-only short-circuit
+        if: needs.DetectChanges.outputs.docs_only == 'true'
+        run: echo "Doc-only change — reporting success without building."
+
       # In the 26.04 container we start as root with a bare image — install git
       # BEFORE checkout (which shells out to git). No-op on the hosted runners.
       - name: Bootstrap container (git for checkout)
+        if: needs.DetectChanges.outputs.docs_only != 'true'
         run: |
           if [ "$(id -u)" = "0" ] && ! command -v git >/dev/null; then
             apt-get update && apt-get install -y --no-install-recommends git ca-certificates
           fi
 
       - uses: actions/checkout@v5
+        if: needs.DetectChanges.outputs.docs_only != 'true'
 
       # Base list (docs/guides/linux-demo-port.md): the toolchain + system
       # Vulkan + glslang (model_common compiles its PBR SPIR-V with
@@ -72,6 +103,7 @@ jobs:
       # SUDO shim so the same step works on hosted runners (non-root, has sudo)
       # and in the container (root, no sudo).
       - name: Install dependencies
+        if: needs.DetectChanges.outputs.docs_only != 'true'
         run: |
           SUDO=""; [ "$(id -u)" != "0" ] && SUDO=sudo
           $SUDO apt-get update
@@ -83,6 +115,7 @@ jobs:
             libxxf86vm-dev libxcb-glx0-dev
 
       - name: Build (build-green; app is not run — no display on CI)
+        if: needs.DetectChanges.outputs.docs_only != 'true'
         run: ./scripts/build_linux.sh
 
       # Guard against a hollow green: Vulkan must have resolved (the renderer is
@@ -90,6 +123,7 @@ jobs:
       # the binary is missing; assert Vulkan here so a silent FindVulkan miss
       # fails loudly rather than compiling out.
       - name: Assert Vulkan resolved + binary built
+        if: needs.DetectChanges.outputs.docs_only != 'true'
         run: |
           grep -q "Vulkan_LIBRARY:.*=.*/" build/CMakeCache.txt || {
             echo "::error::Vulkan was not found via find_package — the model renderer cannot build"; exit 1; }
