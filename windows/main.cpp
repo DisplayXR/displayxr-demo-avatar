@@ -702,11 +702,19 @@ static HWND CreateAppWindow(HINSTANCE hInstance, int width, int height) {
 
     // Borderless by default (WS_POPUP): the avatar floats chrome-free over the
     // desktop. The B key toggles decoration back on for move/resize. Center the
-    // client rect on the primary monitor so the borderless window isn't stranded
-    // at (0,0) with no title bar to grab.
+    // client rect on the monitor hosting the 3D panel so the borderless window
+    // isn't stranded at (0,0) with no title bar to grab.
+    //
+    // INV-1.3 (runtime#715): (g_displayDesktopLeft, g_displayDesktopTop) is the
+    // panel's top-left in virtual-desktop pixels (XrDisplayDesktopPositionEXT,
+    // display_info v16) — on a multi-monitor box the window must open ON the
+    // panel, since the window-relative weave is only correct there. (0,0) =
+    // primary/unknown, which MONITOR_DEFAULTTOPRIMARY resolves to the old
+    // primary-monitor behavior.
     int posX = CW_USEDEFAULT, posY = CW_USEDEFAULT;
     {
-        HMONITOR hMon = MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
+        HMONITOR hMon = MonitorFromPoint(POINT{g_displayDesktopLeft, g_displayDesktopTop},
+                                         MONITOR_DEFAULTTOPRIMARY);
         MONITORINFO mi = { sizeof(mi) };
         if (GetMonitorInfo(hMon, &mi)) {
             const int monW = mi.rcWork.right - mi.rcWork.left;
@@ -2086,13 +2094,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     LOG_INFO("=== DisplayXR 3D Avatar (Vulkan) ===");
 
-    HWND hwnd = CreateAppWindow(hInstance, g_windowWidth, g_windowHeight);
-    if (!hwnd) {
-        LOG_ERROR("Failed to create window");
-        ShutdownLogging();
-        return 1;
-    }
-
     // Add DisplayXR to DLL search path
     {
         HKEY hKey;
@@ -2107,11 +2108,24 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         }
     }
 
-    // Initialize OpenXR
+    // Initialize OpenXR BEFORE creating the window — xrGetSystemProperties
+    // needs only instance + system id, and returns the 3D panel's desktop
+    // position (g_displayDesktopLeft/Top) that CreateAppWindow places the
+    // window at (INV-1.3 ordering: instance → system → properties → window
+    // → session; runtime#715).
     XrSessionManager xr = {};
     g_xr = &xr;
     if (!InitializeOpenXR(xr)) {
         LOG_ERROR("OpenXR initialization failed");
+        g_xr = nullptr;
+        ShutdownLogging();
+        return 1;
+    }
+
+    HWND hwnd = CreateAppWindow(hInstance, g_windowWidth, g_windowHeight);
+    if (!hwnd) {
+        LOG_ERROR("Failed to create window");
+        CleanupOpenXR(xr);
         g_xr = nullptr;
         ShutdownLogging();
         return 1;
