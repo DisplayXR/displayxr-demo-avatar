@@ -9,7 +9,7 @@
 #
 # linux/main.cpp is the desktop-Linux entry point: a minimal Vulkan + OpenXR
 # frame loop (HOSTED-NULL windowing — the runtime self-creates its window; the
-# app-owned X11 window via XR_EXT_xlib_window_binding is Phase-3 work) driving
+# app-owned X11 window via XR_DXR_xlib_window_binding is Phase-3 work) driving
 # the same cross-platform model_common/ModelRenderer the macOS/Windows peers
 # use. Build-green vehicle for the M8 Linux epic (#21, meta runtime #699); see
 # docs/guides/linux-demo-port.md in displayxr-runtime.

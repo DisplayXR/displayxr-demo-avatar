@@ -1,8 +1,17 @@
 // Copyright 2026, DisplayXR
-// SPDX-License-Identifier: BSL-1.0
+// SPDX-License-Identifier: Apache-2.0
+//
+// PROVISIONAL — DXR is DisplayXR's Khronos-registered OpenXR author ID, but
+// the XR_DXR_* extensions in this header are NOT yet registered in the
+// Khronos OpenXR registry: extension numbers and XrStructureType values sit
+// in a provisional experimental block (1004999xxx) pending official
+// assignment. Extension names are expected to be stable; numeric values are
+// not. SPEC_VERSION restarted at 1 on the XR_EXT_* -> XR_DXR_* rename.
+// See GOVERNANCE.md.
+//
 /*!
  * @file
- * @brief  Header for XR_EXT_atlas_capture extension
+ * @brief  Header for XR_DXR_atlas_capture extension
  * @author David Fattal
  * @ingroup external_openxr
  *
@@ -13,12 +22,12 @@
  * the compositor's own atlas image, at a caller-selected stage.
  *
  * Any session class (handle / texture / hosted / IPC) may call it. The
- * privileged cross-client workspace capture (xrCaptureWorkspaceFrameEXT in
- * XR_EXT_spatial_workspace) stays separate; the two share the runtime readback
+ * privileged cross-client workspace capture (xrCaptureWorkspaceFrameDXR in
+ * XR_DXR_spatial_workspace) stays separate; the two share the runtime readback
  * core. Full design: docs/adr/ADR-023-unified-atlas-capture.md (W6 of issue #396).
  */
-#ifndef XR_EXT_ATLAS_CAPTURE_H
-#define XR_EXT_ATLAS_CAPTURE_H 1
+#ifndef XR_DXR_ATLAS_CAPTURE_H
+#define XR_DXR_ATLAS_CAPTURE_H 1
 
 #include <openxr/openxr.h>
 
@@ -26,23 +35,23 @@
 extern "C" {
 #endif
 
-#define XR_EXT_atlas_capture 1
-// SPEC_VERSION 3: XrStructureType values relocated 1000999120..121 ->
-// 1000999170..171 (the old block collided with XR_EXT_workspace_file_dialog,
+#define XR_DXR_atlas_capture 1
+// SPEC_VERSION 3: XrStructureType values relocated 1004999120..121 ->
+// 1004999170..171 (the old block collided with XR_DXR_workspace_file_dialog,
 // which reserved it first). No struct/field/entry-point changes; consumers
 // only need a header re-sync + rebuild.
 // SPEC_VERSION 2: the runtime appends "_atlas_<viewCount>_<cols>x<rows>.png"
 // (was a flat "_atlas.png" in v1), and the encoded PNG is always opaque
 // (alpha forced to 255). See issue #425.
-#define XR_EXT_atlas_capture_SPEC_VERSION 3
-#define XR_EXT_ATLAS_CAPTURE_EXTENSION_NAME "XR_EXT_atlas_capture"
+#define XR_DXR_atlas_capture_SPEC_VERSION 1
+#define XR_DXR_ATLAS_CAPTURE_EXTENSION_NAME "XR_DXR_atlas_capture"
 
-// Reserved 1000999170..171. Final values reconcile with the Khronos registry
+// Reserved 1004999170..171. Final values reconcile with the Khronos registry
 // before spec freeze. Allocation registry: README.md in this directory.
-#define XR_TYPE_ATLAS_CAPTURE_INFO_EXT   ((XrStructureType)1000999170)
-#define XR_TYPE_ATLAS_CAPTURE_RESULT_EXT ((XrStructureType)1000999171)
+#define XR_TYPE_ATLAS_CAPTURE_INFO_DXR   ((XrStructureType)1004999170)
+#define XR_TYPE_ATLAS_CAPTURE_RESULT_DXR ((XrStructureType)1004999171)
 
-#define XR_ATLAS_CAPTURE_PATH_MAX_EXT 256
+#define XR_ATLAS_CAPTURE_PATH_MAX_DXR 256
 
 /*!
  * @brief Compositor stage at which to capture the atlas.
@@ -54,14 +63,14 @@ extern "C" {
  *   PROJECTION_ONLY — the atlas with only projection-class layers, captured at
  *                    the projection-done boundary.
  */
-typedef enum XrAtlasCaptureStageEXT {
-    XR_ATLAS_CAPTURE_STAGE_POST_COMPOSE_EXT    = 0,
-    XR_ATLAS_CAPTURE_STAGE_PROJECTION_ONLY_EXT = 1,
-    XR_ATLAS_CAPTURE_STAGE_MAX_ENUM_EXT        = 0x7FFFFFFF
-} XrAtlasCaptureStageEXT;
+typedef enum XrAtlasCaptureStageDXR {
+    XR_ATLAS_CAPTURE_STAGE_POST_COMPOSE_DXR    = 0,
+    XR_ATLAS_CAPTURE_STAGE_PROJECTION_ONLY_DXR = 1,
+    XR_ATLAS_CAPTURE_STAGE_MAX_ENUM_DXR        = 0x7FFFFFFF
+} XrAtlasCaptureStageDXR;
 
 /*!
- * @brief Request struct for xrCaptureAtlasEXT.
+ * @brief Request struct for xrCaptureAtlasDXR.
  *
  * The runtime appends a layout-encoded suffix
  * "_atlas_<viewCount>_<cols>x<rows>.png" to @c pathPrefix (e.g. a 2-view 2x1
@@ -71,24 +80,24 @@ typedef enum XrAtlasCaptureStageEXT {
  * prefix is an in-struct char array (not a separately allocated string) so the
  * same struct can cross the IPC schema unchanged.
  */
-typedef struct XrAtlasCaptureInfoEXT {
-    XrStructureType          type;   //!< Must be XR_TYPE_ATLAS_CAPTURE_INFO_EXT
+typedef struct XrAtlasCaptureInfoDXR {
+    XrStructureType          type;   //!< Must be XR_TYPE_ATLAS_CAPTURE_INFO_DXR
     const void* XR_MAY_ALIAS next;
-    XrAtlasCaptureStageEXT   stage;  //!< Capture stage (post-compose / projection-only)
-    char                     pathPrefix[XR_ATLAS_CAPTURE_PATH_MAX_EXT];
-} XrAtlasCaptureInfoEXT;
+    XrAtlasCaptureStageDXR   stage;  //!< Capture stage (post-compose / projection-only)
+    char                     pathPrefix[XR_ATLAS_CAPTURE_PATH_MAX_DXR];
+} XrAtlasCaptureInfoDXR;
 
 /*!
- * @brief Result returned by xrCaptureAtlasEXT.
+ * @brief Result returned by xrCaptureAtlasDXR.
  *
- * Same metadata block as XrWorkspaceCaptureResultEXT minus @c viewsWritten.
+ * Same metadata block as XrWorkspaceCaptureResultDXR minus @c viewsWritten.
  * @c tileColumns / @c tileRows are populated on both paths (from the active
  * rendering mode in-process). For in-process sessions @c eyeLeftM /
  * @c eyeRightM may still be zero — eye-pose plumbing currently stops at the
  * display processor and is only surfaced on the IPC/workspace path.
  */
-typedef struct XrAtlasCaptureResultEXT {
-    XrStructureType    type;   //!< Must be XR_TYPE_ATLAS_CAPTURE_RESULT_EXT
+typedef struct XrAtlasCaptureResultDXR {
+    XrStructureType    type;   //!< Must be XR_TYPE_ATLAS_CAPTURE_RESULT_DXR
     void* XR_MAY_ALIAS next;
     uint64_t           timestampNs;
     uint32_t           atlasWidth;
@@ -101,7 +110,7 @@ typedef struct XrAtlasCaptureResultEXT {
     float              displayHeightM;
     float              eyeLeftM[3];
     float              eyeRightM[3];
-} XrAtlasCaptureResultEXT;
+} XrAtlasCaptureResultDXR;
 
 /*!
  * @brief Capture the multi-view atlas the runtime composes for this session.
@@ -123,17 +132,17 @@ typedef struct XrAtlasCaptureResultEXT {
  * @param info    The capture request (stage + path prefix).
  * @param result  Output: capture metadata. May be NULL to capture the PNG only.
  */
-typedef XrResult (XRAPI_PTR *PFN_xrCaptureAtlasEXT)(
+typedef XrResult (XRAPI_PTR *PFN_xrCaptureAtlasDXR)(
     XrSession                    session,
-    const XrAtlasCaptureInfoEXT *info,
-    XrAtlasCaptureResultEXT     *result);
+    const XrAtlasCaptureInfoDXR *info,
+    XrAtlasCaptureResultDXR     *result);
 
 #ifndef XR_NO_PROTOTYPES
 #ifdef XR_EXTENSION_PROTOTYPES
-XRAPI_ATTR XrResult XRAPI_CALL xrCaptureAtlasEXT(
+XRAPI_ATTR XrResult XRAPI_CALL xrCaptureAtlasDXR(
     XrSession                    session,
-    const XrAtlasCaptureInfoEXT *info,
-    XrAtlasCaptureResultEXT     *result);
+    const XrAtlasCaptureInfoDXR *info,
+    XrAtlasCaptureResultDXR     *result);
 #endif /* XR_EXTENSION_PROTOTYPES */
 #endif /* !XR_NO_PROTOTYPES */
 
@@ -141,4 +150,4 @@ XRAPI_ATTR XrResult XRAPI_CALL xrCaptureAtlasEXT(
 }
 #endif
 
-#endif // XR_EXT_ATLAS_CAPTURE_H
+#endif // XR_DXR_ATLAS_CAPTURE_H

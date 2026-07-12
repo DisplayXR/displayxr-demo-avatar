@@ -15,11 +15,11 @@
  * this app passes NO window binding at xrCreateSession: the graphics binding is
  * chained straight into XrSessionCreateInfo and the runtime self-creates its
  * window. The faithful _handle path (app-owned X11 window handed over via
- * XR_EXT_xlib_window_binding — the vendored header is already in
+ * XR_DXR_xlib_window_binding — the vendored header is already in
  * openxr_includes/) is Phase-3 work, gated on the Linux runtime + a GPU + an X
  * server; see the TODO(Phase 3) block in main(). The macOS/Windows peers'
- * speech-bubble window-space layer (XR_EXT_local_3d_zone /
- * XrCompositionLayerWindowSpaceEXT) is likewise deferred to Phase 3 — this
+ * speech-bubble window-space layer (XR_DXR_local_3d_zone /
+ * XrCompositionLayerWindowSpaceDXR) is likewise deferred to Phase 3 — this
  * build-green vehicle submits only the base projection layer.
  *
  * NOT a full port of the macOS/Windows app: no HUD, input, MCP tools, mode
@@ -35,7 +35,7 @@
 #include <openxr/openxr_platform.h>
 // Vendored, forward-looking: the real app-provided-window path for Phase 3.
 // Unused in the hosted-NULL build below (no window binding is chained).
-#include <openxr/XR_EXT_xlib_window_binding.h>
+#include <openxr/XR_DXR_xlib_window_binding.h>
 
 #include <cmath>
 #include <cstring>
@@ -365,9 +365,9 @@ static bool CreateSession(AppXrSession& xr, VkInstance vkInstance, VkPhysicalDev
     //
     // TODO(Phase 3): become a faithful _handle app. Create an app-owned X11
     // window (XOpenDisplay / XCreateWindow), then chain
-    //   XrXlibWindowBindingCreateInfoEXT { .next = &vkBinding, .xDisplay, .window }
-    // (header already vendored: openxr/XR_EXT_xlib_window_binding.h) as
-    // sessionInfo.next, and enable XR_EXT_XLIB_WINDOW_BINDING_EXTENSION_NAME in
+    //   XrXlibWindowBindingCreateInfoDXR { .next = &vkBinding, .xDisplay, .window }
+    // (header already vendored: openxr/XR_DXR_xlib_window_binding.h) as
+    // sessionInfo.next, and enable XR_DXR_XLIB_WINDOW_BINDING_EXTENSION_NAME in
     // InitializeOpenXR. Gated on the Linux runtime + a GPU + an X server —
     // docs/guides/linux-demo-port.md, runtime #660/#699.
     XrSessionCreateInfo sessionInfo = {XR_TYPE_SESSION_CREATE_INFO};

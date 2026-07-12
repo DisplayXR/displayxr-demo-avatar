@@ -1,24 +1,25 @@
 // Copyright 2026, The DisplayXR Project
 // SPDX-License-Identifier: Apache-2.0
 //
-// PROVISIONAL — the XR_EXT_* identifiers in this header are NOT registered
-// with the Khronos OpenXR registry. They are provisional placeholders used
-// during DisplayXR incubation and will be re-registered — and may be renamed
-// (e.g. to a registered XR_<AUTHORID>_ prefix) — through the official Khronos
-// process on the EXT -> KHR path. Do not treat these names or numeric values
-// as stable. See GOVERNANCE.md.
+// PROVISIONAL — DXR is DisplayXR's Khronos-registered OpenXR author ID, but
+// the XR_DXR_* extensions in this header are NOT yet registered in the
+// Khronos OpenXR registry: extension numbers and XrStructureType values sit
+// in a provisional experimental block (1004999xxx) pending official
+// assignment. Extension names are expected to be stable; numeric values are
+// not. SPEC_VERSION restarted at 1 on the XR_EXT_* -> XR_DXR_* rename.
+// See GOVERNANCE.md.
 //
 /*!
  * @file
- * @brief  Header for XR_EXT_xlib_window_binding extension
+ * @brief  Header for XR_DXR_xlib_window_binding extension
  * @author David Fattal
  * @ingroup external_openxr
  *
  * This extension allows an OpenXR application to provide its own X11 window
  * (Display* + Window) to the runtime on desktop Linux. When provided, the
  * runtime will render into the application's window instead of creating its
- * own window. Sibling of XR_EXT_win32_window_binding (HWND) and
- * XR_EXT_cocoa_window_binding (NSView).
+ * own window. Sibling of XR_DXR_win32_window_binding (HWND) and
+ * XR_DXR_cocoa_window_binding (NSView).
  *
  * This enables:
  * - Windowed mode rendering (vs fullscreen)
@@ -35,8 +36,8 @@
  * part of this revision — see the win32/cocoa siblings for the intended shape
  * of a future addition.
  */
-#ifndef XR_EXT_XLIB_WINDOW_BINDING_H
-#define XR_EXT_XLIB_WINDOW_BINDING_H 1
+#ifndef XR_DXR_XLIB_WINDOW_BINDING_H
+#define XR_DXR_XLIB_WINDOW_BINDING_H 1
 
 #include <openxr/openxr.h>
 #include <stdint.h>
@@ -45,14 +46,14 @@
 extern "C" {
 #endif
 
-#define XR_EXT_xlib_window_binding 1
-#define XR_EXT_xlib_window_binding_SPEC_VERSION 1
-#define XR_EXT_XLIB_WINDOW_BINDING_EXTENSION_NAME "XR_EXT_xlib_window_binding"
+#define XR_DXR_xlib_window_binding 1
+#define XR_DXR_xlib_window_binding_SPEC_VERSION 1
+#define XR_DXR_XLIB_WINDOW_BINDING_EXTENSION_NAME "XR_DXR_xlib_window_binding"
 
-// Value from the DisplayXR provisional 1000999xxx block — decade 1000999200–209
+// Value from the DisplayXR provisional 1004999xxx block — decade 1004999200–209
 // claimed in this directory's README.md allocation registry. Replace with an
 // official Khronos-assigned value if the extension is standardized.
-#define XR_TYPE_XLIB_WINDOW_BINDING_CREATE_INFO_EXT ((XrStructureType)1000999200)
+#define XR_TYPE_XLIB_WINDOW_BINDING_CREATE_INFO_DXR ((XrStructureType)1004999200)
 
 // The binding struct uses Xlib types and is only meaningful on desktop Linux
 // (Android also reports __linux__ but has no X11).
@@ -85,12 +86,12 @@ typedef struct _XDisplay Display;
  *
  * @extends XrSessionCreateInfo
  */
-typedef struct XrXlibWindowBindingCreateInfoEXT {
-    XrStructureType             type;      //!< Must be XR_TYPE_XLIB_WINDOW_BINDING_CREATE_INFO_EXT
+typedef struct XrXlibWindowBindingCreateInfoDXR {
+    XrStructureType             type;      //!< Must be XR_TYPE_XLIB_WINDOW_BINDING_CREATE_INFO_DXR
     const void* XR_MAY_ALIAS    next;      //!< Pointer to next structure in chain
     Display*                    xDisplay;  //!< Xlib display connection (XOpenDisplay)
     XR_XLIB_WINDOW_TYPE_        window;    //!< X11 Window (XID) owned by the app
-} XrXlibWindowBindingCreateInfoEXT;
+} XrXlibWindowBindingCreateInfoDXR;
 
 #undef XR_XLIB_WINDOW_TYPE_
 
@@ -100,4 +101,4 @@ typedef struct XrXlibWindowBindingCreateInfoEXT {
 }
 #endif
 
-#endif // XR_EXT_XLIB_WINDOW_BINDING_H
+#endif // XR_DXR_XLIB_WINDOW_BINDING_H

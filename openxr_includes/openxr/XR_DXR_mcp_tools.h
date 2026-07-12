@@ -1,8 +1,17 @@
 // Copyright 2026, DisplayXR
-// SPDX-License-Identifier: BSL-1.0
+// SPDX-License-Identifier: Apache-2.0
+//
+// PROVISIONAL — DXR is DisplayXR's Khronos-registered OpenXR author ID, but
+// the XR_DXR_* extensions in this header are NOT yet registered in the
+// Khronos OpenXR registry: extension numbers and XrStructureType values sit
+// in a provisional experimental block (1004999xxx) pending official
+// assignment. Extension names are expected to be stable; numeric values are
+// not. SPEC_VERSION restarted at 1 on the XR_EXT_* -> XR_DXR_* rename.
+// See GOVERNANCE.md.
+//
 /*!
  * @file
- * @brief  Header for XR_EXT_mcp_tools extension (app-defined agent tools).
+ * @brief  Header for XR_DXR_mcp_tools extension (app-defined agent tools).
  * @author DisplayXR
  * @ingroup external_openxr
  *
@@ -14,13 +23,13 @@
  *
  * Dispatch is event-based on purpose: the MCP transport thread never
  * calls into app code. A tool invocation surfaces as an
- * XrEventDataMCPToolCallEXT through xrPollEvent; the app executes the
+ * XrEventDataMCPToolCallDXR through xrPollEvent; the app executes the
  * tool on its own frame loop (where its state is naturally consistent)
- * and answers with xrSubmitMCPToolResultEXT. The runtime fails a call
+ * and answers with xrSubmitMCPToolResultDXR. The runtime fails a call
  * the app has not answered within ~5 seconds.
  *
  * Event payloads are fixed-size, so tool arguments use the OpenXR
- * two-call idiom via xrGetMCPToolCallArgsEXT.
+ * two-call idiom via xrGetMCPToolCallArgsDXR.
  *
  * All functions return XR_ERROR_FEATURE_UNSUPPORTED when the MCP
  * capability is disabled (HKLM\Software\DisplayXR\Capabilities\MCP /
@@ -28,10 +37,10 @@
  * continue normally.
  *
  * Design: displayxr-runtime docs/roadmap/per-app-mcp-tools.md;
- * spec: docs/specs/extensions/XR_EXT_mcp_tools.md.
+ * spec: docs/specs/extensions/XR_DXR_mcp_tools.md.
  */
-#ifndef XR_EXT_MCP_TOOLS_H
-#define XR_EXT_MCP_TOOLS_H 1
+#ifndef XR_DXR_MCP_TOOLS_H
+#define XR_DXR_MCP_TOOLS_H 1
 
 #include <openxr/openxr.h>
 
@@ -39,16 +48,16 @@
 extern "C" {
 #endif
 
-#define XR_EXT_mcp_tools 1
-#define XR_EXT_mcp_tools_SPEC_VERSION 1
-#define XR_EXT_MCP_TOOLS_EXTENSION_NAME "XR_EXT_mcp_tools"
+#define XR_DXR_mcp_tools 1
+#define XR_DXR_mcp_tools_SPEC_VERSION 1
+#define XR_DXR_MCP_TOOLS_EXTENSION_NAME "XR_DXR_mcp_tools"
 
-// Provisional XrStructureType values. The 1000999130..132 range is
+// Provisional XrStructureType values. The 1004999130..132 range is
 // reserved for this extension. Reconciles with the Khronos registry
 // before any spec-freeze attempt.
-#define XR_TYPE_MCP_APP_INFO_EXT            ((XrStructureType)1000999130)
-#define XR_TYPE_MCP_TOOL_INFO_EXT           ((XrStructureType)1000999131)
-#define XR_TYPE_EVENT_DATA_MCP_TOOL_CALL_EXT ((XrStructureType)1000999132)
+#define XR_TYPE_MCP_APP_INFO_DXR            ((XrStructureType)1004999130)
+#define XR_TYPE_MCP_TOOL_INFO_DXR           ((XrStructureType)1004999131)
+#define XR_TYPE_EVENT_DATA_MCP_TOOL_CALL_DXR ((XrStructureType)1004999132)
 
 /*!
  * @brief Maximum app-id length (the manifest `id` slug), incl. NUL.
@@ -57,7 +66,7 @@ extern "C" {
  * digits, hyphens. Underscores are excluded by design: `__` is the
  * workspace aggregator's namespace separator.
  */
-#define XR_MAX_MCP_APP_ID_SIZE_EXT 33
+#define XR_MAX_MCP_APP_ID_SIZE_DXR 33
 
 /*!
  * @brief Maximum bare tool-name length, incl. NUL.
@@ -65,7 +74,7 @@ extern "C" {
  * Charset is `^[a-z0-9][a-z0-9_-]{0,62}$` and the name must not
  * contain the substring `__` (reserved namespace separator).
  */
-#define XR_MAX_MCP_TOOL_NAME_SIZE_EXT 64
+#define XR_MAX_MCP_TOOL_NAME_SIZE_DXR 64
 
 /*!
  * @brief App identity declaration.
@@ -74,11 +83,11 @@ extern "C" {
  * manifest (manifest spec §3.4); `scripts/check_displayxr_app.py`
  * lints the pairing. It becomes the agent-visible tool-name prefix.
  */
-typedef struct XrMCPAppInfoEXT {
-    XrStructureType          type; //!< Must be XR_TYPE_MCP_APP_INFO_EXT
+typedef struct XrMCPAppInfoDXR {
+    XrStructureType          type; //!< Must be XR_TYPE_MCP_APP_INFO_DXR
     const void* XR_MAY_ALIAS next; //!< Reserved; must be NULL in spec_version 1
-    char                     appId[XR_MAX_MCP_APP_ID_SIZE_EXT]; //!< NUL-terminated slug
-} XrMCPAppInfoEXT;
+    char                     appId[XR_MAX_MCP_APP_ID_SIZE_DXR]; //!< NUL-terminated slug
+} XrMCPAppInfoDXR;
 
 /*!
  * @brief Declare the app's stable identifier. Call once per session,
@@ -90,14 +99,14 @@ typedef struct XrMCPAppInfoEXT {
  *         XR_ERROR_FEATURE_UNSUPPORTED (MCP capability disabled),
  *         XR_ERROR_HANDLE_INVALID.
  */
-typedef XrResult (XRAPI_PTR *PFN_xrSetMCPAppInfoEXT)(
+typedef XrResult (XRAPI_PTR *PFN_xrSetMCPAppInfoDXR)(
     XrSession                session,
-    const XrMCPAppInfoEXT*   info);
+    const XrMCPAppInfoDXR*   info);
 
 #ifndef XR_NO_PROTOTYPES
-XRAPI_ATTR XrResult XRAPI_CALL xrSetMCPAppInfoEXT(
+XRAPI_ATTR XrResult XRAPI_CALL xrSetMCPAppInfoDXR(
     XrSession                session,
-    const XrMCPAppInfoEXT*   info);
+    const XrMCPAppInfoDXR*   info);
 #endif
 
 /*!
@@ -110,13 +119,13 @@ XRAPI_ATTR XrResult XRAPI_CALL xrSetMCPAppInfoEXT(
  *
  * The strings are copied; the struct need not outlive the call.
  */
-typedef struct XrMCPToolInfoEXT {
-    XrStructureType          type; //!< Must be XR_TYPE_MCP_TOOL_INFO_EXT
+typedef struct XrMCPToolInfoDXR {
+    XrStructureType          type; //!< Must be XR_TYPE_MCP_TOOL_INFO_DXR
     const void* XR_MAY_ALIAS next; //!< Reserved; must be NULL in spec_version 1
     const char*              name;            //!< Bare name; runtime/aggregator prefixes
     const char*              description;     //!< Agent-facing; required
     const char*              inputSchemaJson; //!< JSON Schema; optional
-} XrMCPToolInfoEXT;
+} XrMCPToolInfoDXR;
 
 /*!
  * @brief Register a tool on the session. Tools registered after agents
@@ -131,24 +140,24 @@ typedef struct XrMCPToolInfoEXT {
  *         XR_ERROR_LIMIT_REACHED (per-process tool budget exhausted),
  *         XR_ERROR_FEATURE_UNSUPPORTED, XR_ERROR_HANDLE_INVALID.
  */
-typedef XrResult (XRAPI_PTR *PFN_xrRegisterMCPToolEXT)(
+typedef XrResult (XRAPI_PTR *PFN_xrRegisterMCPToolDXR)(
     XrSession                session,
-    const XrMCPToolInfoEXT*  tool);
+    const XrMCPToolInfoDXR*  tool);
 
 /*!
  * @brief Unregister a tool by bare name. In-flight calls on the tool
  * fail to the agent. XR_ERROR_VALIDATION_FAILURE if the name is not
  * registered on this session.
  */
-typedef XrResult (XRAPI_PTR *PFN_xrUnregisterMCPToolEXT)(
+typedef XrResult (XRAPI_PTR *PFN_xrUnregisterMCPToolDXR)(
     XrSession                session,
     const char*              name);
 
 #ifndef XR_NO_PROTOTYPES
-XRAPI_ATTR XrResult XRAPI_CALL xrRegisterMCPToolEXT(
+XRAPI_ATTR XrResult XRAPI_CALL xrRegisterMCPToolDXR(
     XrSession                session,
-    const XrMCPToolInfoEXT*  tool);
-XRAPI_ATTR XrResult XRAPI_CALL xrUnregisterMCPToolEXT(
+    const XrMCPToolInfoDXR*  tool);
+XRAPI_ATTR XrResult XRAPI_CALL xrUnregisterMCPToolDXR(
     XrSession                session,
     const char*              name);
 #endif
@@ -156,22 +165,22 @@ XRAPI_ATTR XrResult XRAPI_CALL xrUnregisterMCPToolEXT(
 /*!
  * @brief Tool invocation event, delivered via xrPollEvent.
  *
- * The app fetches the JSON arguments with xrGetMCPToolCallArgsEXT
+ * The app fetches the JSON arguments with xrGetMCPToolCallArgsDXR
  * (`argsSize` is the required capacity incl. NUL), executes the tool,
- * and answers with xrSubmitMCPToolResultEXT. An unanswered call fails
+ * and answers with xrSubmitMCPToolResultDXR. An unanswered call fails
  * to the agent after ~5 seconds; a result submitted after that is
  * silently dropped (XR_SUCCESS).
  *
  * @extends XrEventDataBaseHeader
  */
-typedef struct XrEventDataMCPToolCallEXT {
-    XrStructureType          type; //!< Must be XR_TYPE_EVENT_DATA_MCP_TOOL_CALL_EXT
+typedef struct XrEventDataMCPToolCallDXR {
+    XrStructureType          type; //!< Must be XR_TYPE_EVENT_DATA_MCP_TOOL_CALL_DXR
     const void* XR_MAY_ALIAS next;
     XrSession                session;
     uint64_t                 callId;   //!< Correlates xrGet…Args/xrSubmit…Result; never 0
-    char                     toolName[XR_MAX_MCP_TOOL_NAME_SIZE_EXT]; //!< NUL-terminated
-    uint32_t                 argsSize; //!< Bytes incl. NUL for xrGetMCPToolCallArgsEXT
-} XrEventDataMCPToolCallEXT;
+    char                     toolName[XR_MAX_MCP_TOOL_NAME_SIZE_DXR]; //!< NUL-terminated
+    uint32_t                 argsSize; //!< Bytes incl. NUL for xrGetMCPToolCallArgsDXR
+} XrEventDataMCPToolCallDXR;
 
 /*!
  * @brief Fetch a pending call's JSON arguments (two-call idiom).
@@ -182,7 +191,7 @@ typedef struct XrEventDataMCPToolCallEXT {
  *         XR_ERROR_VALIDATION_FAILURE (unknown/expired callId),
  *         XR_ERROR_HANDLE_INVALID.
  */
-typedef XrResult (XRAPI_PTR *PFN_xrGetMCPToolCallArgsEXT)(
+typedef XrResult (XRAPI_PTR *PFN_xrGetMCPToolCallArgsDXR)(
     XrSession                session,
     uint64_t                 callId,
     uint32_t                 capacity,
@@ -200,20 +209,20 @@ typedef XrResult (XRAPI_PTR *PFN_xrGetMCPToolCallArgsEXT)(
  *         the result is dropped), XR_ERROR_VALIDATION_FAILURE
  *         (callId never existed), XR_ERROR_HANDLE_INVALID.
  */
-typedef XrResult (XRAPI_PTR *PFN_xrSubmitMCPToolResultEXT)(
+typedef XrResult (XRAPI_PTR *PFN_xrSubmitMCPToolResultDXR)(
     XrSession                session,
     uint64_t                 callId,
     XrBool32                 success,
     const char*              resultJson);
 
 #ifndef XR_NO_PROTOTYPES
-XRAPI_ATTR XrResult XRAPI_CALL xrGetMCPToolCallArgsEXT(
+XRAPI_ATTR XrResult XRAPI_CALL xrGetMCPToolCallArgsDXR(
     XrSession                session,
     uint64_t                 callId,
     uint32_t                 capacity,
     uint32_t*                countOutput,
     char*                    buffer);
-XRAPI_ATTR XrResult XRAPI_CALL xrSubmitMCPToolResultEXT(
+XRAPI_ATTR XrResult XRAPI_CALL xrSubmitMCPToolResultDXR(
     XrSession                session,
     uint64_t                 callId,
     XrBool32                 success,
@@ -224,4 +233,4 @@ XRAPI_ATTR XrResult XRAPI_CALL xrSubmitMCPToolResultEXT(
 }
 #endif
 
-#endif // XR_EXT_MCP_TOOLS_H
+#endif // XR_DXR_MCP_TOOLS_H

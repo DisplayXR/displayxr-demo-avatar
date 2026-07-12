@@ -11,7 +11,7 @@
 # session + HUD/input, with the renderer call sites wired to ModelRenderer
 # (loadModel / hasModel / getRobustSceneBounds, .glb/.gltf NSOpenPanel +
 # drag-drop). Transparent-background mode IS supported on macOS: the Metal
-# compositor is alpha-native (no chroma key) — see XR_EXT_cocoa_window_binding
+# compositor is alpha-native (no chroma key) — see XR_DXR_cocoa_window_binding
 # transparentBackgroundEnabled in main.mm + the gauss demo recipe.
 
 cmake_minimum_required(VERSION 3.21)

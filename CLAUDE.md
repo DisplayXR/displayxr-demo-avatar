@@ -11,7 +11,7 @@ OpenXR app **derived from `displayxr-demo-modelviewer`**: it reuses that demo's
 `model_common/` renderer to weave the bundled FBX, then wraps it in an avatar
 shell — transparent-by-default borderless window, per-pixel click-through, a
 face-the-viewer billboard, depth dolly with display-plane clipping, and a flat
-2D speech bubble (`XR_EXT_local_3d_zone` Local2D) above the weaved character.
+2D speech bubble (`XR_DXR_local_3d_zone` Local2D) above the weaved character.
 Standalone repo, independent release cadence; `common/` + `openxr_includes/`
 were seeded from the runtime and are maintained here.
 
@@ -37,9 +37,9 @@ at startup.
 - **Bottom-70 % confinement + speech bubble** — the Kooima canvas is a bottom-70 %
   sub-rect (full width, centre at 65 %) and the avatar renders into the bottom-70 %
   sub-viewport of each tile; the top 30 % is a flat 2D bubble submitted by a
-  hand-built `xrEndFrame` (a `XrCompositionLayerLocal2DEXT` pill + a full-band
+  hand-built `xrEndFrame` (a `XrCompositionLayerLocal2DDXR` pill + a full-band
   transparent backer, both implicit-M=0). This is the handle-app equivalent of a
-  texture app's `xrSetSharedTextureOutputRectEXT`.
+  texture app's `xrSetSharedTextureOutputRectDXR`.
 - **W/S depth dolly only** — X/Y are anchored each frame to the animated skeleton
   centroid (`getAnimatedAnchor`), so A/D/Q/E are effectively no-ops; `W`/`S`
   drive Z through the display-plane clip.
@@ -63,7 +63,7 @@ windows/main.cpp                 — platform entry + avatar shell: borderless
                                     capture ('I'). NO model-load UI (auto-loads the
                                     bundled tiger; optional CLI model-path arg).
 windows/xr_session.cpp/.h        — OpenXR instance/session/Vulkan setup; enables
-                                    XR_EXT_local_3d_zone (g_hasLocal3DZone gates
+                                    XR_DXR_local_3d_zone (g_hasLocal3DZone gates
                                     the bubble).
 macos/main.mm                    — Cocoa/MoltenVK avatar-shell port (in progress).
 model_common/                     — the renderer (vendor-neutral, analog of
@@ -166,7 +166,7 @@ and runs via **`./scripts/run_avatar_linux.sh`**. The Linux entry point is
 `linux/main.cpp` — a minimal Vulkan + OpenXR frame loop driving the same
 cross-platform `model_common/ModelRenderer` the macOS/Windows peers use.
 Windowing is **hosted-NULL** (the runtime self-creates its window); the faithful
-app-owned X11 window via `XR_EXT_xlib_window_binding` (header already vendored in
+app-owned X11 window via `XR_DXR_xlib_window_binding` (header already vendored in
 `openxr_includes/`) is **Phase-3** work, gated on the Linux runtime + a GPU + an
 X server. This is **build-green only** — CI compiles it on `ubuntu-latest`
 (`build-linux.yml`, dispatch/`linux*`-branch only, not required); on-screen
@@ -184,7 +184,7 @@ both platforms — keep it that way.
 Two capture paths, both readable on a flat monitor:
 - **Atlas capture (`I`)** — dumps the multi-view atlas to
   `%USERPROFILE%\Pictures\DisplayXR\<name>_atlas_<vc>_<cols>x<rows>.png` (skipped
-  for 1×1 mono), via runtime-owned `xrCaptureAtlasEXT`. Good for
+  for 1×1 mono), via runtime-owned `xrCaptureAtlasDXR`. Good for
   geometry/shading/framing + the bottom-70% confinement.
 - **Silhouette dump (`DXR_DUMP_SILHOUETTE=1`)** — writes the click-through hit
   mask to `%TEMP%\avatar_silhouette.png` (~1/sec; white = avatar, black =
