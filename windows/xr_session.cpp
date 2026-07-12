@@ -533,7 +533,6 @@ bool CreateSession(XrSessionManager& xr, VkInstance vkInstance, VkPhysicalDevice
     // a no-op when alpha == 1 throughout, so opaque mode looks identical
     // to a non-transparent session. Requires runtime ≥ v1.3.0.
     sessionTarget.transparentBackgroundEnabled = XR_TRUE;
-    sessionTarget.chromaKeyColor = 0; // 0 → DP picks default magenta
 
     if (xr.hasWin32WindowBindingExt && hwnd) {
         vkBinding.next = &sessionTarget;
