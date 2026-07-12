@@ -30,9 +30,8 @@ set(DISPLAYXR_EXTENSIONS_INCLUDE_DIR "${_dxr_ext_includes}" CACHE PATH
 FetchContent_Declare(
     displayxr_common
     GIT_REPOSITORY https://github.com/DisplayXR/displayxr-common.git
-    # TEMPORARY (#734): dxr-rename branch SHA — swap to released tag before merge
-    # (and restore GIT_SHALLOW TRUE, removed because shallow + SHA pins misbehave)
-    GIT_TAG 28d6eb7b9898cde447d90bfecda8b6734be83db1
+    GIT_TAG v2.0.0
+    GIT_SHALLOW TRUE
 )
 FetchContent_MakeAvailable(displayxr_common)
 
