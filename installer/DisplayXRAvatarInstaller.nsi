@@ -88,7 +88,7 @@ ShowUninstDetails show
 ; transparentBackgroundEnabled=XR_TRUE unconditionally, which only render
 ; correctly against runtime >= 1.9.1's VK->D3D11 KMT-shared-texture / DComp
 ; bridge + in-place resize. Older runtimes produce a broken/black window. The
-; speech bubble additionally uses XR_EXT_local_3d_zone (Local2D) but degrades
+; speech bubble additionally uses XR_DXR_local_3d_zone (Local2D) but degrades
 ; gracefully (no bubble) when the runtime doesn't advertise it.
 !define MIN_RUNTIME_VERSION "1.9.1"
 

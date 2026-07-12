@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 /*!
  * @file
- * @brief  OpenXR session management for Vulkan with XR_EXT_win32_window_binding
+ * @brief  OpenXR session management for Vulkan with XR_DXR_win32_window_binding
  */
 
 #pragma once
@@ -11,28 +11,28 @@
 #include <vulkan/vulkan.h>
 #define XR_USE_GRAPHICS_API_VULKAN
 #include "xr_session_common.h"
-#include <openxr/XR_EXT_display_zones.h>  // zone caps/view-size PFN typedefs
+#include <openxr/XR_DXR_display_zones.h>  // zone caps/view-size PFN typedefs
 
-// True when the runtime advertises XR_EXT_local_3d_zone (set in InitializeOpenXR).
+// True when the runtime advertises XR_DXR_local_3d_zone (set in InitializeOpenXR).
 // Gates the avatar's 2D speech-bubble Local2D layer.
 extern bool g_hasLocal3DZone;
 
-// True when the runtime advertises XR_EXT_view_rig (set in InitializeOpenXR).
-// Required for the zone-chained XrDisplayRigEXT locate (runtime-side framing).
+// True when the runtime advertises XR_DXR_view_rig (set in InitializeOpenXR).
+// Required for the zone-chained XrDisplayRigDXR locate (runtime-side framing).
 extern bool g_hasViewRigExt;
 
-// True when the runtime advertises XR_EXT_display_zones (set in InitializeOpenXR).
+// True when the runtime advertises XR_DXR_display_zones (set in InitializeOpenXR).
 // Together with g_hasViewRigExt this gates the zones frame path: one 3D zone
 // (the tiger, bottom 75%) framed by the runtime rig instead of app-side Kooima.
 extern bool g_hasDisplayZonesExt;
 
-// XR_EXT_display_zones entry points (resolved in InitializeOpenXR; NULL when
+// XR_DXR_display_zones entry points (resolved in InitializeOpenXR; NULL when
 // the extension is absent — callers must check).
-extern PFN_xrGetDisplayZoneCapabilitiesEXT g_pfnGetDisplayZoneCaps;
-extern PFN_xrGetDisplayZoneRecommendedViewSizeEXT g_pfnGetDisplayZoneViewSize;
+extern PFN_xrGetDisplayZoneCapabilitiesDXR g_pfnGetDisplayZoneCaps;
+extern PFN_xrGetDisplayZoneRecommendedViewSizeDXR g_pfnGetDisplayZoneViewSize;
 
-// 3D-panel top-left in virtual-desktop pixels (XrDisplayDesktopPositionEXT,
-// XR_EXT_display_info v16, runtime#715), captured in InitializeOpenXR. (0,0)
+// 3D-panel top-left in virtual-desktop pixels (XrDisplayDesktopPositionDXR,
+// XR_DXR_display_info v16, runtime#715), captured in InitializeOpenXR. (0,0)
 // = primary monitor or unknown (older runtime) — the safe default.
 extern int32_t g_displayDesktopLeft;
 extern int32_t g_displayDesktopTop;

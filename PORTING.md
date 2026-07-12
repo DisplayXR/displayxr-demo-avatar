@@ -20,10 +20,10 @@ roadmap is below. For how the renderer works today, see `CLAUDE.md` →
   skeleton centroid; `W`/`S` drive Z through the ZDP clip (transparent →
   `far_offset = 0`, foreground only).
 - **Speech bubble (Local2D)** — bottom-70 % Kooima sub-canvas + bottom-70 %
-  sub-viewport for the weaved avatar; one `XrCompositionLayerLocal2DEXT` pill
+  sub-viewport for the weaved avatar; one `XrCompositionLayerLocal2DDXR` pill
   (auto-fit, balanced, aspect-preserving) + a full-band transparent backer over
   the top 30 %, submitted in a hand-built `xrEndFrame`. Gated on
-  `XR_EXT_local_3d_zone`.
+  `XR_DXR_local_3d_zone`.
 - **Bundled avatar** = `assets/tiger/avatar.fbx` (+ `rgb.jpg`), copied next to the
   exe and auto-loaded. Inherited renderer: metallic-roughness GGX + split-sum IBL
   + ufbx **skinning + animation** (the tiger plays its first clip).
@@ -67,7 +67,7 @@ relative path (like `windows/` + `macos/`), scaffolded from the
 
 **Next (Android):**
 1. **Tiger-zone framing** — confine the avatar to the bottom-75% via
-   `XR_EXT_display_zones` (app side wired, chains the zone on locate + submit;
+   `XR_DXR_display_zones` (app side wired, chains the zone on locate + submit;
    dormant until the runtime advertises zone support on the OOP path — a runtime
    + DP feature, see runtime `#568`). Until then the tiger frames full-canvas.
 2. **3D weave** — needs the Leia Android DP alpha-gate (reconstructs alpha

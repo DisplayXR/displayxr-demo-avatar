@@ -18,7 +18,7 @@ renderer (`model_common/`), specialised into an avatar shell.
 > v1.9.1+ ships the Vulkan transparent-window bridge + in-place resize this demo
 > relies on; older runtimes produce a broken/black window or flicker on resize.
 > The speech bubble additionally needs a runtime that advertises
-> `XR_EXT_local_3d_zone` (Local2D); without it the avatar still renders, just
+> `XR_DXR_local_3d_zone` (Local2D); without it the avatar still renders, just
 > with no bubble.
 
 ## What makes it an "avatar" (not a model viewer)
@@ -37,11 +37,11 @@ renderer (`model_common/`), specialised into an avatar shell.
 - **Depth dolly with display-plane clip** — `W`/`S` push the avatar toward / away
   from the viewer *through* the display plane; in transparent mode anything
   behind the plane is clipped, so only the popping-out part shows.
-- **2D speech bubble over 3D** — one `XrCompositionLayerLocal2DEXT` over the top
+- **2D speech bubble over 3D** — one `XrCompositionLayerLocal2DDXR` over the top
   ~30 % band (implicit M=0 mask) gives a crisp flat nameplate while the bottom
   70 % keeps weaving. The avatar is confined to the bottom-70 % sub-rect (a
   handle-app Kooima sub-canvas, the equivalent of a texture app's
-  `xrSetSharedTextureOutputRectEXT`).
+  `xrSetSharedTextureOutputRectDXR`).
 
 ## Controls
 

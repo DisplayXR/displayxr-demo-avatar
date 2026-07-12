@@ -9,7 +9,7 @@
 #
 # NOTE: on-screen operation is gated on the runtime's Linux Phase 1b/3b
 # hardware bring-up. The app is currently HOSTED-NULL (the runtime self-creates
-# its window); the faithful app-owned X11 window via XR_EXT_xlib_window_binding
+# its window); the faithful app-owned X11 window via XR_DXR_xlib_window_binding
 # is Phase-3 work (the header is already vendored in openxr_includes/).
 #
 # Usage: scripts/run_avatar_linux.sh [model.glb|.gltf|.fbx] [extra args...]

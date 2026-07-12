@@ -1290,7 +1290,7 @@ void ModelRenderer::updateUniforms(const float viewMatrix[16], const float projM
     // multiply by diag(1,-1,1,1) → negate view column 1) so the model is
     // upright with the demo's Y-mirrored display-pose contract.
     // Plain convention (setPlainViewConvention): consume the view matrix
-    // un-reflected (e.g. the render-ready XR_EXT_view_rig XrView pose) —
+    // un-reflected (e.g. the render-ready XR_DXR_view_rig XrView pose) —
     // Vulkan Y-down is handled at the RASTER stage via a negative-height
     // viewport in renderEye, which keeps rotational handedness intact and
     // the off-axis projection in its native +Y-up frame. -R^T·t below

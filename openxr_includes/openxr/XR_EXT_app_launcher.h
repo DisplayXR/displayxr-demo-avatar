@@ -13,8 +13,8 @@
  * count as "running" all live in the workspace controller.
  *
  * The extension is workspace-scoped: an instance must enable
- * XR_EXT_spatial_workspace and the session must be the active workspace
- * (xrActivateSpatialWorkspaceEXT) before any of these functions return
+ * XR_DXR_spatial_workspace and the session must be the active workspace
+ * (xrActivateSpatialWorkspaceDXR) before any of these functions return
  * XR_SUCCESS. Without a workspace they return XR_ERROR_FEATURE_UNSUPPORTED.
  */
 #ifndef XR_EXT_APP_LAUNCHER_H
@@ -37,7 +37,7 @@ extern "C" {
 
 // Provisional XrStructureType value. Reconciles with the Khronos registry
 // before spec freeze.
-#define XR_TYPE_LAUNCHER_APP_INFO_EXT ((XrStructureType)1000999110)
+#define XR_TYPE_LAUNCHER_APP_INFO_EXT ((XrStructureType)1004999110)
 
 /*!
  * @brief Maximum number of tiles the runtime stores.

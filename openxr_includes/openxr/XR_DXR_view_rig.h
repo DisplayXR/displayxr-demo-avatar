@@ -1,8 +1,17 @@
 // Copyright 2026, DisplayXR
-// SPDX-License-Identifier: BSL-1.0
+// SPDX-License-Identifier: Apache-2.0
+//
+// PROVISIONAL — DXR is DisplayXR's Khronos-registered OpenXR author ID, but
+// the XR_DXR_* extensions in this header are NOT yet registered in the
+// Khronos OpenXR registry: extension numbers and XrStructureType values sit
+// in a provisional experimental block (1004999xxx) pending official
+// assignment. Extension names are expected to be stable; numeric values are
+// not. SPEC_VERSION restarted at 1 on the XR_EXT_* -> XR_DXR_* rename.
+// See GOVERNANCE.md.
+//
 /*!
  * @file
- * @brief  Header for XR_EXT_view_rig extension
+ * @brief  Header for XR_DXR_view_rig extension
  * @author David Fattal
  * @ingroup external_openxr
  *
@@ -31,14 +40,14 @@
  * including the raw-eye transport in XrView.pose for external-window apps.
  *
  * The app-facing halves are pure next-chain structs on xrLocateViews. The one
- * entry point, xrSetWorkspaceViewRigEXT, is for the workspace controller only:
+ * entry point, xrSetWorkspaceViewRigDXR, is for the workspace controller only:
  * an app's own rig is honored by default (app visual policy within its canvas),
  * but in workspace mode the controller may take over the clients' view geometry
  * through this call (e.g. forcing identity m2v during a layout animation). Full
  * design: docs/adr/ADR-024-raw-vs-render-ready-views.md (W7 of issue #396).
  */
-#ifndef XR_EXT_VIEW_RIG_H
-#define XR_EXT_VIEW_RIG_H 1
+#ifndef XR_DXR_VIEW_RIG_H
+#define XR_DXR_VIEW_RIG_H 1
 
 #include <openxr/openxr.h>
 
@@ -46,18 +55,18 @@
 extern "C" {
 #endif
 
-#define XR_EXT_view_rig 1
-#define XR_EXT_view_rig_SPEC_VERSION 2
-#define XR_EXT_VIEW_RIG_EXTENSION_NAME "XR_EXT_view_rig"
+#define XR_DXR_view_rig 1
+#define XR_DXR_view_rig_SPEC_VERSION 1
+#define XR_DXR_VIEW_RIG_EXTENSION_NAME "XR_DXR_view_rig"
 
-// Reserved 1000999xxx range, next free block after mcp_tools (…130-132).
+// Reserved 1004999xxx range, next free block after mcp_tools (…130-132).
 // Final values reconcile with the Khronos registry before spec freeze.
-#define XR_TYPE_DISPLAY_RIG_EXT      ((XrStructureType)1000999140)
-#define XR_TYPE_CAMERA_RIG_EXT       ((XrStructureType)1000999141)
-#define XR_TYPE_VIEW_DISPLAY_RAW_EXT ((XrStructureType)1000999142)
+#define XR_TYPE_DISPLAY_RIG_DXR      ((XrStructureType)1004999140)
+#define XR_TYPE_CAMERA_RIG_DXR       ((XrStructureType)1004999141)
+#define XR_TYPE_VIEW_DISPLAY_RAW_DXR ((XrStructureType)1004999142)
 
-//! Capacity of XrViewDisplayRawEXT::rawEyes (matches the runtime's max views).
-#define XR_VIEW_RIG_MAX_RAW_EYES_EXT 8
+//! Capacity of XrViewDisplayRawDXR::rawEyes (matches the runtime's max views).
+#define XR_VIEW_RIG_MAX_RAW_EYES_DXR 8
 
 // ---- Request: chain exactly ONE of these on XrViewLocateInfo::next. ----
 
@@ -67,15 +76,15 @@ extern "C" {
  * Maps 1:1 onto the runtime's display-rig tunables. Out-of-range values are
  * clamped (with a one-shot runtime WARN), never rejected.
  */
-typedef struct XrDisplayRigEXT {
-    XrStructureType          type;   //!< Must be XR_TYPE_DISPLAY_RIG_EXT
+typedef struct XrDisplayRigDXR {
+    XrStructureType          type;   //!< Must be XR_TYPE_DISPLAY_RIG_DXR
     const void* XR_MAY_ALIAS next;
     XrPosef pose;                  //!< virtual display plane pose in the locate space
     float   virtualDisplayHeight;  //!< app units; m2v = this / physical canvas height
     float   ipdFactor;             //!< [0,1] multiplies view-pose spread about the center
     float   parallaxFactor;        //!< [0,1] lerps eye centroid toward nominal viewer
     float   perspectiveFactor;     //!< [0.1,10] scales eye XYZ (object perspective)
-} XrDisplayRigEXT;
+} XrDisplayRigDXR;
 
 /*!
  * @brief Camera-centric rig: an app camera whose frustum eye tracking perturbs.
@@ -84,16 +93,26 @@ typedef struct XrDisplayRigEXT {
  * inverse convergence distance the math consumes; verticalFov converts to
  * half-tan at the boundary). Out-of-range values are clamped (one-shot WARN),
  * never rejected.
+ *
+ * metersToVirtual (spec v3) scales tracked head motion (meters) into the app's
+ * world units in the modelview; with it, convergenceDiopters is the inverse
+ * convergence distance in WORLD units (it reduces to 1/m when
+ * metersToVirtual == 1). 0 (or unset) is treated as 1.0, preserving the
+ * pre-v3 behavior where one world unit was implicitly one meter.
  */
-typedef struct XrCameraRigEXT {
-    XrStructureType          type;   //!< Must be XR_TYPE_CAMERA_RIG_EXT
+typedef struct XrCameraRigDXR {
+    XrStructureType          type;   //!< Must be XR_TYPE_CAMERA_RIG_DXR
     const void* XR_MAY_ALIAS next;
     XrPosef pose;                  //!< camera pose in the locate space
-    float   ipdFactor;             //!< [0,1] multiplies view-pose spread about the center
-    float   parallaxFactor;        //!< [0,1] lerps eye centroid toward nominal viewer
-    float   convergenceDiopters;   //!< 1/m to the convergence plane; 0 = infinity
+    float   ipdFactor;             //!< ABSOLUTE eye-separation scale (>= 0; any positive — a stereo
+                                   //!< camera's inter-axial is not bounded to natural IPD). NOT the
+                                   //!< display rig's relative [0,1] factor. Divergence comfort is
+                                   //!< guarded on convergence, not by bounding this.
+    float   parallaxFactor;        //!< ABSOLUTE parallax scale (>= 0); not the [0,1] display factor
+    float   convergenceDiopters;   //!< 1/(convergence distance in world units); 0 = infinity
     float   verticalFov;           //!< radians, full vertical angle
-} XrCameraRigEXT;
+    float   metersToVirtual;       //!< meters→world scale on the eye; 0/unset = 1.0 (spec v3)
+} XrCameraRigDXR;
 
 // ---- Result: app chains this on XrViewState::next; runtime fills it. ----
 
@@ -110,10 +129,10 @@ typedef struct XrCameraRigEXT {
  * N-view mode; the runtime never synthesizes eyes). When the tracker has no
  * lock the runtime still reports nominal-viewer eyes with isTracking = XR_FALSE.
  */
-typedef struct XrViewDisplayRawEXT {
-    XrStructureType    type;       //!< Must be XR_TYPE_VIEW_DISPLAY_RAW_EXT
+typedef struct XrViewDisplayRawDXR {
+    XrStructureType    type;       //!< Must be XR_TYPE_VIEW_DISPLAY_RAW_DXR
     void* XR_MAY_ALIAS next;
-    XrVector3f  rawEyes[XR_VIEW_RIG_MAX_RAW_EYES_EXT]; //!< display-space eye positions (meters,
+    XrVector3f  rawEyes[XR_VIEW_RIG_MAX_RAW_EYES_DXR]; //!< display-space eye positions (meters,
                                    //!< display-center origin, +X right +Y up +Z toward viewer)
     uint32_t    eyeCountOutput;    //!< eyes written = the DP's per-view count
                                    //!< for this locate (one per active view)
@@ -123,7 +142,7 @@ typedef struct XrViewDisplayRawEXT {
     XrExtent2Df canvasSizeMeters;  //!< physical size of that canvas
     int64_t     sampleTimeNs;      //!< when the eyes were sampled (monotonic)
     XrBool32    isTracking;        //!< physical tracker lock (vs nominal fallback)
-} XrViewDisplayRawEXT;
+} XrViewDisplayRawDXR;
 
 // ---- Entry point: workspace controller only. ----
 
@@ -134,19 +153,19 @@ typedef struct XrViewDisplayRawEXT {
 //
 //   session — the active workspace controller's session (else
 //             XR_ERROR_VALIDATION_FAILURE).
-//   rig     — NULL, or an XrDisplayRigEXT / XrCameraRigEXT (its `type` selects
+//   rig     — NULL, or an XrDisplayRigDXR / XrCameraRigDXR (its `type` selects
 //             which); NULL clears the override so clients fall back to honoring
 //             their own rigs. Out-of-range tunables are clamped.
 //
 // Per-call, not chained: the override stays in effect until changed or cleared.
-typedef XrResult(XRAPI_PTR *PFN_xrSetWorkspaceViewRigEXT)(XrSession session, const void *rig);
+typedef XrResult(XRAPI_PTR *PFN_xrSetWorkspaceViewRigDXR)(XrSession session, const void *rig);
 
 #ifndef XR_NO_PROTOTYPES
-XRAPI_ATTR XrResult XRAPI_CALL xrSetWorkspaceViewRigEXT(XrSession session, const void *rig);
+XRAPI_ATTR XrResult XRAPI_CALL xrSetWorkspaceViewRigDXR(XrSession session, const void *rig);
 #endif
 
 #ifdef __cplusplus
 }
 #endif
 
-#endif // XR_EXT_VIEW_RIG_H
+#endif // XR_DXR_VIEW_RIG_H

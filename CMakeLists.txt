@@ -7,7 +7,7 @@
 #
 # Derived from displayxr-demo-modelviewer: same native-Vulkan _handle app and
 # PBR/skinning renderer, retargeted to a transparent click-through avatar that
-# floats over the desktop with a 2D speech bubble (XR_EXT_local_3d_zone).
+# floats over the desktop with a 2D speech bubble (XR_DXR_local_3d_zone).
 
 cmake_minimum_required(VERSION 3.21)
 project(displayxr-demo-avatar LANGUAGES C CXX)
@@ -30,7 +30,7 @@ elseif(WIN32)
     add_subdirectory(windows)
 elseif(UNIX)
     # Desktop Linux — build-green vehicle for the M8 Linux epic (#21). Hosted-NULL
-    # windowing; the app-owned X11 window (XR_EXT_xlib_window_binding) is Phase 3.
+    # windowing; the app-owned X11 window (XR_DXR_xlib_window_binding) is Phase 3.
     add_subdirectory(linux)
 else()
     message(FATAL_ERROR "displayxr-demo-avatar supports macOS, Windows and Linux only.")

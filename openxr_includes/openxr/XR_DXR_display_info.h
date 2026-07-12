@@ -1,16 +1,17 @@
 // Copyright 2025-2026, The DisplayXR Project
 // SPDX-License-Identifier: Apache-2.0
 //
-// PROVISIONAL — the XR_EXT_* identifiers in this header are NOT registered
-// with the Khronos OpenXR registry. They are provisional placeholders used
-// during DisplayXR incubation and will be re-registered — and may be renamed
-// (e.g. to a registered XR_<AUTHORID>_ prefix) — through the official Khronos
-// process on the EXT -> KHR path. Do not treat these names or numeric values
-// as stable. See GOVERNANCE.md.
+// PROVISIONAL — DXR is DisplayXR's Khronos-registered OpenXR author ID, but
+// the XR_DXR_* extensions in this header are NOT yet registered in the
+// Khronos OpenXR registry: extension numbers and XrStructureType values sit
+// in a provisional experimental block (1004999xxx) pending official
+// assignment. Extension names are expected to be stable; numeric values are
+// not. SPEC_VERSION restarted at 1 on the XR_EXT_* -> XR_DXR_* rename.
+// See GOVERNANCE.md.
 //
 /*!
  * @file
- * @brief  Header for XR_EXT_display_info extension
+ * @brief  Header for XR_DXR_display_info extension
  * @author David Fattal
  * @ingroup external_openxr
  *
@@ -20,8 +21,8 @@
  * per-eye render resolution each frame, eliminating the need for runtime
  * events on window resize.
  */
-#ifndef XR_EXT_DISPLAY_INFO_H
-#define XR_EXT_DISPLAY_INFO_H 1
+#ifndef XR_DXR_DISPLAY_INFO_H
+#define XR_DXR_DISPLAY_INFO_H 1
 
 #include <openxr/openxr.h>
 
@@ -29,12 +30,12 @@
 extern "C" {
 #endif
 
-#define XR_EXT_display_info 1
-#define XR_EXT_display_info_SPEC_VERSION 16
-#define XR_EXT_DISPLAY_INFO_EXTENSION_NAME "XR_EXT_display_info"
+#define XR_DXR_display_info 1
+#define XR_DXR_display_info_SPEC_VERSION 1
+#define XR_DXR_DISPLAY_INFO_EXTENSION_NAME "XR_DXR_display_info"
 
 // Reuse the type value from the deleted XR_EXT_dynamic_render_resolution
-#define XR_TYPE_DISPLAY_INFO_EXT ((XrStructureType)1000999003)
+#define XR_TYPE_DISPLAY_INFO_DXR ((XrStructureType)1004999003)
 
 /*!
  * @brief Display information returned by xrGetSystemProperties.
@@ -51,8 +52,8 @@ extern "C" {
  *
  * @extends XrSystemProperties
  */
-typedef struct XrDisplayInfoEXT {
-    XrStructureType             type;       //!< Must be XR_TYPE_DISPLAY_INFO_EXT
+typedef struct XrDisplayInfoDXR {
+    XrStructureType             type;       //!< Must be XR_TYPE_DISPLAY_INFO_DXR
     void* XR_MAY_ALIAS          next;       //!< Pointer to next structure in chain
     XrExtent2Df                 displaySizeMeters;          //!< Physical display size in meters
     XrVector3f                  nominalViewerPositionInDisplaySpace; //!< Nominal viewer position in display space (meters)
@@ -60,17 +61,17 @@ typedef struct XrDisplayInfoEXT {
     float                       recommendedViewScaleY;      //!< Vertical scale: sr_recommended_h / display_pixel_h
     uint32_t                    displayPixelWidth;          //!< Native display panel width in pixels (0 if unknown)
     uint32_t                    displayPixelHeight;         //!< Native display panel height in pixels (0 if unknown)
-} XrDisplayInfoEXT;
+} XrDisplayInfoDXR;
 
 // ---- v16: Display desktop position ----
 
-#define XR_TYPE_DISPLAY_DESKTOP_POSITION_EXT ((XrStructureType)1000999210)
+#define XR_TYPE_DISPLAY_DESKTOP_POSITION_DXR ((XrStructureType)1004999210)
 
 /*!
  * @brief Desktop position of the 3D display, returned by xrGetSystemProperties
  * (v16 addition).
  *
- * When chained to XrSystemProperties (typically via XrDisplayInfoEXT's next
+ * When chained to XrSystemProperties (typically via XrDisplayInfoDXR's next
  * pointer), the runtime fills in the 3D panel's top-left corner in OS
  * virtual-desktop coordinates: top-down pixels with the origin at the primary
  * monitor's top-left (Windows virtual-screen / X11 root-window convention).
@@ -84,35 +85,35 @@ typedef struct XrDisplayInfoEXT {
  *
  * @extends XrSystemProperties
  */
-typedef struct XrDisplayDesktopPositionEXT {
-    XrStructureType             type;       //!< Must be XR_TYPE_DISPLAY_DESKTOP_POSITION_EXT
+typedef struct XrDisplayDesktopPositionDXR {
+    XrStructureType             type;       //!< Must be XR_TYPE_DISPLAY_DESKTOP_POSITION_DXR
     void* XR_MAY_ALIAS          next;       //!< Pointer to next structure in chain
     int32_t                     left;       //!< Panel left edge in virtual-desktop pixels
     int32_t                     top;        //!< Panel top edge in virtual-desktop pixels
-} XrDisplayDesktopPositionEXT;
+} XrDisplayDesktopPositionDXR;
 
 /*!
- * @brief Hardware display state for xrRequestDisplayModeEXT (v15 repurpose).
+ * @brief Hardware display state for xrRequestDisplayModeDXR (v15 repurpose).
  */
-typedef enum XrDisplayModeEXT {
-    XR_DISPLAY_MODE_2D_EXT = 0,
-    XR_DISPLAY_MODE_3D_EXT = 1,
-    XR_DISPLAY_MODE_MAX_ENUM_EXT = 0x7FFFFFFF
-} XrDisplayModeEXT;
+typedef enum XrDisplayModeDXR {
+    XR_DISPLAY_MODE_2D_DXR = 0,
+    XR_DISPLAY_MODE_3D_DXR = 1,
+    XR_DISPLAY_MODE_MAX_ENUM_DXR = 0x7FFFFFFF
+} XrDisplayModeDXR;
 
 /*!
  * @brief Request the HARDWARE display state alone for the current mode
  * (v15 repurpose — was a deprecated mode-switching wrapper through v14).
  *
  * A rendering mode is a complete recipe: layout, view count, scales, and a
- * default hardware state. xrRequestDisplayRenderingModeEXT requests a mode
+ * default hardware state. xrRequestDisplayRenderingModeDXR requests a mode
  * and the hardware state follows automatically. THIS function overrides the
  * hardware state ALONE: the active rendering mode, the app's submitted
  * content, and the display processor's atlas processing are untouched —
  * only the physical 2D/3D element (e.g. the switchable lenticular lens)
  * changes.
  *
- * E.g. XR_DISPLAY_MODE_2D_EXT over an active 3D mode keeps the weave
+ * E.g. XR_DISPLAY_MODE_2D_DXR over an active 3D mode keeps the weave
  * running with the lens off: the panel shows the woven atlas flat (blurry),
  * and an app fading its parallax to zero converges back to a sharp image —
  * the building block for app-authored 2D/3D transitions such as the MANUAL
@@ -120,57 +121,57 @@ typedef enum XrDisplayModeEXT {
  *
  * The override holds until the next mode request (whose default hardware
  * state then applies) or the next call to this function. A successful state
- * flip is reported via XrEventDataHardwareDisplayStateChangedEXT.
+ * flip is reported via XrEventDataHardwareDisplayStateChangedDXR.
  *
  * @param session A valid XrSession handle.
  * @param displayMode The desired hardware state (2D or 3D).
  * @return XR_SUCCESS on success.
  */
-typedef XrResult (XRAPI_PTR *PFN_xrRequestDisplayModeEXT)(XrSession session, XrDisplayModeEXT displayMode);
+typedef XrResult (XRAPI_PTR *PFN_xrRequestDisplayModeDXR)(XrSession session, XrDisplayModeDXR displayMode);
 
 #ifndef XR_NO_PROTOTYPES
-XRAPI_ATTR XrResult XRAPI_CALL xrRequestDisplayModeEXT(
+XRAPI_ATTR XrResult XRAPI_CALL xrRequestDisplayModeDXR(
     XrSession                                   session,
-    XrDisplayModeEXT                            displayMode);
+    XrDisplayModeDXR                            displayMode);
 #endif
 
 // ---- v6: Eye Tracking Mode Control ----
 
-#define XR_TYPE_EYE_TRACKING_MODE_CAPABILITIES_EXT ((XrStructureType)1000999006)
-#define XR_TYPE_VIEW_EYE_TRACKING_STATE_EXT        ((XrStructureType)1000999007)
+#define XR_TYPE_EYE_TRACKING_MODE_CAPABILITIES_DXR ((XrStructureType)1004999006)
+#define XR_TYPE_VIEW_EYE_TRACKING_STATE_DXR        ((XrStructureType)1004999007)
 
 /*!
  * @brief Eye tracking mode enum.
  *
- * MANAGED (0) is the default — apps that never call xrRequestEyeTrackingModeEXT
+ * MANAGED (0) is the default — apps that never call xrRequestEyeTrackingModeDXR
  * get current behavior (vendor SDK handles grace period + transitions).
  * MANUAL (1) provides unfiltered positions + explicit isTracking flag.
  */
-typedef enum XrEyeTrackingModeEXT {
-    XR_EYE_TRACKING_MODE_MANAGED_EXT  = 0,
-    XR_EYE_TRACKING_MODE_MANUAL_EXT   = 1,
-    XR_EYE_TRACKING_MODE_MAX_ENUM_EXT = 0x7FFFFFFF
-} XrEyeTrackingModeEXT;
+typedef enum XrEyeTrackingModeDXR {
+    XR_EYE_TRACKING_MODE_MANAGED_DXR  = 0,
+    XR_EYE_TRACKING_MODE_MANUAL_DXR   = 1,
+    XR_EYE_TRACKING_MODE_MAX_ENUM_DXR = 0x7FFFFFFF
+} XrEyeTrackingModeDXR;
 
 /*!
  * @brief Capability flags for eye tracking modes (bitmask).
  *
  * A value of 0 means the display has NO eye tracking capability at all.
  */
-typedef XrFlags64 XrEyeTrackingModeCapabilityFlagsEXT;
-static const XrEyeTrackingModeCapabilityFlagsEXT
-    XR_EYE_TRACKING_MODE_CAPABILITY_NONE_EXT       = 0;
-static const XrEyeTrackingModeCapabilityFlagsEXT
-    XR_EYE_TRACKING_MODE_CAPABILITY_MANAGED_BIT_EXT = 0x00000001;
-static const XrEyeTrackingModeCapabilityFlagsEXT
-    XR_EYE_TRACKING_MODE_CAPABILITY_MANUAL_BIT_EXT = 0x00000002;
+typedef XrFlags64 XrEyeTrackingModeCapabilityFlagsDXR;
+static const XrEyeTrackingModeCapabilityFlagsDXR
+    XR_EYE_TRACKING_MODE_CAPABILITY_NONE_DXR       = 0;
+static const XrEyeTrackingModeCapabilityFlagsDXR
+    XR_EYE_TRACKING_MODE_CAPABILITY_MANAGED_BIT_DXR = 0x00000001;
+static const XrEyeTrackingModeCapabilityFlagsDXR
+    XR_EYE_TRACKING_MODE_CAPABILITY_MANUAL_BIT_DXR = 0x00000002;
 
 /*!
  * @brief Eye tracking mode capabilities — chained to XrSystemProperties.
  *
  * If supportedModes is 0 (NONE), the display has no eye tracking. In that
- * case defaultMode is undefined, xrRequestEyeTrackingModeEXT returns
- * XR_ERROR_FEATURE_UNSUPPORTED for any mode, and XrViewEyeTrackingStateEXT
+ * case defaultMode is undefined, xrRequestEyeTrackingModeDXR returns
+ * XR_ERROR_FEATURE_UNSUPPORTED for any mode, and XrViewEyeTrackingStateDXR
  * always reports isTracking=XR_FALSE.
  *
  * xrLocateViews ALWAYS returns fully populated views (count, positions, FOVs)
@@ -180,12 +181,12 @@ static const XrEyeTrackingModeCapabilityFlagsEXT
  *
  * @extends XrSystemProperties
  */
-typedef struct XrEyeTrackingModeCapabilitiesEXT {
-    XrStructureType                        type;           //!< Must be XR_TYPE_EYE_TRACKING_MODE_CAPABILITIES_EXT
+typedef struct XrEyeTrackingModeCapabilitiesDXR {
+    XrStructureType                        type;           //!< Must be XR_TYPE_EYE_TRACKING_MODE_CAPABILITIES_DXR
     void* XR_MAY_ALIAS                     next;
-    XrEyeTrackingModeCapabilityFlagsEXT    supportedModes; //!< Bitmask of supported modes (0 = no tracking)
-    XrEyeTrackingModeEXT                   defaultMode;    //!< Mode used if app never requests one
-} XrEyeTrackingModeCapabilitiesEXT;
+    XrEyeTrackingModeCapabilityFlagsDXR    supportedModes; //!< Bitmask of supported modes (0 = no tracking)
+    XrEyeTrackingModeDXR                   defaultMode;    //!< Mode used if app never requests one
+} XrEyeTrackingModeCapabilitiesDXR;
 
 /*!
  * @brief Per-frame eye tracking state — chained to XrViewState in xrLocateViews.
@@ -199,12 +200,12 @@ typedef struct XrEyeTrackingModeCapabilitiesEXT {
  *
  * @extends XrViewState
  */
-typedef struct XrViewEyeTrackingStateEXT {
-    XrStructureType           type;       //!< Must be XR_TYPE_VIEW_EYE_TRACKING_STATE_EXT
+typedef struct XrViewEyeTrackingStateDXR {
+    XrStructureType           type;       //!< Must be XR_TYPE_VIEW_EYE_TRACKING_STATE_DXR
     void* XR_MAY_ALIAS        next;
     XrBool32                  isTracking; //!< XR_TRUE if eyes are actively tracked this frame
-    XrEyeTrackingModeEXT     activeMode; //!< Currently active mode
-} XrViewEyeTrackingStateEXT;
+    XrEyeTrackingModeDXR     activeMode; //!< Currently active mode
+} XrViewEyeTrackingStateDXR;
 
 /*!
  * @brief Request eye tracking mode switch.
@@ -220,13 +221,13 @@ typedef struct XrViewEyeTrackingStateEXT {
  *         XR_ERROR_FEATURE_UNSUPPORTED if the mode is not supported,
  *         XR_ERROR_VALIDATION_FAILURE if mode is invalid.
  */
-typedef XrResult (XRAPI_PTR *PFN_xrRequestEyeTrackingModeEXT)(
-    XrSession session, XrEyeTrackingModeEXT mode);
+typedef XrResult (XRAPI_PTR *PFN_xrRequestEyeTrackingModeDXR)(
+    XrSession session, XrEyeTrackingModeDXR mode);
 
 #ifndef XR_NO_PROTOTYPES
-XRAPI_ATTR XrResult XRAPI_CALL xrRequestEyeTrackingModeEXT(
+XRAPI_ATTR XrResult XRAPI_CALL xrRequestEyeTrackingModeDXR(
     XrSession               session,
-    XrEyeTrackingModeEXT    mode);
+    XrEyeTrackingModeDXR    mode);
 #endif
 
 // ---- v7: Display Rendering Mode Control ----
@@ -249,29 +250,29 @@ XRAPI_ATTR XrResult XRAPI_CALL xrRequestEyeTrackingModeEXT(
  * @param modeIndex The vendor-defined rendering mode index.
  * @return XR_SUCCESS on success.
  */
-typedef XrResult (XRAPI_PTR *PFN_xrRequestDisplayRenderingModeEXT)(
+typedef XrResult (XRAPI_PTR *PFN_xrRequestDisplayRenderingModeDXR)(
     XrSession session, uint32_t modeIndex);
 
 #ifndef XR_NO_PROTOTYPES
-XRAPI_ATTR XrResult XRAPI_CALL xrRequestDisplayRenderingModeEXT(
+XRAPI_ATTR XrResult XRAPI_CALL xrRequestDisplayRenderingModeDXR(
     XrSession               session,
     uint32_t                modeIndex);
 #endif
 
 // ---- v8: Rendering Mode Enumeration ----
 
-#define XR_TYPE_DISPLAY_RENDERING_MODE_INFO_EXT ((XrStructureType)1000999008)
+#define XR_TYPE_DISPLAY_RENDERING_MODE_INFO_DXR ((XrStructureType)1004999008)
 
 /*!
  * @brief Information about a single display rendering mode.
  *
- * Returned by xrEnumerateDisplayRenderingModesEXT to describe each available
+ * Returned by xrEnumerateDisplayRenderingModesDXR to describe each available
  * vendor-specific rendering mode (e.g., side-by-side, anaglyph, lenticular).
  */
-typedef struct XrDisplayRenderingModeInfoEXT {
-    XrStructureType             type;       //!< Must be XR_TYPE_DISPLAY_RENDERING_MODE_INFO_EXT
+typedef struct XrDisplayRenderingModeInfoDXR {
+    XrStructureType             type;       //!< Must be XR_TYPE_DISPLAY_RENDERING_MODE_INFO_DXR
     void* XR_MAY_ALIAS          next;       //!< Pointer to next structure in chain
-    uint32_t                    modeIndex;  //!< Vendor-defined mode index (pass to xrRequestDisplayRenderingModeEXT)
+    uint32_t                    modeIndex;  //!< Vendor-defined mode index (pass to xrRequestDisplayRenderingModeDXR)
     char                        modeName[XR_MAX_SYSTEM_NAME_SIZE]; //!< Human-readable mode name
     uint32_t                    viewCount;  //!< Number of views (1=mono, 2=stereo, etc.)
     float                       viewScaleX; //!< Per-view horizontal scale (vendor-provided)
@@ -285,15 +286,15 @@ typedef struct XrDisplayRenderingModeInfoEXT {
      * (v13) True for the mode that is currently active for this session.
      *
      * Apps can read this at startup (after xrCreateSession + first
-     * xrEnumerateDisplayRenderingModesEXT call) to learn the current mode
-     * without waiting for an XrEventDataRenderingModeChangedEXT — useful
+     * xrEnumerateDisplayRenderingModesDXR call) to learn the current mode
+     * without waiting for an XrEventDataRenderingModeChangedDXR — useful
      * when the session begins under a workspace that already chose a mode.
      * Re-enumerating after a mode change reflects the new active mode.
      */
     XrBool32                    isActive;
     /*!
      * (v13) True iff this session may request this mode via
-     * xrRequestDisplayRenderingModeEXT.
+     * xrRequestDisplayRenderingModeDXR.
      *
      * False for non-controller sessions running under a workspace — the
      * workspace controller is the sole mode authority and app requests are
@@ -302,7 +303,7 @@ typedef struct XrDisplayRenderingModeInfoEXT {
      * true for standalone sessions and for workspace-controller sessions.
      */
     XrBool32                    isRequestable;
-} XrDisplayRenderingModeInfoEXT;
+} XrDisplayRenderingModeInfoDXR;
 
 /*!
  * @brief Enumerate available display rendering modes.
@@ -316,70 +317,70 @@ typedef struct XrDisplayRenderingModeInfoEXT {
  * @param modes                Output array of mode info structs.
  * @return XR_SUCCESS on success, XR_ERROR_SIZE_INSUFFICIENT if capacity too small.
  */
-typedef XrResult (XRAPI_PTR *PFN_xrEnumerateDisplayRenderingModesEXT)(
+typedef XrResult (XRAPI_PTR *PFN_xrEnumerateDisplayRenderingModesDXR)(
     XrSession session,
     uint32_t modeCapacityInput,
     uint32_t *modeCountOutput,
-    XrDisplayRenderingModeInfoEXT *modes);
+    XrDisplayRenderingModeInfoDXR *modes);
 
 #ifndef XR_NO_PROTOTYPES
-XRAPI_ATTR XrResult XRAPI_CALL xrEnumerateDisplayRenderingModesEXT(
+XRAPI_ATTR XrResult XRAPI_CALL xrEnumerateDisplayRenderingModesDXR(
     XrSession                           session,
     uint32_t                            modeCapacityInput,
     uint32_t                           *modeCountOutput,
-    XrDisplayRenderingModeInfoEXT      *modes);
+    XrDisplayRenderingModeInfoDXR      *modes);
 #endif
 
 // ---- v10: Unified Display Mode Events ----
 
-#define XR_TYPE_EVENT_DATA_RENDERING_MODE_CHANGED_EXT        ((XrStructureType)1000999010)
-#define XR_TYPE_EVENT_DATA_HARDWARE_DISPLAY_STATE_CHANGED_EXT ((XrStructureType)1000999011)
+#define XR_TYPE_EVENT_DATA_RENDERING_MODE_CHANGED_DXR        ((XrStructureType)1004999010)
+#define XR_TYPE_EVENT_DATA_HARDWARE_DISPLAY_STATE_CHANGED_DXR ((XrStructureType)1004999011)
 
 /*!
  * @brief Event fired when the active rendering mode changes.
  *
- * Pushed by xrRequestDisplayRenderingModeEXT on every actual mode change.
+ * Pushed by xrRequestDisplayRenderingModeDXR on every actual mode change.
  *
  * @extends XrEventDataBaseHeader
  */
-typedef struct XrEventDataRenderingModeChangedEXT {
-    XrStructureType             type;       //!< Must be XR_TYPE_EVENT_DATA_RENDERING_MODE_CHANGED_EXT
+typedef struct XrEventDataRenderingModeChangedDXR {
+    XrStructureType             type;       //!< Must be XR_TYPE_EVENT_DATA_RENDERING_MODE_CHANGED_DXR
     const void* XR_MAY_ALIAS    next;
     XrSession                   session;
     uint32_t                    previousModeIndex;
     uint32_t                    currentModeIndex;
-} XrEventDataRenderingModeChangedEXT;
+} XrEventDataRenderingModeChangedDXR;
 
 /*!
  * @brief Event fired when the physical display hardware state changes.
  *
- * Pushed by xrRequestDisplayRenderingModeEXT only when the hardware 3D
+ * Pushed by xrRequestDisplayRenderingModeDXR only when the hardware 3D
  * state flips (i.e., when switching between modes with different
  * hardwareDisplay3D values).
  *
  * @extends XrEventDataBaseHeader
  */
-typedef struct XrEventDataHardwareDisplayStateChangedEXT {
-    XrStructureType             type;       //!< Must be XR_TYPE_EVENT_DATA_HARDWARE_DISPLAY_STATE_CHANGED_EXT
+typedef struct XrEventDataHardwareDisplayStateChangedDXR {
+    XrStructureType             type;       //!< Must be XR_TYPE_EVENT_DATA_HARDWARE_DISPLAY_STATE_CHANGED_DXR
     const void* XR_MAY_ALIAS    next;
     XrSession                   session;
     XrBool32                    hardwareDisplay3D;
-} XrEventDataHardwareDisplayStateChangedEXT;
+} XrEventDataHardwareDisplayStateChangedDXR;
 
-// xrSetSharedTextureOutputRectEXT was removed (ADR-031); display-zones (XR_EXT_display_zones) is the sole region paradigm
+// xrSetSharedTextureOutputRectDXR was removed (ADR-031); display-zones (XR_DXR_display_zones) is the sole region paradigm
 
 // ---- v14: Per-Mode Tracking Capability + Tracking-State Event (#441) ----
 
-#define XR_TYPE_DISPLAY_RENDERING_MODE_TRACKING_INFO_EXT  ((XrStructureType)1000999012)
-#define XR_TYPE_EVENT_DATA_EYE_TRACKING_STATE_CHANGED_EXT ((XrStructureType)1000999013)
+#define XR_TYPE_DISPLAY_RENDERING_MODE_TRACKING_INFO_DXR  ((XrStructureType)1004999012)
+#define XR_TYPE_EVENT_DATA_EYE_TRACKING_STATE_CHANGED_DXR ((XrStructureType)1004999013)
 
 /*!
  * @brief Per-mode tracking capability — chained by the APP to each
- * XrDisplayRenderingModeInfoEXT element's next before calling
- * xrEnumerateDisplayRenderingModesEXT.
+ * XrDisplayRenderingModeInfoDXR element's next before calling
+ * xrEnumerateDisplayRenderingModesDXR.
  *
  * OPT-IN HANDSHAKE: to use the chain, the app MUST pre-set each array
- * element's type to XR_TYPE_DISPLAY_RENDERING_MODE_INFO_EXT (standard OpenXR
+ * element's type to XR_TYPE_DISPLAY_RENDERING_MODE_INFO_DXR (standard OpenXR
  * input convention) and set next to this struct (or a chain containing it).
  * The runtime only walks elements carrying that type — v13-and-earlier
  * binaries leave type/next uninitialized, and the runtime keeps overwriting
@@ -388,23 +389,23 @@ typedef struct XrEventDataHardwareDisplayStateChangedEXT {
  * hasTracking tells whether the rendering mode consumes live eye tracking
  * (e.g., a tracked 3D mode or a "2D tracked" mode) or is fully untracked
  * (e.g., SBS/anaglyph export modes; every sim_display mode). When the ACTIVE
- * mode has hasTracking == XR_FALSE, XrViewEyeTrackingStateEXT.isTracking is
+ * mode has hasTracking == XR_FALSE, XrViewEyeTrackingStateDXR.isTracking is
  * always XR_FALSE — regardless of tracker state. xrLocateViews still returns
  * fully populated views in every mode.
  *
- * LAYOUT-FREEZE POLICY: XrDisplayRenderingModeInfoEXT is frozen at its v13
+ * LAYOUT-FREEZE POLICY: XrDisplayRenderingModeInfoDXR is frozen at its v13
  * layout. The runtime's enumerate fill writes array elements with its own
  * compiled stride, so appending fields (as v12/v13 did) silently corrupts app
  * binaries compiled against older headers. All future per-mode fields MUST be
  * added as chained structs like this one.
  *
- * @extends XrDisplayRenderingModeInfoEXT
+ * @extends XrDisplayRenderingModeInfoDXR
  */
-typedef struct XrDisplayRenderingModeTrackingInfoEXT {
-    XrStructureType             type;        //!< Must be XR_TYPE_DISPLAY_RENDERING_MODE_TRACKING_INFO_EXT
+typedef struct XrDisplayRenderingModeTrackingInfoDXR {
+    XrStructureType             type;        //!< Must be XR_TYPE_DISPLAY_RENDERING_MODE_TRACKING_INFO_DXR
     void* XR_MAY_ALIAS          next;
     XrBool32                    hasTracking; //!< Mode consumes live eye tracking
-} XrDisplayRenderingModeTrackingInfoEXT;
+} XrDisplayRenderingModeTrackingInfoDXR;
 
 /*!
  * @brief Event fired on every edge of the derived isTracking value.
@@ -422,16 +423,16 @@ typedef struct XrDisplayRenderingModeTrackingInfoEXT {
  *
  * @extends XrEventDataBaseHeader
  */
-typedef struct XrEventDataEyeTrackingStateChangedEXT {
-    XrStructureType             type;       //!< Must be XR_TYPE_EVENT_DATA_EYE_TRACKING_STATE_CHANGED_EXT
+typedef struct XrEventDataEyeTrackingStateChangedDXR {
+    XrStructureType             type;       //!< Must be XR_TYPE_EVENT_DATA_EYE_TRACKING_STATE_CHANGED_DXR
     const void* XR_MAY_ALIAS    next;
     XrSession                   session;
     XrBool32                    isTracking; //!< New state
-    XrEyeTrackingModeEXT        activeMode; //!< Session's MANAGED/MANUAL preference at edge time
-} XrEventDataEyeTrackingStateChangedEXT;
+    XrEyeTrackingModeDXR        activeMode; //!< Session's MANAGED/MANUAL preference at edge time
+} XrEventDataEyeTrackingStateChangedDXR;
 
 #ifdef __cplusplus
 }
 #endif
 
-#endif // XR_EXT_DISPLAY_INFO_H
+#endif // XR_DXR_DISPLAY_INFO_H

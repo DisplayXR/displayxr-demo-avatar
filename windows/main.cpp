@@ -27,9 +27,9 @@
 #include "xr_session.h"
 #include "model_renderer.h"
 #include "model_vulkan_utils.h"   // scratch image/buffer for the click-through silhouette
-#include <openxr/XR_EXT_local_3d_zone.h>  // XrCompositionLayerLocal2DEXT (speech bubble)
-#include <openxr/XR_EXT_display_zones.h>  // XrDisplayZoneEXT — the tiger zone (ADR-027)
-#include <openxr/XR_EXT_view_rig.h>       // XrDisplayRigEXT locate + XrViewDisplayRawEXT readback
+#include <openxr/XR_DXR_local_3d_zone.h>  // XrCompositionLayerLocal2DDXR (speech bubble)
+#include <openxr/XR_DXR_display_zones.h>  // XrDisplayZoneDXR — the tiger zone (ADR-027)
+#include <openxr/XR_DXR_view_rig.h>       // XrDisplayRigDXR locate + XrViewDisplayRawDXR readback
 #include "display3d_view.h"
 #include "projection_depth.h"
 
@@ -409,7 +409,7 @@ static void ToggleDecoration(HWND hwnd) {
     LOG_INFO("Window decoration: %s (B)", g_decorated ? "ON (move/resize)" : "OFF (borderless)");
 }
 
-// Atlas capture is runtime-owned via xrCaptureAtlasEXT (XR_EXT_atlas_capture).
+// Atlas capture is runtime-owned via xrCaptureAtlasDXR (XR_DXR_atlas_capture).
 // App-side helpers (filename numbering + flash overlay) live in
 // common/atlas_capture* — see dxr_capture::MakeCaptureAtlasPrefix /
 // TriggerCaptureFlash / PostFlashRequest.
@@ -706,7 +706,7 @@ static HWND CreateAppWindow(HINSTANCE hInstance, int width, int height) {
     // isn't stranded at (0,0) with no title bar to grab.
     //
     // INV-1.3 (runtime#715): (g_displayDesktopLeft, g_displayDesktopTop) is the
-    // panel's top-left in virtual-desktop pixels (XrDisplayDesktopPositionEXT,
+    // panel's top-left in virtual-desktop pixels (XrDisplayDesktopPositionDXR,
     // display_info v16) — on a multi-monitor box the window must open ON the
     // panel, since the window-relative weave is only correct there. (0,0) =
     // primary/unknown, which MONITOR_DEFAULTTOPRIMARY resolves to the old
@@ -947,9 +947,9 @@ static void UpdateSilhouette(VkDevice dev, VkPhysicalDevice phys, VkQueue queue,
     }
 }
 
-// ── Display-zones path (ADR-027 / XR_EXT_display_zones, P6 migration) ───────
+// ── Display-zones path (ADR-027 / XR_DXR_display_zones, P6 migration) ───────
 // The tiger renders through ONE 3D zone (zoneId 1, rect = bottom 75% of the
-// client window) with the runtime rig (XR_EXT_view_rig) chained on the zone
+// client window) with the runtime rig (XR_DXR_view_rig) chained on the zone
 // locate — the app consumes render-ready XrView pose/fov framed to the rect
 // and the app-side Kooima is gone. The speech bubble stays a plain Local2D
 // layer in the top 25% (in a zones frame Local2D is pure 2D content; the
@@ -1053,7 +1053,7 @@ static float RigLocalEyeZ(const XrPosef& rig, const XrVector3f& eyeWorld) {
 // Zone state (render-thread-owned). The zone swapchain is pre-sized once at
 // activation for the fullscreen worst case so live resize never recreates it
 // (same philosophy as the main swapchain's largest-atlas pre-size); per-frame
-// tile dims come from xrGetDisplayZoneRecommendedViewSizeEXT clamped to the
+// tile dims come from xrGetDisplayZoneRecommendedViewSizeDXR clamped to the
 // capacity.
 static SwapchainInfo        g_zoneSwapchain;
 static std::vector<VkImage> g_zoneSwapImages;
@@ -1091,7 +1091,7 @@ static void TryActivateZones(XrSessionManager* xr) {
         return;
     }
 
-    XrDisplayZoneCapabilitiesEXT caps = {XR_TYPE_DISPLAY_ZONE_CAPABILITIES_EXT};
+    XrDisplayZoneCapabilitiesDXR caps = {XR_TYPE_DISPLAY_ZONE_CAPABILITIES_DXR};
     XrResult cr = g_pfnGetDisplayZoneCaps(xr->session, &caps);
     if (XR_FAILED(cr) || !caps.supported || caps.maxZones3D < 1) {
         LOG_WARN("Display zones not supported by this session (result=0x%x "
@@ -1230,7 +1230,7 @@ static void RenderThreadFunc(
 
         // Rendering mode requests (V/mode-button=cycle, 0-8=absolute) through the
         // shared ModeSwitch sequencer: eases viewParams.ipdFactor around the switch
-        // and fires xrRequestDisplayRenderingModeEXT on the right frame. Ramped ipd
+        // and fires xrRequestDisplayRenderingModeDXR on the right frame. Ramped ipd
         // lands on inputSnapshot.viewParams.ipdFactor (what the render path reads).
         // Runtime owns current mode via xr->currentModeIndex.
         XrSessionUpdateModeSwitch(*xr, inputSnapshot, perfStats.deltaTime);
@@ -1238,11 +1238,11 @@ static void RenderThreadFunc(
         // Handle eye tracking mode toggle (T key)
         if (inputSnapshot.eyeTrackingModeToggleRequested) {
             if (xr->pfnRequestEyeTrackingModeEXT && xr->session != XR_NULL_HANDLE) {
-                XrEyeTrackingModeEXT newMode = (xr->activeEyeTrackingMode == XR_EYE_TRACKING_MODE_MANAGED_EXT)
-                    ? XR_EYE_TRACKING_MODE_MANUAL_EXT : XR_EYE_TRACKING_MODE_MANAGED_EXT;
+                XrEyeTrackingModeDXR newMode = (xr->activeEyeTrackingMode == XR_EYE_TRACKING_MODE_MANAGED_DXR)
+                    ? XR_EYE_TRACKING_MODE_MANUAL_DXR : XR_EYE_TRACKING_MODE_MANAGED_DXR;
                 XrResult etResult = xr->pfnRequestEyeTrackingModeEXT(xr->session, newMode);
                 LOG_INFO("Eye tracking mode -> %s (%s)",
-                    newMode == XR_EYE_TRACKING_MODE_MANUAL_EXT ? "MANUAL" : "MANAGED",
+                    newMode == XR_EYE_TRACKING_MODE_MANUAL_DXR ? "MANUAL" : "MANAGED",
                     XR_SUCCEEDED(etResult) ? "OK" : "unsupported");
             }
         }
@@ -1316,11 +1316,11 @@ static void RenderThreadFunc(
                 XrCompositionLayerProjectionView projectionViews[8] = {};
                 bool rendered = false;
 
-                // Display zones: the SAME XrDisplayZoneEXT instance chains on the
+                // Display zones: the SAME XrDisplayZoneDXR instance chains on the
                 // zone-scoped locate (with the rig) AND on the submitted projection
                 // layer (next reset to NULL) — one variable, both chain points.
-                XrDisplayZoneEXT tigerZone = {XR_TYPE_DISPLAY_ZONE_EXT};
-                XrDisplayRigEXT  tigerRig  = {XR_TYPE_DISPLAY_RIG_EXT};
+                XrDisplayZoneDXR tigerZone = {XR_TYPE_DISPLAY_ZONE_DXR};
+                XrDisplayRigDXR  tigerRig  = {XR_TYPE_DISPLAY_RIG_DXR};
                 bool zonesFrame = false;
 
                 if (frameState.shouldRender) {
@@ -1405,7 +1405,7 @@ static void RenderThreadFunc(
                             // un-chained locate above), rebased to the ZONE canvas
                             // centre using the runtime-reported canvas rect from
                             // LAST frame's zone locate (raw eyes are panel-relative,
-                            // not canvas-rebased — XR_EXT_view_rig). One frame of
+                            // not canvas-rebased — XR_DXR_view_rig). One frame of
                             // staleness is invisible under the tau smoothing. First
                             // frame (no canvas yet): hold facing-forward, exactly
                             // like the eye-tracking warmup hold.
@@ -1483,7 +1483,7 @@ static void RenderThreadFunc(
 
                             // Per-zone recommended view size; re-query when the rect
                             // dims or the rendering mode change (the app-side
-                            // equivalent of XrEventDataDisplayZoneMetricsChangedEXT,
+                            // equivalent of XrEventDataDisplayZoneMetricsChangedDXR,
                             // which displayxr-common's PollEvents drops unseen).
                             // Clamped to the pre-sized swapchain capacity per tile.
                             static XrExtent2Di s_zoneViewSize = {0, 0};
@@ -1518,7 +1518,7 @@ static void RenderThreadFunc(
                             zoneLocate.viewConfigurationType = xr->viewConfigType;
                             zoneLocate.displayTime = frameState.predictedDisplayTime;
                             zoneLocate.space = xr->localSpace;
-                            XrViewDisplayRawEXT zoneRaw = {XR_TYPE_VIEW_DISPLAY_RAW_EXT};
+                            XrViewDisplayRawDXR zoneRaw = {XR_TYPE_VIEW_DISPLAY_RAW_DXR};
                             XrViewState zoneViewState = {XR_TYPE_VIEW_STATE};
                             zoneViewState.next = &zoneRaw;
                             for (uint32_t i = 0; i < 8; i++) zoneViews[i] = {XR_TYPE_VIEW};
@@ -1770,8 +1770,8 @@ static void RenderThreadFunc(
                             }
 
                             // 'I' key: snapshot the multi-view atlas the runtime
-                            // composes for this session via xrCaptureAtlasEXT
-                            // (XR_EXT_atlas_capture, W6 of #396). The runtime owns
+                            // composes for this session via xrCaptureAtlasDXR
+                            // (XR_DXR_atlas_capture, W6 of #396). The runtime owns
                             // the readback — no app-side staging texture. Works for
                             // any multi-view layout the runtime advertises; skipped
                             // for mono (1×1). Filename auto-increments. The prefix
@@ -1796,9 +1796,9 @@ static void RenderThreadFunc(
                                     if (stem.empty()) stem = "scene";
                                     std::string prefix = dxr_capture::MakeCaptureAtlasPrefix(
                                         stem, cols, rows);
-                                    XrAtlasCaptureInfoEXT info = {XR_TYPE_ATLAS_CAPTURE_INFO_EXT};
+                                    XrAtlasCaptureInfoDXR info = {XR_TYPE_ATLAS_CAPTURE_INFO_DXR};
                                     info.next = nullptr;
-                                    info.stage = XR_ATLAS_CAPTURE_STAGE_PROJECTION_ONLY_EXT;
+                                    info.stage = XR_ATLAS_CAPTURE_STAGE_PROJECTION_ONLY_DXR;
                                     strncpy_s(info.pathPrefix, prefix.c_str(), _TRUNCATE);
                                     XrResult cr = xr->pfnCaptureAtlasEXT(xr->session, &info, nullptr);
                                     if (XR_SUCCEEDED(cr)) {
@@ -1806,10 +1806,10 @@ static void RenderThreadFunc(
                                                  prefix.c_str());
                                         dxr_capture::PostFlashRequest(hwnd);
                                     } else {
-                                        LOG_WARN("xrCaptureAtlasEXT failed: 0x%x", (unsigned)cr);
+                                        LOG_WARN("xrCaptureAtlasDXR failed: 0x%x", (unsigned)cr);
                                     }
                                 } else {
-                                    LOG_WARN("Capture skipped: XR_EXT_atlas_capture not available");
+                                    LOG_WARN("Capture skipped: XR_DXR_atlas_capture not available");
                                 }
                             }
 
@@ -1876,7 +1876,7 @@ static void RenderThreadFunc(
                 //    2D and no full-band backer is needed. RenderBubbleToTexture draws
                 //    the rounded panel + balanced text into g_animBtnSwapchain (slot
                 //    name predates the chrome-button strip); composited post-weave. ──
-                XrCompositionLayerLocal2DEXT bubbleLayer = {(XrStructureType)XR_TYPE_COMPOSITION_LAYER_LOCAL_2D_EXT};
+                XrCompositionLayerLocal2DDXR bubbleLayer = {(XrStructureType)XR_TYPE_COMPOSITION_LAYER_LOCAL_2D_DXR};
                 bool bubbleReady = false;
                 if (g_animBtnReady && g_hasAnimBtnSwapchain && g_hasLocal3DZone) {
                     // The top-25% band is bandW×bandH; its aspect varies with the
@@ -1987,7 +1987,7 @@ static void RenderThreadFunc(
                     proj.viewCount = submitViewCount;
                     proj.views = projectionViews;
                     if (zonesFrame) {
-                        // Same XrDisplayZoneEXT instance as the locate, rig chain
+                        // Same XrDisplayZoneDXR instance as the locate, rig chain
                         // cleared — this makes the frame a ZONES frame: the runtime
                         // weaves the tiger views into the bottom-75% rect, composites
                         // the bubble flat in the top 25%, and auto-derives the wish
@@ -2016,9 +2016,9 @@ static void RenderThreadFunc(
                     // validation (bring-up diagnostics). Default: nothing chained =
                     // auto wish.
                     static const bool s_zonesValidate = EnvZonesValidate();
-                    XrDisplayZonesFrameEndInfoEXT zonesEnd = {XR_TYPE_DISPLAY_ZONES_FRAME_END_INFO_EXT};
+                    XrDisplayZonesFrameEndInfoDXR zonesEnd = {XR_TYPE_DISPLAY_ZONES_FRAME_END_INFO_DXR};
                     if (zonesFrame && s_zonesValidate) {
-                        zonesEnd.flags = XR_DISPLAY_ZONES_FRAME_END_VALIDATE_BIT_EXT;
+                        zonesEnd.flags = XR_DISPLAY_ZONES_FRAME_END_VALIDATE_BIT_DXR;
                         zonesEnd.wishMask = XR_NULL_HANDLE;  // auto wish either way
                         endInfo.next = &zonesEnd;
                     }
@@ -2325,7 +2325,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     g_inputState.renderingModeCount = xr.renderingModeCount;
     // Align runtime active rendering mode with app's default (mode 1 = first 3D mode).
     // The main loop's dispatch picks this up on the first frame and calls
-    // xrRequestDisplayRenderingModeEXT(1); the runtime event drives xr.currentModeIndex.
+    // xrRequestDisplayRenderingModeDXR(1); the runtime event drives xr.currentModeIndex.
     g_inputState.absoluteRenderingModeRequested = 1;
     g_inputState.animateEnabled = false; // no auto-orbit — avatar faces the viewer
     {

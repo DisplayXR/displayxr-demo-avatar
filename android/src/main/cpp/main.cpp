@@ -19,13 +19,13 @@
 #include <vulkan/vulkan.h>
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
-#include <openxr/XR_EXT_display_info.h>  // display rendering-mode enumerate/request
-#include <openxr/XR_EXT_view_rig.h>      // runtime-owned Kooima views (#396 W7)
-#include <openxr/XR_EXT_display_zones.h> // bottom-75% tiger zone framing (ADR-027, #568)
-// XrCompositionLayerWindowSpaceEXT — the shared window-space layer struct is
+#include <openxr/XR_DXR_display_info.h>  // display rendering-mode enumerate/request
+#include <openxr/XR_DXR_view_rig.h>      // runtime-owned Kooima views (#396 W7)
+#include <openxr/XR_DXR_display_zones.h> // bottom-75% tiger zone framing (ADR-027, #568)
+// XrCompositionLayerWindowSpaceDXR — the shared window-space layer struct is
 // declared (ifndef-guarded) in the window-binding headers; the cocoa one is
 // plain C with no platform deps, so it serves as the decl source on Android.
-#include <openxr/XR_EXT_cocoa_window_binding.h>
+#include <openxr/XR_DXR_cocoa_window_binding.h>
 
 #include <atomic>
 #include <vector>
@@ -114,12 +114,12 @@ XrSpace g_app_space = XR_NULL_HANDLE;
 // Gated on `setprop debug.dxr.overlay 1`. Read once at android_main start.
 bool g_overlay_mode = false;
 
-// ── Display rendering-mode switching (XR_EXT_display_info) ─────────────────
+// ── Display rendering-mode switching (XR_DXR_display_info) ─────────────────
 // The runtime advertises a set of display rendering modes (e.g. 3D-stereo,
 // 2D-mono); `setprop debug.dxr.mode N` selects one. Mode requests are async —
 // the runtime applies them and (if view count changes) the next frame adapts.
-PFN_xrEnumerateDisplayRenderingModesEXT g_pfnEnumModes = nullptr;
-PFN_xrRequestDisplayRenderingModeEXT g_pfnReqMode = nullptr;
+PFN_xrEnumerateDisplayRenderingModesDXR g_pfnEnumModes = nullptr;
+PFN_xrRequestDisplayRenderingModeDXR g_pfnReqMode = nullptr;
 uint32_t g_rmode_count = 0;
 std::atomic<uint32_t> g_rmode_current{0};
 bool g_rmode_requestable = false;
@@ -143,7 +143,7 @@ uint32_t g_atlas_w = 0;
 uint32_t g_atlas_h = 0;
 
 // #568 speech bubble — a rounded panel + greeting, rasterized like the button
-// bar but submitted as an XR_EXT_local_3d_zone Local2D layer in the top-25% 2D
+// bar but submitted as an XR_DXR_local_3d_zone Local2D layer in the top-25% 2D
 // band (above the tiger zone). Reuses the HudBar swapchain/font/upload infra.
 HudBar g_bubble;
 constexpr uint32_t kBubbleTexW = 1024;
@@ -225,8 +225,8 @@ get_tiger_bbox(int *x, int *y, int *w, int *h)
 	return true;
 }
 
-// ── XR_EXT_view_rig (#396 W7) ───────────────────────────────────────────────
-// When the runtime advertises XR_EXT_view_rig, chain an XrDisplayRigEXT on
+// ── XR_DXR_view_rig (#396 W7) ───────────────────────────────────────────────
+// When the runtime advertises XR_DXR_view_rig, chain an XrDisplayRigDXR on
 // xrLocateViews and consume the render-ready off-axis XrView{pose,fov} the
 // runtime computes (server-side Kooima over IPC on Android, #510/#513). The
 // rig pose stays IDENTITY: this app orbits the MODEL (build_splat_model), not
@@ -234,16 +234,16 @@ get_tiger_bbox(int *x, int *y, int *w, int *h)
 // model frames AT screen depth (no forward push — see load_model_index).
 bool g_has_view_rig = false;
 
-// ── XR_EXT_display_zones (ADR-027, #568) — bottom-75% tiger zone ────────────
+// ── XR_DXR_display_zones (ADR-027, #568) — bottom-75% tiger zone ────────────
 // The avatar (like the Windows leg) confines its 3D content to the bottom 75%
 // of the canvas (the top 25% is reserved for the speech bubble). With the zone
 // chained on BOTH the zone-scoped locate (→ off-axis FOV framed to the rect)
 // AND the submitted projection layer (→ runtime composites the view tile into
 // the rect), the runtime owns the framing — no app-side Kooima.
 bool g_has_display_zones = false;
-bool g_has_local_3d_zone = false;   // XR_EXT_display_zones requires it (>= v4)
-PFN_xrGetDisplayZoneCapabilitiesEXT g_pfnGetDisplayZoneCaps = nullptr;
-PFN_xrGetDisplayZoneRecommendedViewSizeEXT g_pfnGetDisplayZoneViewSize = nullptr;
+bool g_has_local_3d_zone = false;   // XR_DXR_display_zones requires it (>= v4)
+PFN_xrGetDisplayZoneCapabilitiesDXR g_pfnGetDisplayZoneCaps = nullptr;
+PFN_xrGetDisplayZoneRecommendedViewSizeDXR g_pfnGetDisplayZoneViewSize = nullptr;
 bool g_zones_active = false;          // caps query passed; zone framing live
 // Top fraction reserved for the (future) speech bubble; tiger gets the rest.
 constexpr float kBubbleBandFrac = 0.25f;
@@ -376,7 +376,7 @@ rig_local_eye_z(const XrPosef &rig, const XrVector3f &eye_world)
 // negation here: ModelRenderer (W7, #396) consumes a clean +Y-up view +
 // off-axis projection and flips Vulkan Y at the RASTER stage via a
 // negative-height viewport in renderEye. aspect_w_over_h > 0 forces a
-// SYMMETRIC frustum (legacy no-rig fallback only) — under XR_EXT_view_rig
+// SYMMETRIC frustum (legacy no-rig fallback only) — under XR_DXR_view_rig
 // pass -1: the rig FOV is render-ready off-axis and must pass through.
 Mat4
 projection_matrix_from_fov(const XrFovf &fov, float aspect_w_over_h, float near_z, float far_z)
@@ -687,7 +687,7 @@ create_instance(struct android_app *app)
 {
 	g_runtime_unavailable.store(false, std::memory_order_relaxed);
 
-	// XR_EXT_view_rig is enabled only when advertised (#396 W7); without it
+	// XR_DXR_view_rig is enabled only when advertised (#396 W7); without it
 	// the app keeps the legacy raw-locate + fixed-clip path.
 	g_has_view_rig = false;
 	{
@@ -700,37 +700,37 @@ create_instance(struct android_app *app)
 			}
 			if (xrEnumerateInstanceExtensionProperties(nullptr, n, &n, props.data()) == XR_SUCCESS) {
 				for (uint32_t i = 0; i < n; ++i) {
-					if (std::strcmp(props[i].extensionName, XR_EXT_VIEW_RIG_EXTENSION_NAME) == 0) {
+					if (std::strcmp(props[i].extensionName, XR_DXR_VIEW_RIG_EXTENSION_NAME) == 0) {
 						g_has_view_rig = true;
 					}
-					if (std::strcmp(props[i].extensionName, XR_EXT_DISPLAY_ZONES_EXTENSION_NAME) == 0) {
+					if (std::strcmp(props[i].extensionName, XR_DXR_DISPLAY_ZONES_EXTENSION_NAME) == 0) {
 						g_has_display_zones = true;
 					}
-					if (std::strcmp(props[i].extensionName, XR_EXT_LOCAL_3D_ZONE_EXTENSION_NAME) == 0) {
+					if (std::strcmp(props[i].extensionName, XR_DXR_LOCAL_3D_ZONE_EXTENSION_NAME) == 0) {
 						g_has_local_3d_zone = true;
 					}
 				}
 			}
 		}
-		LOGI("XR_EXT_view_rig advertised: %s; XR_EXT_display_zones: %s",
+		LOGI("XR_DXR_view_rig advertised: %s; XR_DXR_display_zones: %s",
 		     g_has_view_rig ? "yes" : "no", g_has_display_zones ? "yes" : "no");
 	}
 
 	const char *extensions[6] = {
 	    XR_KHR_ANDROID_CREATE_INSTANCE_EXTENSION_NAME,
 	    XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME,
-	    XR_EXT_DISPLAY_INFO_EXTENSION_NAME,  // display rendering-mode switching
+	    XR_DXR_DISPLAY_INFO_EXTENSION_NAME,  // display rendering-mode switching
 	};
 	uint32_t extension_count = 3;
 	if (g_has_view_rig) {
-		extensions[extension_count++] = XR_EXT_VIEW_RIG_EXTENSION_NAME;
+		extensions[extension_count++] = XR_DXR_VIEW_RIG_EXTENSION_NAME;
 	}
-	// XR_EXT_display_zones requires XR_EXT_local_3d_zone (>=v4) + XR_EXT_view_rig
+	// XR_DXR_display_zones requires XR_DXR_local_3d_zone (>=v4) + XR_DXR_view_rig
 	// (>=v2) — enable all three together or none (the runtime rejects the
 	// instance with XR_ERROR_VALIDATION_FAILURE otherwise).
 	if (g_has_display_zones && g_has_view_rig && g_has_local_3d_zone) {
-		extensions[extension_count++] = XR_EXT_LOCAL_3D_ZONE_EXTENSION_NAME;
-		extensions[extension_count++] = XR_EXT_DISPLAY_ZONES_EXTENSION_NAME;
+		extensions[extension_count++] = XR_DXR_LOCAL_3D_ZONE_EXTENSION_NAME;
+		extensions[extension_count++] = XR_DXR_DISPLAY_ZONES_EXTENSION_NAME;
 	} else {
 		g_has_display_zones = false;
 	}
@@ -979,12 +979,12 @@ create_session()
 	// query caps. On success the render loop chains a bottom-75% tiger zone so
 	// the runtime frames the avatar into the lower band (top 25% = bubble).
 	if (g_has_display_zones) {
-		xrGetInstanceProcAddr(g_instance, "xrGetDisplayZoneCapabilitiesEXT",
+		xrGetInstanceProcAddr(g_instance, "xrGetDisplayZoneCapabilitiesDXR",
 		                      (PFN_xrVoidFunction *)&g_pfnGetDisplayZoneCaps);
-		xrGetInstanceProcAddr(g_instance, "xrGetDisplayZoneRecommendedViewSizeEXT",
+		xrGetInstanceProcAddr(g_instance, "xrGetDisplayZoneRecommendedViewSizeDXR",
 		                      (PFN_xrVoidFunction *)&g_pfnGetDisplayZoneViewSize);
 		if (g_pfnGetDisplayZoneCaps && g_pfnGetDisplayZoneViewSize) {
-			XrDisplayZoneCapabilitiesEXT caps = {XR_TYPE_DISPLAY_ZONE_CAPABILITIES_EXT};
+			XrDisplayZoneCapabilitiesDXR caps = {XR_TYPE_DISPLAY_ZONE_CAPABILITIES_DXR};
 			XrResult cr = g_pfnGetDisplayZoneCaps(g_session, &caps);
 			g_zones_active = (cr == XR_SUCCESS && caps.supported && caps.maxZones3D >= 1);
 			LOGI("Display zones: caps result=0x%x supported=%d maxZones3D=%u -> active=%d",
@@ -1004,9 +1004,9 @@ create_session()
 bool
 enumerate_rendering_modes()
 {
-	xrGetInstanceProcAddr(g_instance, "xrEnumerateDisplayRenderingModesEXT",
+	xrGetInstanceProcAddr(g_instance, "xrEnumerateDisplayRenderingModesDXR",
 	                      (PFN_xrVoidFunction *)&g_pfnEnumModes);
-	xrGetInstanceProcAddr(g_instance, "xrRequestDisplayRenderingModeEXT",
+	xrGetInstanceProcAddr(g_instance, "xrRequestDisplayRenderingModeDXR",
 	                      (PFN_xrVoidFunction *)&g_pfnReqMode);
 	if (g_pfnEnumModes == nullptr || g_pfnReqMode == nullptr) {
 		LOGI("Display rendering-mode ext entry points not resolved — mode switch disabled");
@@ -1015,17 +1015,17 @@ enumerate_rendering_modes()
 	uint32_t count = 0;
 	XrResult res = g_pfnEnumModes(g_session, 0, &count, nullptr);
 	if (res != XR_SUCCESS || count == 0) {
-		LOGI("xrEnumerateDisplayRenderingModesEXT: count=%u res=%d", count, (int)res);
+		LOGI("xrEnumerateDisplayRenderingModesDXR: count=%u res=%d", count, (int)res);
 		return true;
 	}
-	std::vector<XrDisplayRenderingModeInfoEXT> modes(count);
+	std::vector<XrDisplayRenderingModeInfoDXR> modes(count);
 	for (auto &m : modes) {
-		m.type = XR_TYPE_DISPLAY_RENDERING_MODE_INFO_EXT;
+		m.type = XR_TYPE_DISPLAY_RENDERING_MODE_INFO_DXR;
 		m.next = nullptr;
 	}
 	res = g_pfnEnumModes(g_session, count, &count, modes.data());
 	if (res != XR_SUCCESS) {
-		LOGI("xrEnumerateDisplayRenderingModesEXT (fill) res=%d", (int)res);
+		LOGI("xrEnumerateDisplayRenderingModesDXR (fill) res=%d", (int)res);
 		return true;
 	}
 	g_rmode_count = count;
@@ -1380,8 +1380,8 @@ poll_xr_events()
 				LOGI("session state -> %d", (int)e->state);
 				handle_session_state(e->state);
 			}
-		} else if (ev.type == (XrStructureType)XR_TYPE_EVENT_DATA_RENDERING_MODE_CHANGED_EXT) {
-			const auto *e = reinterpret_cast<const XrEventDataRenderingModeChangedEXT *>(&ev);
+		} else if (ev.type == (XrStructureType)XR_TYPE_EVENT_DATA_RENDERING_MODE_CHANGED_DXR) {
+			const auto *e = reinterpret_cast<const XrEventDataRenderingModeChangedDXR *>(&ev);
 			LOGI("rendering mode changed: %u -> %u", e->previousModeIndex, e->currentModeIndex);
 			g_rmode_current.store(e->currentModeIndex, std::memory_order_relaxed);
 		} else if (ev.type == XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING) {
@@ -1416,7 +1416,7 @@ render_frame()
 	// Display-zones framing (#568): the SAME zone chains on the zone-scoped
 	// locate AND the submitted projection layer. Declared at frame scope so the
 	// submit can reference it; populated in the locate block when zones are live.
-	XrDisplayZoneEXT tiger_zone = {XR_TYPE_DISPLAY_ZONE_EXT};
+	XrDisplayZoneDXR tiger_zone = {XR_TYPE_DISPLAY_ZONE_DXR};
 	bool zones_frame = false;
 	if (frame_state.shouldRender && g_scene_loaded.load(std::memory_order_relaxed)) {
 		XrViewState view_state = {};
@@ -1431,8 +1431,8 @@ render_frame()
 		// off-axis views (server-side Kooima over IPC on Android, #510/#513).
 		// Identity rig pose — this app orbits the model, not the camera. The
 		// raw channel reports the DP's display-space eyes + tracking state.
-		XrDisplayRigEXT display_rig = {XR_TYPE_DISPLAY_RIG_EXT};
-		XrViewDisplayRawEXT view_raw = {XR_TYPE_VIEW_DISPLAY_RAW_EXT};
+		XrDisplayRigDXR display_rig = {XR_TYPE_DISPLAY_RIG_DXR};
+		XrViewDisplayRawDXR view_raw = {XR_TYPE_VIEW_DISPLAY_RAW_DXR};
 		// #570: match macOS/Windows — the virtual display is centred ON the tiger
 		// (the model's animated scene centre), not at the world origin. The model
 		// is rendered in place at the same centre (build_splat_model), so the
@@ -1531,7 +1531,7 @@ render_frame()
 				// ZONE rect (bottom-75%), so the render tile must match the ZONE
 				// aspect, not the full canvas — otherwise a full-window-aspect tile
 				// is scaled into the shorter zone rect → vertical squish. Size from
-				// the zone extent (== xrGetDisplayZoneRecommendedViewSizeEXT, which
+				// the zone extent (== xrGetDisplayZoneRecommendedViewSizeDXR, which
 				// returns the rect extent 1:1).
 				if (zones_frame) {
 					dw = (uint32_t)tiger_zone.rect.extent.width;
@@ -1601,7 +1601,7 @@ render_frame()
 			// Advance glTF animation (bind pose if the model has none). ~60 fps dt.
 			g_model.updateAnimation(1.0f / 60.0f);
 
-			// #568 rig framing: under XR_EXT_view_rig the XrView pose is already
+			// #568 rig framing: under XR_DXR_view_rig the XrView pose is already
 			// render-ready (off-axis Kooima), so the renderer must consume it in
 			// the PLAIN convention — no view-stage Y-flip; the Vulkan Y-flip is the
 			// negative-height viewport in renderEye. Without this the legacy
@@ -1747,11 +1747,11 @@ render_frame()
 		tiger_zone.next = nullptr;
 		projection_layer.next = &tiger_zone;
 	}
-	// #568 speech bubble — an XR_EXT_local_3d_zone Local2D layer placed in the
+	// #568 speech bubble — an XR_DXR_local_3d_zone Local2D layer placed in the
 	// top-25% 2D band (above the tiger zone). Static greeting uploaded once at
 	// init; the runtime blits the released image into `rect` each frame. Only in
 	// a zones frame (the band only exists when the tiger is zone-confined).
-	XrCompositionLayerLocal2DEXT bubble_layer = {(XrStructureType)XR_TYPE_COMPOSITION_LAYER_LOCAL_2D_EXT};
+	XrCompositionLayerLocal2DDXR bubble_layer = {(XrStructureType)XR_TYPE_COMPOSITION_LAYER_LOCAL_2D_DXR};
 	bool bubble_active = false;
 	if (zones_frame && g_bubble.ready) {
 		const uint32_t cw = g_win_px_w.load(std::memory_order_relaxed);
