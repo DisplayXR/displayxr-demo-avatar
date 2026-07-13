@@ -33,18 +33,21 @@ extern PFN_xrGetDisplayZoneRecommendedViewSizeDXR g_pfnGetDisplayZoneViewSize;
 
 // XR_DXR_mcp_tools (#30): app-defined agent tools on the runtime-hosted
 // per-process MCP server. Set/resolved in InitializeOpenXR; registration
-// happens after xrCreateSession (main.cpp) and dispatch runs from the avatar's
-// own event pump. The whole path is inert (all NULL) when the runtime doesn't
-// advertise the extension or the MCP capability gate is off — never
-// load-bearing. These are app-owned (the shared XrSessionManager's MCP fields
-// stay untouched: displayxr-common's PollEvents hardcodes the cube reference
-// tools, so the avatar owns MCP end-to-end instead).
+// happens after xrCreateSession (main.cpp) and tool-call dispatch runs through
+// the shared displayxr-common PollEvents via the app-supplied mcpToolHandler
+// hook (displayxr-common v2.1.0 / common #18). The whole path is inert (all
+// NULL) when the runtime doesn't advertise the extension or the MCP capability
+// gate is off — never load-bearing.
+//
+// These three registration entry points stay app-owned globals (the shared
+// XrSessionManager has no xrUnregisterMCPToolDXR field). The arg-fetch +
+// result-submit entry points that PollEvents itself uses are resolved into the
+// session manager (xr.pfnGetMCPToolCallArgsEXT / xr.pfnSubmitMCPToolResultEXT),
+// NOT into app globals — the handler must never touch them (#18).
 extern bool g_hasMcpToolsExt;
 extern PFN_xrSetMCPAppInfoDXR      g_pfnSetMCPAppInfo;
 extern PFN_xrRegisterMCPToolDXR    g_pfnRegisterMCPTool;
 extern PFN_xrUnregisterMCPToolDXR  g_pfnUnregisterMCPTool;
-extern PFN_xrGetMCPToolCallArgsDXR g_pfnGetMCPToolCallArgs;
-extern PFN_xrSubmitMCPToolResultDXR g_pfnSubmitMCPToolResult;
 
 // 3D-panel top-left in virtual-desktop pixels (XrDisplayDesktopPositionDXR,
 // XR_DXR_display_info v16, runtime#715), captured in InitializeOpenXR. (0,0)
