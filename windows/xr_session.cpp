@@ -31,6 +31,15 @@ PFN_xrGetDisplayZoneRecommendedViewSizeDXR g_pfnGetDisplayZoneViewSize = nullptr
 int32_t g_displayDesktopLeft = 0;
 int32_t g_displayDesktopTop = 0;
 
+// XR_DXR_mcp_tools (#30): app-owned extension flag + entry points (see
+// xr_session.h). All NULL until InitializeOpenXR resolves them.
+bool g_hasMcpToolsExt = false;
+PFN_xrSetMCPAppInfoDXR      g_pfnSetMCPAppInfo = nullptr;
+PFN_xrRegisterMCPToolDXR    g_pfnRegisterMCPTool = nullptr;
+PFN_xrUnregisterMCPToolDXR  g_pfnUnregisterMCPTool = nullptr;
+PFN_xrGetMCPToolCallArgsDXR g_pfnGetMCPToolCallArgs = nullptr;
+PFN_xrSubmitMCPToolResultDXR g_pfnSubmitMCPToolResult = nullptr;
+
 #define XR_CHECK(call) \
     do { \
         XrResult result = (call); \
@@ -87,6 +96,9 @@ bool InitializeOpenXR(XrSessionManager& xr) {
         if (strcmp(ext.extensionName, XR_DXR_DISPLAY_ZONES_EXTENSION_NAME) == 0) {
             g_hasDisplayZonesExt = true;
         }
+        if (strcmp(ext.extensionName, XR_DXR_MCP_TOOLS_EXTENSION_NAME) == 0) {
+            g_hasMcpToolsExt = true;
+        }
     }
 
     LOG_INFO("XR_KHR_vulkan_enable: %s", hasVulkan ? "AVAILABLE" : "NOT FOUND");
@@ -97,6 +109,7 @@ bool InitializeOpenXR(XrSessionManager& xr) {
     LOG_INFO("XR_DXR_local_3d_zone: %s", g_hasLocal3DZone ? "AVAILABLE" : "NOT FOUND");
     LOG_INFO("XR_DXR_view_rig: %s", g_hasViewRigExt ? "AVAILABLE" : "NOT FOUND");
     LOG_INFO("XR_DXR_display_zones: %s", g_hasDisplayZonesExt ? "AVAILABLE" : "NOT FOUND");
+    LOG_INFO("XR_DXR_mcp_tools: %s", g_hasMcpToolsExt ? "AVAILABLE" : "NOT FOUND");
 
     if (!hasVulkan) {
         LOG_ERROR("XR_KHR_vulkan_enable extension not available");
@@ -125,6 +138,9 @@ bool InitializeOpenXR(XrSessionManager& xr) {
     }
     if (g_hasDisplayZonesExt) {
         enabledExtensions.push_back(XR_DXR_DISPLAY_ZONES_EXTENSION_NAME);
+    }
+    if (g_hasMcpToolsExt) {
+        enabledExtensions.push_back(XR_DXR_MCP_TOOLS_EXTENSION_NAME);
     }
 
     XrInstanceCreateInfo createInfo = {XR_TYPE_INSTANCE_CREATE_INFO};
@@ -238,6 +254,31 @@ bool InitializeOpenXR(XrSessionManager& xr) {
         LOG_INFO("xrGetDisplayZoneCapabilitiesDXR: %s / xrGetDisplayZoneRecommendedViewSizeDXR: %s",
             g_pfnGetDisplayZoneCaps ? "resolved" : "NULL",
             g_pfnGetDisplayZoneViewSize ? "resolved" : "NULL");
+    }
+
+    // XR_DXR_mcp_tools (#30): resolve the agent-tool entry points. The appId +
+    // base tools are declared after xrCreateSession (RegisterMcpBaseTools in
+    // main.cpp), the animation tools are late-(un)registered on model load, and
+    // tool calls are dispatched from the avatar's own event pump. Resolution
+    // failure is non-fatal by design — the MCP capability gate may simply be
+    // off; the avatar runs identically without an agent surface.
+    if (g_hasMcpToolsExt) {
+        xrGetInstanceProcAddr(xr.instance, "xrSetMCPAppInfoDXR",
+            (PFN_xrVoidFunction*)&g_pfnSetMCPAppInfo);
+        xrGetInstanceProcAddr(xr.instance, "xrRegisterMCPToolDXR",
+            (PFN_xrVoidFunction*)&g_pfnRegisterMCPTool);
+        xrGetInstanceProcAddr(xr.instance, "xrUnregisterMCPToolDXR",
+            (PFN_xrVoidFunction*)&g_pfnUnregisterMCPTool);
+        xrGetInstanceProcAddr(xr.instance, "xrGetMCPToolCallArgsDXR",
+            (PFN_xrVoidFunction*)&g_pfnGetMCPToolCallArgs);
+        xrGetInstanceProcAddr(xr.instance, "xrSubmitMCPToolResultDXR",
+            (PFN_xrVoidFunction*)&g_pfnSubmitMCPToolResult);
+        const bool resolved = g_pfnSetMCPAppInfo && g_pfnRegisterMCPTool &&
+            g_pfnUnregisterMCPTool && g_pfnGetMCPToolCallArgs && g_pfnSubmitMCPToolResult;
+        LOG_INFO("XR_DXR_mcp_tools entry points: %s", resolved ? "resolved" : "NULL");
+        if (!resolved) g_hasMcpToolsExt = false;  // defensive: treat partial resolve as absent
+    } else {
+        LOG_INFO("XR_DXR_mcp_tools: not advertised by runtime");
     }
 
     uint32_t viewCount = 0;
