@@ -489,14 +489,16 @@ static void TryAutoLoadBundledScene(const std::string& overridePath = std::strin
 // the MCP capability gate is off (or the runtime predates the extension) the
 // PFNs are NULL and every path here is an inert no-op.
 //
-// NOTE ON THE EVENT LOOP: the Windows app otherwise borrows displayxr-common's
-// shared PollEvents, whose MCP dispatch is hardcoded to the cube reference
-// tools (set_spin/get_status). It would swallow the avatar's tool-call events
-// and answer "unhandled tool", so the avatar owns its own event pump
-// (PollEventsWithMcp below) which replicates common's session-state handling
-// and adds the avatar tool dispatch. Handlers run on the render thread inside
-// PollEventsWithMcp; they take g_inputMutex / g_sceneMutex exactly like the
-// keyboard + auto-load paths do.
+// NOTE ON THE EVENT LOOP: the Windows app uses displayxr-common's shared
+// PollEvents unchanged. displayxr-common v2.1.0 (common #18) added an
+// app-supplied mcpToolHandler hook: when set, PollEvents fetches the call args,
+// invokes the handler, and submits the returned JSON (with the handler's
+// success flag gating the ok bit) — so the avatar no longer has to fork
+// PollEvents just to swap the cube reference dispatch for its own. The handler
+// (HandleMcpToolCall below) is a pure (toolName, argsJson) -> resultJson map;
+// it must NOT call xrGetMCPToolCallArgsDXR / xrSubmitMCPToolResultDXR (PollEvents
+// does both). It runs on the render thread inside PollEvents and takes
+// g_inputMutex / g_sceneMutex exactly like the keyboard + auto-load paths do.
 
 // Minimal JSON helpers — hand-rolled on purpose, matching macos/main.mm and the
 // runtime reference adopter: tool args are tiny one-level objects, so a JSON
@@ -655,6 +657,13 @@ static void UpdateMcpAnimationTools() {
     }
 }
 
+// Forward-declared so RegisterMcpBaseTools can wire it as the mcpToolHandler
+// hook (the definition, with the full tool dispatch, is below).
+static std::string HandleMcpToolCall(XrSessionManager& xr,
+                                     const std::string& toolName,
+                                     const std::string& argsJson,
+                                     bool& success);
+
 // Declare the app identity + register the base agent tools. Call once, right
 // after xrCreateSession. The appId MUST match `id` in
 // windows/displayxr/avatar_handle_vk_win.displayxr.json (INV-10.1). The
@@ -725,37 +734,42 @@ static void RegisterMcpBaseTools(XrSessionManager& xr) {
     frameTool.inputSchemaJson = "{\"type\":\"object\"}";
     XrResult t4 = g_pfnRegisterMCPTool(xr.session, &frameTool);
 
+    // Route tool-call dispatch through the shared PollEvents hook (common #18):
+    // it fetches the args and submits our returned JSON, so we only map
+    // (toolName, argsJson) -> resultJson. Set once here, alongside registration.
+    xr.mcpToolHandler = [&xr](const std::string& toolName,
+                              const std::string& argsJson, bool& success) {
+        return HandleMcpToolCall(xr, toolName, argsJson, success);
+    };
+
     g_mcpToolsReady = true;
     LOG_INFO("XR_DXR_mcp_tools: appId=avatar load_model=%d get_status=%d "
              "set_orbit=%d frame_model=%d", t1, t2, t3, t4);
 }
 
-// Dispatch one agent tool call. Runs on the render thread inside
-// PollEventsWithMcp. EVERY call is answered — success=XR_FALSE + {"error":…} for
-// bad args — because an unanswered call only fails to the agent after the
-// runtime's ~5 s timeout.
-static void HandleMcpToolCall(XrSessionManager& xr, const XrEventDataMCPToolCallDXR* call) {
-    // Two-call idiom: argsSize from the event is the required capacity incl. NUL.
-    std::string args;
-    if (g_pfnGetMCPToolCallArgs && call->argsSize > 0) {
-        std::vector<char> buf(call->argsSize, '\0');
-        uint32_t needed = 0;
-        if (XR_SUCCEEDED(g_pfnGetMCPToolCallArgs(xr.session, call->callId,
-                                                 (uint32_t)buf.size(), &needed, buf.data())))
-            args.assign(buf.data());
-    }
-    const char* a = args.c_str();
+// Dispatch one agent tool call. Invoked by the shared displayxr-common
+// PollEvents through the mcpToolHandler hook (common #18): PollEvents has
+// already fetched the JSON args and will submit whatever we return, so this is a
+// pure (toolName, argsJson) -> resultJson map — it must NOT call
+// xrGetMCPToolCallArgsDXR / xrSubmitMCPToolResultDXR. Runs on the render thread.
+// EVERY call is answered — success=false + {"error":…} for bad args — because an
+// unanswered call only fails to the agent after the runtime's ~5 s timeout.
+static std::string HandleMcpToolCall(XrSessionManager& xr,
+                                     const std::string& toolName,
+                                     const std::string& argsJson,
+                                     bool& success) {
+    const char* a = argsJson.c_str();
     std::string result;
-    XrBool32 ok = XR_TRUE;
+    success = true;
     char buf[1024];
 
-    if (strcmp(call->toolName, "load_model") == 0) {
+    if (toolName == "load_model") {
         std::string path;
         if (!McpJsonGetString(a, "path", path) || path.empty()) {
-            ok = XR_FALSE;
+            success = false;
             result = "{\"error\":\"missing required string argument 'path'\"}";
         } else if (!model_validate_file(path)) {
-            ok = XR_FALSE;
+            success = false;
             result = "{\"error\":\"not a readable supported model file: " +
                      McpJsonEscape(path) + "\"}";
         } else {
@@ -764,7 +778,7 @@ static void HandleMcpToolCall(XrSessionManager& xr, const XrEventDataMCPToolCall
             // (un)registers the animation tools) requires it held.
             std::lock_guard<std::mutex> lock(g_sceneMutex);
             if (!g_modelRenderer.loadModel(path.c_str())) {
-                ok = XR_FALSE;
+                success = false;
                 result = "{\"error\":\"failed to load (corrupt or unsupported): " +
                          McpJsonEscape(path) + "\"}";
             } else {
@@ -780,7 +794,7 @@ static void HandleMcpToolCall(XrSessionManager& xr, const XrEventDataMCPToolCall
                 result = buf;
             }
         }
-    } else if (strcmp(call->toolName, "get_status") == 0) {
+    } else if (toolName == "get_status") {
         std::string clip; int ci = -1, cn = 0; float ct = 0, cd = 0; bool playing = false;
         const bool hasClip = g_modelRenderer.getPlaybackInfo(clip, ci, cn, ct, cd, playing);
         float yaw, pitch, zoom, px, py, pz;
@@ -810,7 +824,7 @@ static void HandleMcpToolCall(XrSessionManager& xr, const XrEventDataMCPToolCall
                  xr.currentModeIndex,
                  xr.sessionRunning ? "true" : "false");
         result = buf;
-    } else if (strcmp(call->toolName, "set_orbit") == 0) {
+    } else if (toolName == "set_orbit") {
         double az, el, zm;
         bool any = false;
         {
@@ -840,7 +854,7 @@ static void HandleMcpToolCall(XrSessionManager& xr, const XrEventDataMCPToolCall
             }
         }
         if (!any) {
-            ok = XR_FALSE;
+            success = false;
             result = "{\"error\":\"provide at least one of azimuth_deg, elevation_deg, zoom\"}";
         } else {
             std::lock_guard<std::mutex> lock(g_inputMutex);
@@ -850,16 +864,16 @@ static void HandleMcpToolCall(XrSessionManager& xr, const XrEventDataMCPToolCall
                      g_inputState.viewParams.scaleFactor);
             result = buf;
         }
-    } else if (strcmp(call->toolName, "frame_model") == 0) {
+    } else if (toolName == "frame_model") {
         if (!g_modelRenderer.hasModel()) {
-            ok = XR_FALSE;
+            success = false;
             result = "{\"error\":\"no model loaded — call load_model first\"}";
         } else {
             std::lock_guard<std::mutex> lock(g_inputMutex);
             g_inputState.resetViewRequested = true;  // applied by the render loop next frame
             result = "{\"framed\":true}";
         }
-    } else if (strcmp(call->toolName, "list_animations") == 0) {
+    } else if (toolName == "list_animations") {
         const int n = g_modelRenderer.animationCount();
         std::string clips = "[";
         for (int i = 0; i < n; i++) {
@@ -874,14 +888,14 @@ static void HandleMcpToolCall(XrSessionManager& xr, const XrEventDataMCPToolCall
                  g_modelRenderer.activeAnimation(),
                  (g_modelRenderer.hasAnimations() && !g_modelRenderer.isPaused()) ? "true" : "false");
         result = "{\"animations\":" + clips + buf;
-    } else if (strcmp(call->toolName, "play_animation") == 0) {
+    } else if (toolName == "play_animation") {
         const int n = g_modelRenderer.animationCount();
         int target = -1;
         double idx; std::string nm;
         if (McpJsonGetNumber(a, "index", idx)) {
             target = (int)idx;
             if (target < 0 || target >= n) {
-                ok = XR_FALSE;
+                success = false;
                 snprintf(buf, sizeof(buf), "{\"error\":\"index out of range (0..%d)\"}", n - 1);
                 result = buf;
             }
@@ -892,7 +906,7 @@ static void HandleMcpToolCall(XrSessionManager& xr, const XrEventDataMCPToolCall
                 if (c == nm) target = i;
             }
             if (target < 0) {
-                ok = XR_FALSE;
+                success = false;
                 result = "{\"error\":\"no clip named '" + McpJsonEscape(nm) +
                          "' — see list_animations\"}";
             }
@@ -900,9 +914,9 @@ static void HandleMcpToolCall(XrSessionManager& xr, const XrEventDataMCPToolCall
             target = g_modelRenderer.activeAnimation();  // resume the active clip
             if (target < 0) target = 0;
         }
-        if (ok == XR_TRUE) {
+        if (success) {
             if (n == 0) {
-                ok = XR_FALSE;
+                success = false;
                 result = "{\"error\":\"the loaded model has no animation clips\"}";
             } else {
                 if (target != g_modelRenderer.activeAnimation())
@@ -916,7 +930,7 @@ static void HandleMcpToolCall(XrSessionManager& xr, const XrEventDataMCPToolCall
                 result = buf;
             }
         }
-    } else if (strcmp(call->toolName, "stop_animation") == 0) {
+    } else if (toolName == "stop_animation") {
         g_modelRenderer.setPaused(true);
         std::string c; float d = 0;
         const int active = g_modelRenderer.activeAnimation();
@@ -926,80 +940,11 @@ static void HandleMcpToolCall(XrSessionManager& xr, const XrEventDataMCPToolCall
                  active >= 0 ? "\"" : "");
         result = buf;
     } else {
-        ok = XR_FALSE;
+        success = false;
         result = "{\"error\":\"unhandled tool\"}";
     }
 
-    if (g_pfnSubmitMCPToolResult)
-        g_pfnSubmitMCPToolResult(xr.session, call->callId, ok, result.c_str());
-}
-
-// Avatar-owned event pump. Replicates displayxr-common's PollEvents session
-// bookkeeping (the shared one hardcodes the cube MCP tools, see the section
-// header) and adds the avatar's XR_DXR_mcp_tools dispatch. Drop-in replacement
-// for the PollEvents(*xr) call in the render loop.
-static void PollEventsWithMcp(XrSessionManager& xr) {
-    XrEventDataBuffer event = {XR_TYPE_EVENT_DATA_BUFFER};
-    while (xrPollEvent(xr.instance, &event) == XR_SUCCESS) {
-        switch (event.type) {
-        case XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED: {
-            auto* stateEvent = (XrEventDataSessionStateChanged*)&event;
-            XrSessionState oldState = xr.sessionState;
-            xr.sessionState = stateEvent->state;
-            LOG_INFO("Session state changed: %s -> %s",
-                GetSessionStateString(oldState), GetSessionStateString(xr.sessionState));
-            switch (xr.sessionState) {
-            case XR_SESSION_STATE_READY: {
-                XrSessionBeginInfo beginInfo = {XR_TYPE_SESSION_BEGIN_INFO};
-                beginInfo.primaryViewConfigurationType = xr.viewConfigType;
-                XrResult result = xrBeginSession(xr.session, &beginInfo);
-                LogXrResult("xrBeginSession", result);
-                if (XR_SUCCEEDED(result)) xr.sessionRunning = true;
-                break;
-            }
-            case XR_SESSION_STATE_STOPPING:
-                xrEndSession(xr.session);
-                xr.sessionRunning = false;
-                break;
-            case XR_SESSION_STATE_EXITING:
-            case XR_SESSION_STATE_LOSS_PENDING:
-                xr.exitRequested = true;
-                break;
-            default:
-                break;
-            }
-            break;
-        }
-        case XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING:
-            LOG_WARN("Instance loss pending - requesting exit");
-            xr.exitRequested = true;
-            break;
-        case (XrStructureType)XR_TYPE_EVENT_DATA_RENDERING_MODE_CHANGED_DXR: {
-            auto* modeEvent = (XrEventDataRenderingModeChangedDXR*)&event;
-            LOG_INFO("Rendering mode changed: %u -> %u",
-                modeEvent->previousModeIndex, modeEvent->currentModeIndex);
-            xr.currentModeIndex = modeEvent->currentModeIndex;
-            break;
-        }
-        case (XrStructureType)XR_TYPE_EVENT_DATA_EYE_TRACKING_STATE_CHANGED_DXR: {
-            auto* etEvent = (XrEventDataEyeTrackingStateChangedDXR*)&event;
-            LOG_INFO("Eye tracking state changed: isTracking=%s mode=%u",
-                etEvent->isTracking == XR_TRUE ? "YES" : "NO", (uint32_t)etEvent->activeMode);
-            xr.isEyeTracking = (etEvent->isTracking == XR_TRUE);
-            xr.activeEyeTrackingMode = (uint32_t)etEvent->activeMode;
-            break;
-        }
-        case (XrStructureType)XR_TYPE_EVENT_DATA_MCP_TOOL_CALL_DXR: {
-            // An agent invoked one of our XR_DXR_mcp_tools tools (#30).
-            HandleMcpToolCall(xr, (const XrEventDataMCPToolCallDXR*)&event);
-            break;
-        }
-        default:
-            LOG_DEBUG("Received event type: %d", event.type);
-            break;
-        }
-        event = {XR_TYPE_EVENT_DATA_BUFFER};
-    }
+    return result;
 }
 
 // ── Per-pixel click-through silhouette ─────────────────────────────────────
@@ -1856,9 +1801,9 @@ static void RenderThreadFunc(
             }
         }
 
-        // Avatar-owned pump: session bookkeeping + XR_DXR_mcp_tools dispatch
-        // (the shared displayxr-common PollEvents hardcodes the cube tools, #30).
-        PollEventsWithMcp(*xr);
+        // Shared displayxr-common pump: session bookkeeping + XR_DXR_mcp_tools
+        // dispatch via the app-supplied mcpToolHandler hook (common #18, #30).
+        PollEvents(*xr);
 
         if (xr->sessionRunning) {
             XrFrameState frameState;

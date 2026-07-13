@@ -37,8 +37,6 @@ bool g_hasMcpToolsExt = false;
 PFN_xrSetMCPAppInfoDXR      g_pfnSetMCPAppInfo = nullptr;
 PFN_xrRegisterMCPToolDXR    g_pfnRegisterMCPTool = nullptr;
 PFN_xrUnregisterMCPToolDXR  g_pfnUnregisterMCPTool = nullptr;
-PFN_xrGetMCPToolCallArgsDXR g_pfnGetMCPToolCallArgs = nullptr;
-PFN_xrSubmitMCPToolResultDXR g_pfnSubmitMCPToolResult = nullptr;
 
 #define XR_CHECK(call) \
     do { \
@@ -259,9 +257,14 @@ bool InitializeOpenXR(XrSessionManager& xr) {
     // XR_DXR_mcp_tools (#30): resolve the agent-tool entry points. The appId +
     // base tools are declared after xrCreateSession (RegisterMcpBaseTools in
     // main.cpp), the animation tools are late-(un)registered on model load, and
-    // tool calls are dispatched from the avatar's own event pump. Resolution
-    // failure is non-fatal by design — the MCP capability gate may simply be
-    // off; the avatar runs identically without an agent surface.
+    // tool calls are dispatched by the shared displayxr-common PollEvents via
+    // the app-supplied mcpToolHandler hook (common #18). Resolution failure is
+    // non-fatal by design — the MCP capability gate may simply be off; the
+    // avatar runs identically without an agent surface.
+    //
+    // The registration entry points are app-owned globals; the arg-fetch +
+    // result-submit ones go into the session manager (xr.pfn*EXT), which is
+    // where the shared PollEvents reads them — the app never calls them itself.
     if (g_hasMcpToolsExt) {
         xrGetInstanceProcAddr(xr.instance, "xrSetMCPAppInfoDXR",
             (PFN_xrVoidFunction*)&g_pfnSetMCPAppInfo);
@@ -270,11 +273,13 @@ bool InitializeOpenXR(XrSessionManager& xr) {
         xrGetInstanceProcAddr(xr.instance, "xrUnregisterMCPToolDXR",
             (PFN_xrVoidFunction*)&g_pfnUnregisterMCPTool);
         xrGetInstanceProcAddr(xr.instance, "xrGetMCPToolCallArgsDXR",
-            (PFN_xrVoidFunction*)&g_pfnGetMCPToolCallArgs);
+            (PFN_xrVoidFunction*)&xr.pfnGetMCPToolCallArgsEXT);
         xrGetInstanceProcAddr(xr.instance, "xrSubmitMCPToolResultDXR",
-            (PFN_xrVoidFunction*)&g_pfnSubmitMCPToolResult);
+            (PFN_xrVoidFunction*)&xr.pfnSubmitMCPToolResultEXT);
         const bool resolved = g_pfnSetMCPAppInfo && g_pfnRegisterMCPTool &&
-            g_pfnUnregisterMCPTool && g_pfnGetMCPToolCallArgs && g_pfnSubmitMCPToolResult;
+            g_pfnUnregisterMCPTool && xr.pfnGetMCPToolCallArgsEXT &&
+            xr.pfnSubmitMCPToolResultEXT;
+        xr.hasMcpToolsExt = resolved;
         LOG_INFO("XR_DXR_mcp_tools entry points: %s", resolved ? "resolved" : "NULL");
         if (!resolved) g_hasMcpToolsExt = false;  // defensive: treat partial resolve as absent
     } else {
