@@ -23,6 +23,13 @@ endif()
 find_package(Vulkan REQUIRED)
 message(STATUS "Found Vulkan: ${Vulkan_LIBRARY}")
 
+# Xlib for the app-owned transparent ARGB window (XR_DXR_xlib_window_binding).
+# libx11-dev is already a CI dep; the window path falls back to hosted-NULL at
+# runtime when no X server is present (e.g. headless CI), so this only adds a
+# link-time dependency, not a runtime one.
+find_package(X11 REQUIRED)
+message(STATUS "Found X11: ${X11_X11_LIB}")
+
 # OpenXR loader — CMake package (e.g. from a from-source /tmp/openxr-install via
 # CMAKE_PREFIX_PATH) → system library → hard error.
 set(OPENXR_FOUND FALSE)
@@ -67,6 +74,7 @@ target_link_libraries(avatar_handle_vk_linux PRIVATE
     model_renderer
     OpenXR::openxr_loader
     Vulkan::Vulkan
+    ${X11_LIBRARIES}
 )
 
 # Copy the OpenXR loader .so next to the exe when it's an imported target, so a
