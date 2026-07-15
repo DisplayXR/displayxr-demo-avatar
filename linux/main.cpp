@@ -11,13 +11,14 @@
  * heavy renderer stack (tinygltf / tinyusdz / ufbx / glm / SPIR-V shaders) that
  * is the real portability surface of this demo.
  *
- * Windowing — HOSTED-NULL (Phase-1 interim). Per docs/guides/linux-demo-port.md
- * this app passes NO window binding at xrCreateSession: the graphics binding is
- * chained straight into XrSessionCreateInfo and the runtime self-creates its
- * window. The faithful _handle path (app-owned X11 window handed over via
- * XR_DXR_xlib_window_binding — the vendored header is already in
- * openxr_includes/) is Phase-3 work, gated on the Linux runtime + a GPU + an X
- * server; see the TODO(Phase 3) block in main(). The macOS/Windows peers'
+ * Windowing — APP-OWNED X11 WINDOW (transparent overlay, runtime#757). The app
+ * creates a 32-bit ARGB X11 window and hands it to the runtime via
+ * XR_DXR_xlib_window_binding with transparentBackgroundEnabled, so transparent
+ * pixels compose through to the desktop — the transparent/click-through avatar
+ * (the Lenovo use case). Falls back to hosted-NULL (graphics binding chained
+ * straight in, runtime self-creates its window) when no X server / the extension
+ * is absent (e.g. headless CI). Click-through (XShape input region from the
+ * avatar silhouette) is the remaining WS6 piece. The macOS/Windows peers'
  * speech-bubble window-space layer (XR_DXR_local_3d_zone /
  * XrCompositionLayerWindowSpaceDXR) is likewise deferred to Phase 3 — this
  * build-green vehicle submits only the base projection layer.
@@ -30,11 +31,19 @@
 
 #include <vulkan/vulkan.h>
 
+// Xlib FIRST so XR_DXR_xlib_window_binding.h binds the real Display*/Window
+// types (it provides stand-ins only when Xlib.h was not included). Needed for
+// the app-owned-window path below.
+#include <X11/Xlib.h>
+#include <X11/Xutil.h>
+
 #define XR_USE_GRAPHICS_API_VULKAN
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
-// Vendored, forward-looking: the real app-provided-window path for Phase 3.
-// Unused in the hosted-NULL build below (no window binding is chained).
+// App-provided-window path: the avatar creates a 32-bit ARGB X11 window and
+// hands it to the runtime via XR_DXR_xlib_window_binding with
+// transparentBackgroundEnabled — the transparent/click-through overlay (the
+// Lenovo use case). Falls back to hosted-NULL when no X server is available.
 #include <openxr/XR_DXR_xlib_window_binding.h>
 
 #include <cmath>
@@ -196,7 +205,66 @@ struct AppXrSession {
 
     uint32_t viewWidth = 0;
     uint32_t viewHeight = 0;
+
+    // App-owned X11 window (transparent overlay). Null/0 → hosted-NULL fallback
+    // (no X server, e.g. headless CI, or the xlib-binding extension is absent).
+    Display* xDisplay = nullptr;
+    Window xWindow = 0;
+    Colormap xColormap = 0;
+    bool hasXlibBinding = false; // XR_DXR_xlib_window_binding enabled on the instance
 };
+
+// Create a 32-bit ARGB X11 window for the transparent avatar overlay. Returns
+// false (leaving xDisplay null) when no X server / no ARGB visual is available,
+// so the caller falls back to hosted-NULL. A compositing WM (GNOME/Mutter, KWin,
+// picom) must be running for the desktop to show through.
+static bool CreateAppWindow(AppXrSession& xr) {
+    Display* dpy = XOpenDisplay(nullptr);
+    if (dpy == nullptr) {
+        LOG_INFO("XOpenDisplay failed (no X server) — using hosted-NULL windowing");
+        return false;
+    }
+    int screen = DefaultScreen(dpy);
+
+    XVisualInfo vinfo;
+    if (!XMatchVisualInfo(dpy, screen, 32, TrueColor, &vinfo)) {
+        LOG_INFO("No 32-bit ARGB visual — using hosted-NULL windowing");
+        XCloseDisplay(dpy);
+        return false;
+    }
+
+    Window root = RootWindow(dpy, screen);
+    Colormap cmap = XCreateColormap(dpy, root, vinfo.visual, AllocNone);
+
+    XSetWindowAttributes attrs = {};
+    attrs.colormap = cmap;
+    attrs.border_pixel = 0;      // required with a non-default colormap (else BadMatch)
+    attrs.background_pixel = 0;  // fully-transparent fill
+    attrs.event_mask = StructureNotifyMask | KeyPressMask;
+
+    // Size to the screen for a full-panel overlay; on-hardware placement is
+    // tuned separately (the app owns its window geometry on the xlib path).
+    unsigned int w = (unsigned int)DisplayWidth(dpy, screen);
+    unsigned int h = (unsigned int)DisplayHeight(dpy, screen);
+
+    Window win = XCreateWindow(dpy, root, 0, 0, w, h, 0, 32, InputOutput, vinfo.visual,
+                               CWColormap | CWBorderPixel | CWBackPixel | CWEventMask, &attrs);
+    if (win == 0) {
+        LOG_ERROR("XCreateWindow failed — using hosted-NULL windowing");
+        XFreeColormap(dpy, cmap);
+        XCloseDisplay(dpy);
+        return false;
+    }
+    XStoreName(dpy, win, "DisplayXR Avatar");
+    XMapWindow(dpy, win);
+    XFlush(dpy);
+
+    xr.xDisplay = dpy;
+    xr.xWindow = win;
+    xr.xColormap = cmap;
+    LOG_INFO("Created %ux%u 32-bit ARGB app window for transparent overlay", w, h);
+    return true;
+}
 
 static bool InitializeOpenXR(AppXrSession& xr) {
     LOG_INFO("Initializing OpenXR...");
@@ -207,14 +275,24 @@ static bool InitializeOpenXR(AppXrSession& xr) {
     XR_CHECK(xrEnumerateInstanceExtensionProperties(nullptr, extensionCount, &extensionCount, extensions.data()));
 
     bool hasVulkan = false;
-    for (const auto& ext : extensions)
+    bool hasXlibBinding = false;
+    for (const auto& ext : extensions) {
         if (strcmp(ext.extensionName, XR_KHR_VULKAN_ENABLE_EXTENSION_NAME) == 0) hasVulkan = true;
+        if (strcmp(ext.extensionName, XR_DXR_XLIB_WINDOW_BINDING_EXTENSION_NAME) == 0) hasXlibBinding = true;
+    }
 
     LOG_INFO("XR_KHR_vulkan_enable: %s", hasVulkan ? "AVAILABLE" : "NOT FOUND");
     if (!hasVulkan) { LOG_ERROR("XR_KHR_vulkan_enable not available"); return false; }
+    LOG_INFO("XR_DXR_xlib_window_binding: %s", hasXlibBinding ? "AVAILABLE" : "NOT FOUND");
 
     std::vector<const char*> enabledExtensions;
     enabledExtensions.push_back(XR_KHR_VULKAN_ENABLE_EXTENSION_NAME);
+    // Enable the app-owned-window binding when the runtime exposes it — required
+    // to hand over our transparent X11 window (else we run hosted-NULL).
+    if (hasXlibBinding) {
+        enabledExtensions.push_back(XR_DXR_XLIB_WINDOW_BINDING_EXTENSION_NAME);
+        xr.hasXlibBinding = true;
+    }
 
     XrInstanceCreateInfo createInfo = {XR_TYPE_INSTANCE_CREATE_INFO};
     strncpy(createInfo.applicationInfo.applicationName, "AvatarHandleVkLinux",
@@ -360,21 +438,27 @@ static bool CreateSession(AppXrSession& xr, VkInstance vkInstance, VkPhysicalDev
     vkBinding.queueFamilyIndex = queueFamilyIndex;
     vkBinding.queueIndex = 0;
 
-    // HOSTED-NULL: the graphics binding is chained straight into the session
-    // create info — NO window binding. The runtime self-creates its window.
-    //
-    // TODO(Phase 3): become a faithful _handle app. Create an app-owned X11
-    // window (XOpenDisplay / XCreateWindow), then chain
-    //   XrXlibWindowBindingCreateInfoDXR { .next = &vkBinding, .xDisplay, .window }
-    // (header already vendored: openxr/XR_DXR_xlib_window_binding.h) as
-    // sessionInfo.next, and enable XR_DXR_XLIB_WINDOW_BINDING_EXTENSION_NAME in
-    // InitializeOpenXR. Gated on the Linux runtime + a GPU + an X server —
-    // docs/guides/linux-demo-port.md, runtime #660/#699.
+    // App-owned-window path: chain the xlib binding (→ vkBinding) so the runtime
+    // renders into our 32-bit ARGB window, with transparentBackgroundEnabled so
+    // transparent pixels compose through to the desktop (the avatar overlay).
+    // Falls back to hosted-NULL when no window / the extension is absent (e.g.
+    // headless CI), where the graphics binding is chained straight in and the
+    // runtime self-creates its window.
+    XrXlibWindowBindingCreateInfoDXR xlibBinding = {XR_TYPE_XLIB_WINDOW_BINDING_CREATE_INFO_DXR};
+    xlibBinding.next = &vkBinding;
+    xlibBinding.xDisplay = xr.xDisplay;
+    xlibBinding.window = xr.xWindow;
+    xlibBinding.transparentBackgroundEnabled = XR_TRUE;
+
+    const bool useAppWindow = xr.hasXlibBinding && xr.xDisplay != nullptr && xr.xWindow != 0;
+
     XrSessionCreateInfo sessionInfo = {XR_TYPE_SESSION_CREATE_INFO};
-    sessionInfo.next = &vkBinding;
+    sessionInfo.next = useAppWindow ? (const void*)&xlibBinding : (const void*)&vkBinding;
     sessionInfo.systemId = xr.systemId;
     XR_CHECK(xrCreateSession(xr.instance, &sessionInfo, &xr.session));
-    LOG_INFO("Session created (hosted-NULL: runtime self-creates the window)");
+    LOG_INFO("Session created (%s)",
+             useAppWindow ? "app-owned ARGB window, transparent overlay"
+                          : "hosted-NULL: runtime self-creates the window");
     return true;
 }
 
@@ -469,6 +553,13 @@ static void CleanupOpenXR(AppXrSession& xr) {
     if (xr.localSpace != XR_NULL_HANDLE) xrDestroySpace(xr.localSpace);
     if (xr.session != XR_NULL_HANDLE) xrDestroySession(xr.session);
     if (xr.instance != XR_NULL_HANDLE) xrDestroyInstance(xr.instance);
+    // Tear down the app-owned X11 window after the runtime has released it.
+    if (xr.xWindow != 0 && xr.xDisplay != nullptr) XDestroyWindow(xr.xDisplay, xr.xWindow);
+    if (xr.xColormap != 0 && xr.xDisplay != nullptr) XFreeColormap(xr.xDisplay, xr.xColormap);
+    if (xr.xDisplay != nullptr) XCloseDisplay(xr.xDisplay);
+    xr.xWindow = 0;
+    xr.xColormap = 0;
+    xr.xDisplay = nullptr;
 }
 
 static void SignalHandler(int) { g_running = false; }
@@ -479,7 +570,7 @@ static void SignalHandler(int) { g_running = false; }
 int main(int argc, char** argv) {
     signal(SIGINT, SignalHandler);
     signal(SIGTERM, SignalHandler);
-    LOG_INFO("=== DisplayXR Avatar (Linux, hosted-NULL, build-green) ===");
+    LOG_INFO("=== DisplayXR Avatar (Linux, app-owned ARGB window / transparent overlay) ===");
 
     AppXrSession xr = {};
     if (!InitializeOpenXR(xr)) { LOG_ERROR("OpenXR init failed"); return 1; }
@@ -507,6 +598,11 @@ int main(int argc, char** argv) {
     VkQueue graphicsQueue = VK_NULL_HANDLE;
     if (!CreateVulkanDevice(physDevice, queueFamilyIndex, devExts, vkDevice, graphicsQueue)) {
         vkDestroyInstance(vkInstance, nullptr); CleanupOpenXR(xr); return 1; }
+
+    // Best-effort: create the app-owned transparent ARGB window before the
+    // session so CreateSession can hand it over. Falls back to hosted-NULL
+    // (headless CI, no compositor) — never fatal.
+    CreateAppWindow(xr);
 
     if (!CreateSession(xr, vkInstance, physDevice, vkDevice, queueFamilyIndex)) {
         vkDestroyDevice(vkDevice, nullptr); vkDestroyInstance(vkInstance, nullptr);
