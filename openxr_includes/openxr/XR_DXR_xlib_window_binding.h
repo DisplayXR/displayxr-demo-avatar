@@ -47,7 +47,7 @@ extern "C" {
 #endif
 
 #define XR_DXR_xlib_window_binding 1
-#define XR_DXR_xlib_window_binding_SPEC_VERSION 1
+#define XR_DXR_xlib_window_binding_SPEC_VERSION 2
 #define XR_DXR_XLIB_WINDOW_BINDING_EXTENSION_NAME "XR_DXR_xlib_window_binding"
 
 // Value from the DisplayXR provisional 1004999xxx block — decade 1004999200–209
@@ -91,6 +91,16 @@ typedef struct XrXlibWindowBindingCreateInfoDXR {
     const void* XR_MAY_ALIAS    next;      //!< Pointer to next structure in chain
     Display*                    xDisplay;  //!< Xlib display connection (XOpenDisplay)
     XR_XLIB_WINDOW_TYPE_        window;    //!< X11 Window (XID) owned by the app
+    //! When XR_TRUE, the runtime configures the bound window for transparent
+    //! desktop composition: pixels the app writes with full opacity appear
+    //! opaque on screen, and pixels written transparent (alpha = 0) compose
+    //! through to the desktop underneath. On X11 the runtime selects a 32-bit
+    //! ARGB visual and a non-opaque swapchain compositeAlpha; a compositing
+    //! window manager (e.g. GNOME/Mutter, KWin, picom) must be running for the
+    //! desktop to show through. Only honored when both xDisplay and window are
+    //! valid. Sibling of XrWin32WindowBindingCreateInfoDXR::transparentBackgroundEnabled
+    //! (SPEC_VERSION 2).
+    XrBool32                    transparentBackgroundEnabled;
 } XrXlibWindowBindingCreateInfoDXR;
 
 #undef XR_XLIB_WINDOW_TYPE_
