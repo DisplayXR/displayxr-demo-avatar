@@ -17,6 +17,7 @@
 
 #include <vector>
 #include <cstring>
+#include <cstdio>
 
 // Scratch GPU image + host-visible readback for the silhouette pass (lazily
 // created, resized with the window). Single-threaded — driven from the frame
@@ -167,6 +168,19 @@ ClickthroughUpdate(VkDevice dev,
 				++cx;
 			}
 		}
+	}
+
+	// Diagnostic (runtime#757 FLAG 1): the rect count disambiguates "region
+	// empty" (silhouette produced no alpha → render/matrix issue) from "region
+	// present but clicks still fall through" (coord/application issue). Throttled
+	// ~every 60 updates (≈15 s at the 4 Hz update rate) so it's not spammy.
+	static int s_diag = 0;
+	if ((s_diag++ % 60) == 0) {
+		uint32_t covered = 0;
+		for (const auto& r : rects) covered += (uint32_t)r.width * r.height;
+		fprintf(stderr,
+		        "[INFO]  clickthrough: %zu input-rects, ~%u px covered, win %ux%u, coverage %ux%u\n",
+		        rects.size(), covered, winW, winH, w, h);
 	}
 
 	// Set the window's INPUT shape to just the avatar: clicks land on it, the
