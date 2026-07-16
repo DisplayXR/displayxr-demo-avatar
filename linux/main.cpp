@@ -53,6 +53,7 @@
 #include <cstring>
 #include <cstdio>
 #include <cstdint>
+#include <cstdlib>
 #include <csignal>
 #include <chrono>
 #include <string>
@@ -173,10 +174,23 @@ static void ComputeModelFit() {
     g_fitMat[15] = 1.0f;
     g_fitMat[12] = -s * center[0];
     g_fitMat[13] = -s * center[1];
-    g_fitMat[14] = -s * center[2];
+    // Push the model in FRONT of the camera along world -Z. On the app-owned-window
+    // / native-VK path the view pose sits at the display plane (z≈0, verified on
+    // the DS1), so a model centred at the origin lands on the 0.01 m near plane and
+    // clips away — the app expects the "viewer at ~0.45 m" noted above, which
+    // sim_display delivers but the native-VK path does not. This offset moves the
+    // model clear of the near plane. Tunable live on the panel via
+    // DXR_AVATAR_Z_OFFSET (metres; more-negative = further in front; flip the sign
+    // if it goes the wrong way). Default -0.5 m. runtime#757 HW bring-up.
+    float z_off = -0.5f;
+    const char *z_off_env = getenv("DXR_AVATAR_Z_OFFSET");
+    if (z_off_env != nullptr) {
+        z_off = (float)atof(z_off_env);
+    }
+    g_fitMat[14] = -s * center[2] + z_off;
     g_fitValid = true;
-    LOG_INFO("Auto-fit: center=(%.3f,%.3f,%.3f) extentY=%.3f -> scale=%.5f (target %.2f m)",
-             center[0], center[1], center[2], extent[1], s, kFitHeightM);
+    LOG_INFO("Auto-fit: center=(%.3f,%.3f,%.3f) extentY=%.3f -> scale=%.5f (target %.2f m), z_off=%.3f",
+             center[0], center[1], center[2], extent[1], s, kFitHeightM, z_off);
 }
 
 // ============================================================================
