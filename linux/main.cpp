@@ -46,6 +46,11 @@
 // transparentBackgroundEnabled — the transparent/click-through overlay (the
 // Lenovo use case). Falls back to hosted-NULL when no X server is available.
 #include <openxr/XR_DXR_xlib_window_binding.h>
+// Display-centric view rig: the runtime returns render-ready XrView{pose,fov}
+// (camera at the eye, off-axis Kooima FOV) so the app doesn't hand-roll the view
+// math. This is how modelviewer/gauss/cube-handle frame correctly on the
+// native-VK path; the avatar consumes it the same way.
+#include <openxr/XR_DXR_view_rig.h>
 
 #include "clickthrough.h" // XShape silhouette click-through for the overlay
 
@@ -160,37 +165,31 @@ static void mat4_mul(float* out, const float* a, const float* b) {
 static float g_fitMat[16];
 static bool g_fitValid = false;
 
+// Avatar target height in app units (≈ meters). The display view rig's virtual
+// display is sized so the avatar fills ~80% of the panel — a framing choice, not
+// a magic offset; the runtime rig + eye positions drive the actual view pose.
+static constexpr float kAvatarFitHeightM = 0.15f;
+static constexpr float kVirtualDisplayHeightM = kAvatarFitHeightM / 0.8f;
+
 static void ComputeModelFit() {
     float center[3], extent[3];
     if (!g_modelRenderer.getRobustSceneBounds(0.05f, 0.95f, center, extent) || !(extent[1] > 1e-3f)) {
         return;
     }
-    // Panel-scale target height; hardware-tune if the framing still feels off
-    // (George's #21 confirm called the old framing "large/near the camera").
-    const float kFitHeightM = 0.15f;
-    const float s = kFitHeightM / extent[1];
+    // Scale the human-scale FBX into panel units and center it at the display
+    // plane (world origin). The view is owned by the display view rig now (camera
+    // at the eye, off-axis FOV), so NO manual pose/offset is needed — the model at
+    // the display plane renders in front of the rig's eye-distance camera.
+    const float s = kAvatarFitHeightM / extent[1];
     for (int i = 0; i < 16; i++) g_fitMat[i] = 0.0f;
     g_fitMat[0] = g_fitMat[5] = g_fitMat[10] = s;
     g_fitMat[15] = 1.0f;
     g_fitMat[12] = -s * center[0];
     g_fitMat[13] = -s * center[1];
-    // Push the model in FRONT of the camera along world -Z. On the app-owned-window
-    // / native-VK path the view pose sits at the display plane (z≈0, verified on
-    // the DS1), so a model centred at the origin lands on the 0.01 m near plane and
-    // clips away — the app expects the "viewer at ~0.45 m" noted above, which
-    // sim_display delivers but the native-VK path does not. This offset moves the
-    // model clear of the near plane. Tunable live on the panel via
-    // DXR_AVATAR_Z_OFFSET (metres; more-negative = further in front; flip the sign
-    // if it goes the wrong way). Default -0.5 m. runtime#757 HW bring-up.
-    float z_off = -0.5f;
-    const char *z_off_env = getenv("DXR_AVATAR_Z_OFFSET");
-    if (z_off_env != nullptr) {
-        z_off = (float)atof(z_off_env);
-    }
-    g_fitMat[14] = -s * center[2] + z_off;
+    g_fitMat[14] = -s * center[2];
     g_fitValid = true;
-    LOG_INFO("Auto-fit: center=(%.3f,%.3f,%.3f) extentY=%.3f -> scale=%.5f (target %.2f m), z_off=%.3f",
-             center[0], center[1], center[2], extent[1], s, kFitHeightM, z_off);
+    LOG_INFO("Auto-fit: center=(%.3f,%.3f,%.3f) extentY=%.3f -> scale=%.5f (target %.2f m)",
+             center[0], center[1], center[2], extent[1], s, kAvatarFitHeightM);
 }
 
 // ============================================================================
@@ -231,6 +230,7 @@ struct AppXrSession {
     unsigned int xWinW = 0, xWinH = 0; // app window size (for the click-through region)
     bool hasXlibBinding = false;       // XR_DXR_xlib_window_binding enabled on the instance
     bool usingAppWindow = false;       // the xlib binding was actually handed to xrCreateSession
+    bool hasViewRig = false;           // XR_DXR_view_rig enabled — chain the display rig on locate
 };
 
 // Create a 32-bit ARGB X11 window for the transparent avatar overlay. Returns
@@ -297,14 +297,17 @@ static bool InitializeOpenXR(AppXrSession& xr) {
 
     bool hasVulkan = false;
     bool hasXlibBinding = false;
+    bool hasViewRig = false;
     for (const auto& ext : extensions) {
         if (strcmp(ext.extensionName, XR_KHR_VULKAN_ENABLE_EXTENSION_NAME) == 0) hasVulkan = true;
         if (strcmp(ext.extensionName, XR_DXR_XLIB_WINDOW_BINDING_EXTENSION_NAME) == 0) hasXlibBinding = true;
+        if (strcmp(ext.extensionName, XR_DXR_VIEW_RIG_EXTENSION_NAME) == 0) hasViewRig = true;
     }
 
     LOG_INFO("XR_KHR_vulkan_enable: %s", hasVulkan ? "AVAILABLE" : "NOT FOUND");
     if (!hasVulkan) { LOG_ERROR("XR_KHR_vulkan_enable not available"); return false; }
     LOG_INFO("XR_DXR_xlib_window_binding: %s", hasXlibBinding ? "AVAILABLE" : "NOT FOUND");
+    LOG_INFO("XR_DXR_view_rig: %s", hasViewRig ? "AVAILABLE" : "NOT FOUND");
 
     std::vector<const char*> enabledExtensions;
     enabledExtensions.push_back(XR_KHR_VULKAN_ENABLE_EXTENSION_NAME);
@@ -313,6 +316,12 @@ static bool InitializeOpenXR(AppXrSession& xr) {
     if (hasXlibBinding) {
         enabledExtensions.push_back(XR_DXR_XLIB_WINDOW_BINDING_EXTENSION_NAME);
         xr.hasXlibBinding = true;
+    }
+    // Enable the display view rig so the runtime returns render-ready view
+    // poses/FOV (camera at the eye) instead of us hand-rolling the Kooima math.
+    if (hasViewRig) {
+        enabledExtensions.push_back(XR_DXR_VIEW_RIG_EXTENSION_NAME);
+        xr.hasViewRig = true;
     }
 
     XrInstanceCreateInfo createInfo = {XR_TYPE_INSTANCE_CREATE_INFO};
@@ -703,6 +712,23 @@ int main(int argc, char** argv) {
             locateInfo.displayTime = frameState.predictedDisplayTime;
             locateInfo.space = xr.localSpace;
 
+            // Chain the display view rig: the runtime returns render-ready
+            // XrView{pose, fov} (camera AT the eye, off-axis Kooima FOV) so we
+            // don't hand-roll the view math. This is the fix for the native-VK
+            // path returning a display-plane (z≈0) view pose — with the rig the
+            // pose sits at the eye (~0.5 m) like sim_display. Must be chained on
+            // every locate (per-locate semantics). Identity pose = display plane
+            // at the locate origin.
+            XrDisplayRigDXR displayRig = {XR_TYPE_DISPLAY_RIG_DXR};
+            displayRig.pose = {{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, 0.0f}};
+            displayRig.virtualDisplayHeight = kVirtualDisplayHeightM;
+            displayRig.ipdFactor = 1.0f;
+            displayRig.parallaxFactor = 1.0f;
+            displayRig.perspectiveFactor = 1.0f;
+            if (xr.hasViewRig) {
+                locateInfo.next = &displayRig;
+            }
+
             XrViewState viewState = {XR_TYPE_VIEW_STATE};
             uint32_t viewCount = 0;
             xrLocateViews(xr.session, &locateInfo, &viewState, 0, &viewCount, nullptr);
@@ -710,15 +736,8 @@ int main(int argc, char** argv) {
             std::vector<XrView> views(viewCount, {XR_TYPE_VIEW});
             XrResult loc = xrLocateViews(xr.session, &locateInfo, &viewState, viewCount, &viewCount, views.data());
 
-            // DisplayXR supplies a valid display-relative view pose on the native-VK
-            // compositor path, but does not always set POSITION_VALID/ORIENTATION_VALID
-            // on that path (sim_display does; the Leia/native-VK weave path does not —
-            // the pose is display-relative, not head-tracked in the OpenXR sense). Apps
-            // that hard-gate on those flags (as this one used to) then submit an empty
-            // swapchain → nothing drawn. The working demos (modelviewer/gaussiansplat)
-            // render whenever xrLocateViews succeeds, so match them: use the pose the
-            // runtime returned. (runtime#757 hardware bring-up; flags-populated poses
-            // still render — the checks were the *only* gate that was skipping draws.)
+            // Render whenever the locate succeeds — the view pose/FOV come from the
+            // display rig above (render-ready), matching modelviewer/gaussiansplat.
             if (XR_SUCCEEDED(loc)) {
                 XrSwapchainImageAcquireInfo acqInfo = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
                 uint32_t imageIndex = 0;
@@ -735,7 +754,16 @@ int main(int argc, char** argv) {
                         for (uint32_t i = 0; i < eyeCount; i++) {
                             float viewMat[16], projMat[16];
                             mat4_view_from_xr_pose(viewMat, views[i].pose);
-                            mat4_from_xr_fov(projMat, views[i].fov, 0.01f, 100.0f);
+                            // Foreground clip (well-defined, no magic numbers): the far
+                            // plane = the eye→display distance, so it coincides with the
+                            // virtual display plane. The rig returns the eye at the
+                            // rig-local z of the view pose (display plane = locate origin
+                            // → |pose.z|). The avatar renders in front of the display; the
+                            // desktop shows behind via compose-under-bg. Fall back to a far
+                            // plane if the rig is absent / z is degenerate.
+                            float ez = fabsf(views[i].pose.position.z);
+                            float farZ = (ez > 0.02f) ? ez : 100.0f;
+                            mat4_from_xr_fov(projMat, views[i].fov, 0.01f, farZ);
                             if (g_fitValid) { // bake the model-fit into the view (MV = V * F)
                                 float fitted[16];
                                 mat4_mul(fitted, viewMat, g_fitMat);
