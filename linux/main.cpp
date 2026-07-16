@@ -401,7 +401,17 @@ static bool GetVulkanPhysicalDevice(AppXrSession& xr, VkInstance vkInstance, VkP
     return true;
 }
 
-static bool GetVulkanDeviceExtensions(AppXrSession& xr, std::vector<const char*>& deviceExtensions,
+static bool DeviceSupportsExtension(VkPhysicalDevice pd, const char* name) {
+    uint32_t n = 0;
+    vkEnumerateDeviceExtensionProperties(pd, nullptr, &n, nullptr);
+    std::vector<VkExtensionProperties> props(n);
+    vkEnumerateDeviceExtensionProperties(pd, nullptr, &n, props.data());
+    for (auto& p : props) if (strcmp(p.extensionName, name) == 0) return true;
+    return false;
+}
+
+static bool GetVulkanDeviceExtensions(AppXrSession& xr, VkPhysicalDevice physDevice,
+                                      std::vector<const char*>& deviceExtensions,
                                       std::vector<std::string>& storage) {
     PFN_xrGetVulkanDeviceExtensionsKHR pfn = nullptr;
     XR_CHECK(xrGetInstanceProcAddr(xr.instance, "xrGetVulkanDeviceExtensionsKHR", (PFN_xrVoidFunction*)&pfn));
@@ -420,6 +430,33 @@ static bool GetVulkanDeviceExtensions(AppXrSession& xr, std::vector<const char*>
           if (!n.empty() && n[0] != '\0') storage.push_back(n);
           start = end + 1;
       } }
+
+    // runtime#757 / leia#81 — the transparency desktop-capture producer in the
+    // Leia DP imports the live desktop as a dma-buf VkImage, which needs these
+    // device extensions ENABLED on the app-owned VkDevice. We're an
+    // XR_KHR_vulkan_enable (enable1) app, so WE own vkCreateDevice — the runtime
+    // advertises only its own required set via xrGetVulkanDeviceExtensionsKHR, so
+    // append the capture extensions here. Support-checked: a device/driver
+    // lacking them just skips, and the producer then declines gracefully (opaque
+    // / 2D-under-backdrop) rather than failing device creation. Must append to
+    // `storage` BEFORE building the const char* list so the pointers stay valid.
+    const char* kCaptureExts[] = {
+        VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME,
+        VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME,
+        VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME, // usually already in the runtime set
+    };
+    for (const char* e : kCaptureExts) {
+        bool already = false;
+        for (auto& s : storage) if (s == e) { already = true; break; }
+        if (already) continue;
+        if (DeviceSupportsExtension(physDevice, e)) {
+            storage.push_back(e);
+            LOG_INFO("transparency: enabling capture device ext %s", e);
+        } else {
+            LOG_WARN("transparency: device lacks %s — desktop capture will decline", e);
+        }
+    }
+
     for (auto& n : storage) deviceExtensions.push_back(n.c_str());
     return true;
 }
@@ -622,7 +659,7 @@ int main(int argc, char** argv) {
 
     std::vector<const char*> devExts;
     std::vector<std::string> extStorage;
-    if (!GetVulkanDeviceExtensions(xr, devExts, extStorage)) {
+    if (!GetVulkanDeviceExtensions(xr, physDevice, devExts, extStorage)) {
         vkDestroyInstance(vkInstance, nullptr); CleanupOpenXR(xr); return 1; }
     // Negative-viewport Y-flip (matches the macOS/Windows raster convention).
     devExts.push_back(VK_KHR_MAINTENANCE1_EXTENSION_NAME);
