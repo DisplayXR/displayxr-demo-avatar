@@ -849,8 +849,25 @@ int main(int argc, char** argv) {
                         static uint32_t s_clickFrame = 0;
                         constexpr uint32_t kClickUpdateEveryN = 15; // ~4 Hz at 60 fps
                         if (xr.usingAppWindow && haveSil && (s_clickFrame++ % kClickUpdateEveryN) == 0) {
+                            // FLAG 1 fix (Suki, on-panel): the window is created at
+                            // DisplayWidth/Height (the WHOLE X screen — 7680x2400 across eDP-1 +
+                            // DP-1), but the runtime repositions/resizes the overlay onto the
+                            // target output (RandR panel override -> DS1 3840x2160). xr.xWinW/xWinH
+                            // hold the stale creation size, so the input region was scaled to the
+                            // root (non-uniform 12x/6.67x) and shoved off the real window -> every
+                            // click fell through. Query the ACTUAL geometry (throttled ~4 Hz, so
+                            // XGetGeometry cost is nil). xWinW/xWinH has no other consumer, so this
+                            // call-site query is the complete fix (no ConfigureNotify tracking).
+                            unsigned int cw = xr.xWinW, ch = xr.xWinH;
+                            {
+                                Window gRoot; int gx, gy; unsigned int gw, gh, gbw, gd;
+                                if (XGetGeometry(xr.xDisplay, xr.xWindow, &gRoot, &gx, &gy,
+                                                 &gw, &gh, &gbw, &gd) && gw > 0 && gh > 0) {
+                                    cw = gw; ch = gh;
+                                }
+                            }
                             ClickthroughUpdate(vkDevice, physDevice, graphicsQueue, queueFamilyIndex,
-                                               g_modelRenderer, xr.xDisplay, xr.xWindow, xr.xWinW, xr.xWinH,
+                                               g_modelRenderer, xr.xDisplay, xr.xWindow, cw, ch,
                                                silView, silProj);
                         }
                     }
