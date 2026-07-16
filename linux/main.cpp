@@ -259,6 +259,19 @@ static bool CreateAppWindow(AppXrSession& xr) {
         return false;
     }
     XStoreName(dpy, win, "DisplayXR Avatar");
+
+    // Borderless: strip the WM decorations (_MOTIF_WM_HINTS, decorations=0). A
+    // decorated title bar/frame captures input and defeats the XShape
+    // click-through, and it looks wrong for a floating overlay.
+    {
+        struct MotifWmHints { unsigned long flags, functions, decorations; long input_mode; unsigned long status; };
+        MotifWmHints mwm = {2 /* MWM_HINTS_DECORATIONS */, 0, 0 /* none */, 0, 0};
+        Atom motif = XInternAtom(dpy, "_MOTIF_WM_HINTS", False);
+        if (motif != None) {
+            XChangeProperty(dpy, win, motif, motif, 32, PropModeReplace, (unsigned char*)&mwm, 5);
+        }
+    }
+
     XMapWindow(dpy, win);
     XFlush(dpy);
 
@@ -495,7 +508,16 @@ static bool CreateSwapchain(AppXrSession& xr) {
     XR_CHECK(xrEnumerateSwapchainFormats(xr.session, 0, &formatCount, nullptr));
     std::vector<int64_t> formats(formatCount);
     XR_CHECK(xrEnumerateSwapchainFormats(xr.session, formatCount, &formatCount, formats.data()));
+    // Prefer a UNORM swapchain (matches the macOS avatar). ModelRenderer draws to
+    // an internal UNORM target and its shader gamma-encodes explicitly; an sRGB
+    // swapchain instead relies on the blit to sRGB-encode, which it doesn't — so
+    // colors come out washed-out / desaturated (Suki's DS1 report). Pick UNORM if
+    // offered, else sRGB, else the R8G8B8A8_UNORM fallback.
     int64_t selectedFormat = formats.empty() ? (int64_t)VK_FORMAT_R8G8B8A8_UNORM : formats[0];
+    for (int64_t f : formats) {
+        if (f == VK_FORMAT_B8G8R8A8_UNORM || f == VK_FORMAT_R8G8B8A8_UNORM) { selectedFormat = f; break; }
+        if (f == VK_FORMAT_B8G8R8A8_SRGB || f == VK_FORMAT_R8G8B8A8_SRGB) selectedFormat = f;
+    }
 
     const auto& view = xr.configViews[0];
     uint32_t scWidth = view.recommendedImageRectWidth * 2; // stereo SBS atlas
@@ -781,9 +803,15 @@ int main(int argc, char** argv) {
                         xrReleaseSwapchainImage(xr.swapchain.swapchain, &relInfo);
 
                         // Refresh the click-through input region from the avatar
-                        // silhouette (view 0). Only meaningful with an app-owned
+                        // silhouette (view 0). THROTTLED: the silhouette re-render +
+                        // GPU readback is expensive (it churns the renderer's 4K MSAA
+                        // targets — measured ~8x FPS hit at 60Hz), and the region
+                        // changes slowly with the animation. ~4 Hz is plenty and keeps
+                        // the frame loop at refresh. Only meaningful with an app-owned
                         // window; a no-op otherwise.
-                        if (xr.usingAppWindow && haveSil) {
+                        static uint32_t s_clickFrame = 0;
+                        constexpr uint32_t kClickUpdateEveryN = 15; // ~4 Hz at 60 fps
+                        if (xr.usingAppWindow && haveSil && (s_clickFrame++ % kClickUpdateEveryN) == 0) {
                             ClickthroughUpdate(vkDevice, physDevice, graphicsQueue, queueFamilyIndex,
                                                g_modelRenderer, xr.xDisplay, xr.xWindow, xr.xWinW, xr.xWinH,
                                                silView, silProj);
