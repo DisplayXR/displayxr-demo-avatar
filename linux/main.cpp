@@ -696,9 +696,16 @@ int main(int argc, char** argv) {
             std::vector<XrView> views(viewCount, {XR_TYPE_VIEW});
             XrResult loc = xrLocateViews(xr.session, &locateInfo, &viewState, viewCount, &viewCount, views.data());
 
-            if (XR_SUCCEEDED(loc) &&
-                (viewState.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT) &&
-                (viewState.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT)) {
+            // DisplayXR supplies a valid display-relative view pose on the native-VK
+            // compositor path, but does not always set POSITION_VALID/ORIENTATION_VALID
+            // on that path (sim_display does; the Leia/native-VK weave path does not —
+            // the pose is display-relative, not head-tracked in the OpenXR sense). Apps
+            // that hard-gate on those flags (as this one used to) then submit an empty
+            // swapchain → nothing drawn. The working demos (modelviewer/gaussiansplat)
+            // render whenever xrLocateViews succeeds, so match them: use the pose the
+            // runtime returned. (runtime#757 hardware bring-up; flags-populated poses
+            // still render — the checks were the *only* gate that was skipping draws.)
+            if (XR_SUCCEEDED(loc)) {
                 XrSwapchainImageAcquireInfo acqInfo = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
                 uint32_t imageIndex = 0;
                 if (XR_SUCCEEDED(xrAcquireSwapchainImage(xr.swapchain.swapchain, &acqInfo, &imageIndex))) {
