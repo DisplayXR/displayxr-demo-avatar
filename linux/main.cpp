@@ -17,8 +17,9 @@
  * pixels compose through to the desktop — the transparent/click-through avatar
  * (the Lenovo use case). Falls back to hosted-NULL (graphics binding chained
  * straight in, runtime self-creates its window) when no X server / the extension
- * is absent (e.g. headless CI). Click-through (XShape input region from the
- * avatar silhouette) is the remaining WS6 piece. The macOS/Windows peers'
+ * is absent (e.g. headless CI). Click-through is wired via an XShape input region
+ * refreshed each frame from the avatar silhouette (clickthrough.cpp). The
+ * macOS/Windows peers'
  * speech-bubble window-space layer (XR_DXR_local_3d_zone /
  * XrCompositionLayerWindowSpaceDXR) is likewise deferred to Phase 3 — this
  * build-green vehicle submits only the base projection layer.
@@ -45,6 +46,8 @@
 // transparentBackgroundEnabled — the transparent/click-through overlay (the
 // Lenovo use case). Falls back to hosted-NULL when no X server is available.
 #include <openxr/XR_DXR_xlib_window_binding.h>
+
+#include "clickthrough.h" // XShape silhouette click-through for the overlay
 
 #include <cmath>
 #include <cstring>
@@ -211,7 +214,9 @@ struct AppXrSession {
     Display* xDisplay = nullptr;
     Window xWindow = 0;
     Colormap xColormap = 0;
-    bool hasXlibBinding = false; // XR_DXR_xlib_window_binding enabled on the instance
+    unsigned int xWinW = 0, xWinH = 0; // app window size (for the click-through region)
+    bool hasXlibBinding = false;       // XR_DXR_xlib_window_binding enabled on the instance
+    bool usingAppWindow = false;       // the xlib binding was actually handed to xrCreateSession
 };
 
 // Create a 32-bit ARGB X11 window for the transparent avatar overlay. Returns
@@ -262,6 +267,8 @@ static bool CreateAppWindow(AppXrSession& xr) {
     xr.xDisplay = dpy;
     xr.xWindow = win;
     xr.xColormap = cmap;
+    xr.xWinW = w;
+    xr.xWinH = h;
     LOG_INFO("Created %ux%u 32-bit ARGB app window for transparent overlay", w, h);
     return true;
 }
@@ -451,6 +458,7 @@ static bool CreateSession(AppXrSession& xr, VkInstance vkInstance, VkPhysicalDev
     xlibBinding.transparentBackgroundEnabled = XR_TRUE;
 
     const bool useAppWindow = xr.hasXlibBinding && xr.xDisplay != nullptr && xr.xWindow != 0;
+    xr.usingAppWindow = useAppWindow;
 
     XrSessionCreateInfo sessionInfo = {XR_TYPE_SESSION_CREATE_INFO};
     sessionInfo.next = useAppWindow ? (const void*)&xlibBinding : (const void*)&vkBinding;
@@ -701,6 +709,8 @@ int main(int argc, char** argv) {
                         uint32_t eyeCount = 2;
                         uint32_t eyeW = xr.viewWidth, eyeH = xr.viewHeight;
                         projViews.resize(eyeCount, {});
+                        float silView[16], silProj[16];
+                        bool haveSil = false;
                         for (uint32_t i = 0; i < eyeCount; i++) {
                             float viewMat[16], projMat[16];
                             mat4_view_from_xr_pose(viewMat, views[i].pose);
@@ -709,6 +719,11 @@ int main(int argc, char** argv) {
                                 float fitted[16];
                                 mat4_mul(fitted, viewMat, g_fitMat);
                                 memcpy(viewMat, fitted, sizeof(fitted));
+                            }
+                            if (i == 0) { // view 0 drives the click-through silhouette
+                                memcpy(silView, viewMat, sizeof(silView));
+                                memcpy(silProj, projMat, sizeof(silProj));
+                                haveSil = true;
                             }
                             // Draw the avatar into this eye's SBS viewport region.
                             g_modelRenderer.renderEye(
@@ -729,6 +744,15 @@ int main(int argc, char** argv) {
                         }
                         XrSwapchainImageReleaseInfo relInfo = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
                         xrReleaseSwapchainImage(xr.swapchain.swapchain, &relInfo);
+
+                        // Refresh the click-through input region from the avatar
+                        // silhouette (view 0). Only meaningful with an app-owned
+                        // window; a no-op otherwise.
+                        if (xr.usingAppWindow && haveSil) {
+                            ClickthroughUpdate(vkDevice, physDevice, graphicsQueue, queueFamilyIndex,
+                                               g_modelRenderer, xr.xDisplay, xr.xWindow, xr.xWinW, xr.xWinH,
+                                               silView, silProj);
+                        }
                     }
                 }
             }
@@ -757,6 +781,7 @@ int main(int argc, char** argv) {
     // + resource destroys on a dead VkDevice. Mirrors modelviewer.
     g_modelRenderer.cleanup();
     if (vkDevice) vkDeviceWaitIdle(vkDevice);
+    if (vkDevice) ClickthroughDestroy(vkDevice); // silhouette scratch + pool
     CleanupOpenXR(xr);
     if (vkDevice) vkDestroyDevice(vkDevice, nullptr);
     if (vkInstance) vkDestroyInstance(vkInstance, nullptr);
