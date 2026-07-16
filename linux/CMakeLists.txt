@@ -58,6 +58,8 @@ endif()
 
 add_executable(avatar_handle_vk_linux
     main.cpp
+    # XShape silhouette click-through for the transparent overlay (runtime#757).
+    clickthrough.cpp
     # stb_image (read) implementation TU: displayxr::common only ships a
     # macOS-gated impl, so Linux supplies its own (see the file).
     stb_image_impl.cpp
@@ -75,6 +77,7 @@ target_link_libraries(avatar_handle_vk_linux PRIVATE
     OpenXR::openxr_loader
     Vulkan::Vulkan
     ${X11_LIBRARIES}
+    ${X11_Xext_LIB}   # XShape — click-through input region
 )
 
 # Copy the OpenXR loader .so next to the exe when it's an imported target, so a
