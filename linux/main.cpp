@@ -147,49 +147,33 @@ static void mat4_view_from_xr_pose(float* m, const XrPosef& pose) {
     m[3]  = 0.0f; m[7]  = 0.0f; m[11] = 0.0f; m[15] = 1.0f;
 }
 
-// out = a * b (column-major, OpenGL layout — same convention as above).
-static void mat4_mul(float* out, const float* a, const float* b) {
-    for (int c = 0; c < 4; c++)
-        for (int r = 0; r < 4; r++)
-            out[c * 4 + r] = a[0 * 4 + r] * b[c * 4 + 0] + a[1 * 4 + r] * b[c * 4 + 1] +
-                             a[2 * 4 + r] * b[c * 4 + 2] + a[3 * 4 + r] * b[c * 4 + 3];
-}
 
-// Model-fit transform: world = s * (model - center). The runtime's plain XR
-// views are Kooima poses in METERS with the virtual display at the origin
-// (~0.19 m tall panel, viewer at ~0.45 m) — a human-scale FBX drawn raw fills
-// meters of world, which is why hardware validation saw only the lower legs
-// (avatar#21). macOS/Windows fix framing by growing their virtual-display rig
-// (ApplyAutoFitForLoadedScene); with plain views the equivalent is shrinking
-// the model into panel scale.
-static float g_fitMat[16];
+// Auto-fit — SIZE THE VIRTUAL DISPLAY TO THE MODEL (matches windows/macOS
+// ApplyAutoFitForLoadedScene). The model renders at its NATIVE scale; the display
+// view rig is placed at the model center with virtualDisplayHeight = model height
+// × comfort, so the avatar fills ~90% of the panel. No model scaling, no offsets —
+// the runtime rig + eye positions own the view pose.
+static constexpr float kFallbackVHeightM = 1.5f;         // degenerate-extent fallback (win/mac parity)
+static constexpr float kAutoFitVerticalComfort = 1.111f; // model fills 90% (5% headroom top/bottom)
+static float g_fitCenter[3] = {0.0f, 0.0f, 0.0f};        // rig pose position (model AABB center)
+static float g_fitVHeight = kFallbackVHeightM;           // rig virtualDisplayHeight (model height × comfort)
 static bool g_fitValid = false;
 
-// Avatar target height in app units (≈ meters). The display view rig's virtual
-// display is sized so the avatar fills ~80% of the panel — a framing choice, not
-// a magic offset; the runtime rig + eye positions drive the actual view pose.
-static constexpr float kAvatarFitHeightM = 0.15f;
-static constexpr float kVirtualDisplayHeightM = kAvatarFitHeightM / 0.8f;
-
-static void ComputeModelFit() {
+static void ComputeAutoFit() {
     float center[3], extent[3];
-    if (!g_modelRenderer.getRobustSceneBounds(0.05f, 0.95f, center, extent) || !(extent[1] > 1e-3f)) {
+    if (!g_modelRenderer.getRobustSceneBounds(0.05f, 0.95f, center, extent)) {
+        g_fitValid = false;
         return;
     }
-    // Scale the human-scale FBX into panel units and center it at the display
-    // plane (world origin). The view is owned by the display view rig now (camera
-    // at the eye, off-axis FOV), so NO manual pose/offset is needed — the model at
-    // the display plane renders in front of the rig's eye-distance camera.
-    const float s = kAvatarFitHeightM / extent[1];
-    for (int i = 0; i < 16; i++) g_fitMat[i] = 0.0f;
-    g_fitMat[0] = g_fitMat[5] = g_fitMat[10] = s;
-    g_fitMat[15] = 1.0f;
-    g_fitMat[12] = -s * center[0];
-    g_fitMat[13] = -s * center[1];
-    g_fitMat[14] = -s * center[2];
+    g_fitCenter[0] = center[0];
+    g_fitCenter[1] = center[1];
+    g_fitCenter[2] = center[2];
+    float vh = extent[1] * kAutoFitVerticalComfort;
+    if (!(vh > 1e-3f)) vh = kFallbackVHeightM; // degenerate (thin) extent
+    g_fitVHeight = vh;
     g_fitValid = true;
-    LOG_INFO("Auto-fit: center=(%.3f,%.3f,%.3f) extentY=%.3f -> scale=%.5f (target %.2f m)",
-             center[0], center[1], center[2], extent[1], s, kAvatarFitHeightM);
+    LOG_INFO("Auto-fit: center=(%.3f,%.3f,%.3f) extent=(%.3f,%.3f,%.3f) vHeight=%.3f",
+             center[0], center[1], center[2], extent[0], extent[1], extent[2], vh);
 }
 
 // ============================================================================
@@ -682,7 +666,7 @@ int main(int argc, char** argv) {
         g_modelRenderer.loadDebugModel();
     }
     g_modelRenderer.setPlainViewConvention(true);
-    ComputeModelFit();
+    ComputeAutoFit();
 
     LOG_INFO("=== Entering main loop (Ctrl+C to exit) ===");
     auto lastTime = std::chrono::high_resolution_clock::now();
@@ -720,8 +704,12 @@ int main(int argc, char** argv) {
             // every locate (per-locate semantics). Identity pose = display plane
             // at the locate origin.
             XrDisplayRigDXR displayRig = {XR_TYPE_DISPLAY_RIG_DXR};
-            displayRig.pose = {{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, 0.0f}};
-            displayRig.virtualDisplayHeight = kVirtualDisplayHeightM;
+            // Place the virtual display AT the model center, sized to the model
+            // (windows/macOS approach) — the model renders at native scale and
+            // the rig frames it. Identity orientation (forward = world -Z).
+            displayRig.pose.orientation = {0.0f, 0.0f, 0.0f, 1.0f};
+            displayRig.pose.position = {g_fitCenter[0], g_fitCenter[1], g_fitCenter[2]};
+            displayRig.virtualDisplayHeight = g_fitValid ? g_fitVHeight : kFallbackVHeightM;
             displayRig.ipdFactor = 1.0f;
             displayRig.parallaxFactor = 1.0f;
             displayRig.perspectiveFactor = 1.0f;
@@ -753,22 +741,20 @@ int main(int argc, char** argv) {
                         bool haveSil = false;
                         for (uint32_t i = 0; i < eyeCount; i++) {
                             float viewMat[16], projMat[16];
+                            // Render at native model scale — the rig (placed at the
+                            // model center, sized to the model) owns the framing. No
+                            // model-fit baked into the view.
                             mat4_view_from_xr_pose(viewMat, views[i].pose);
-                            // Foreground clip (well-defined, no magic numbers): the far
-                            // plane = the eye→display distance, so it coincides with the
-                            // virtual display plane. The rig returns the eye at the
-                            // rig-local z of the view pose (display plane = locate origin
-                            // → |pose.z|). The avatar renders in front of the display; the
-                            // desktop shows behind via compose-under-bg. Fall back to a far
-                            // plane if the rig is absent / z is degenerate.
-                            float ez = fabsf(views[i].pose.position.z);
+                            // Foreground clip (well-defined, no magic numbers): far =
+                            // eye→display distance, so the far plane coincides with the
+                            // virtual display plane (placed at the model center). ez =
+                            // the eye's z relative to the rig pose (identity orientation
+                            // → z difference). Avatar renders in front of the display;
+                            // desktop shows behind via compose-under-bg. Falls back to a
+                            // far plane if the rig is absent / z degenerate.
+                            float ez = fabsf(views[i].pose.position.z - g_fitCenter[2]);
                             float farZ = (ez > 0.02f) ? ez : 100.0f;
                             mat4_from_xr_fov(projMat, views[i].fov, 0.01f, farZ);
-                            if (g_fitValid) { // bake the model-fit into the view (MV = V * F)
-                                float fitted[16];
-                                mat4_mul(fitted, viewMat, g_fitMat);
-                                memcpy(viewMat, fitted, sizeof(fitted));
-                            }
                             if (i == 0) { // view 0 drives the click-through silhouette
                                 memcpy(silView, viewMat, sizeof(silView));
                                 memcpy(silProj, projMat, sizeof(silProj));
