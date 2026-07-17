@@ -3,6 +3,10 @@
 
 #include <winver.h>
 
+// Explorer/file icon — multi-size .ico generated from the 2D workspace
+// logo (displayxr/avatar_icon.png); the SBS 3D logo stays shell-only.
+1 ICON "displayxr/avatar_icon.ico"
+
 VS_VERSION_INFO VERSIONINFO
 FILEVERSION     1,0,0,0
 PRODUCTVERSION  1,0,0,0
