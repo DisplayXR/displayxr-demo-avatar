@@ -479,7 +479,7 @@ static bool GetVulkanDeviceExtensions(AppXrSession& xr, VkPhysicalDevice physDev
           start = end + 1;
       } }
 
-    // runtime#757 / leia#81 — the transparency desktop-capture producer in the
+    // runtime#757 / leia-plugin#81 — the transparency desktop-capture producer in the
     // Leia DP imports the live desktop as a dma-buf VkImage, which needs these
     // device extensions ENABLED on the app-owned VkDevice. We're an
     // XR_KHR_vulkan_enable (enable1) app, so WE own vkCreateDevice — the runtime
