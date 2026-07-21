@@ -51,6 +51,10 @@
 // math. This is how modelviewer/gauss/cube-handle frame correctly on the
 // native-VK path; the avatar consumes it the same way.
 #include <openxr/XR_DXR_view_rig.h>
+// Local 3D zone / Local2D composition layer — the flat 2D speech bubble in the
+// top 25% band, composited post-weave so the avatar keeps weaving in the bottom
+// 75%. Mirrors the macOS/Windows peers' speech-bubble layer.
+#include <openxr/XR_DXR_local_3d_zone.h>
 
 #include "clickthrough.h" // XShape silhouette click-through for the overlay
 
@@ -70,6 +74,10 @@
 
 #include "model_renderer.h"
 #include "model_loader.h"
+#include "model_vulkan_utils.h" // modelCreateBuffer / ModelBuffer (bubble staging)
+
+#include "stb_truetype.h"        // CPU text rasterizer for the speech bubble
+                                 // (impl defined in stb_truetype_impl.cpp)
 
 // ============================================================================
 // Logging
@@ -98,6 +106,35 @@
 
 static volatile bool g_running = true;
 static ModelRenderer g_modelRenderer;
+
+// stb_image_write (defined in stb_truetype_impl.cpp) — only used by the optional
+// DXR_DUMP_BUBBLE debug dump. STBIWDEF is `extern "C"` in C++, so the definition
+// linked from that TU matches this declaration.
+extern "C" int stbi_write_png(char const* filename, int w, int h, int comp,
+                              const void* data, int stride_in_bytes);
+
+// ============================================================================
+// Speech bubble — Local2D layer (XR_DXR_local_3d_zone)
+// ============================================================================
+// A flat 2D nameplate pill in the top 25% band, composited post-weave as a
+// Local2D layer so the avatar keeps weaving in the bottom 75%. The rounded panel
+// + word-wrapped greeting are CPU-rasterized (stb_truetype replaces the macOS
+// CoreText / Windows DirectWrite path), uploaded to an app-owned window-space
+// swapchain, then mapped sub-rect → full band. Mirrors macos/main.mm's
+// RenderBubbleBitmap + CreateBubbleSwapchain + the bubble submission block.
+static constexpr float kAvatarCanvasFrac = 0.75f;   // avatar = bottom 75%, bubble = top 25%
+static const uint32_t  kBubbleTexW = 2048;          // generous ~4:1 fixed texture
+static const uint32_t  kBubbleTexH = 512;
+static const char*     kBubbleText = "Hi there! I'm Leo, your friendly 3D desktop avatar.";
+
+static bool g_hasLocal3DZone = false;               // XR_DXR_local_3d_zone enabled on the instance
+
+static XrSwapchain g_bubbleSwapchain = XR_NULL_HANDLE;
+static int64_t     g_bubbleFormat = 0;
+static std::vector<XrSwapchainImageVulkanKHR> g_bubbleImages;
+static ModelBuffer g_bubbleStaging = {};            // host-visible RGBA8 upload buffer
+static void*       g_bubbleStagingMapped = nullptr;
+static bool        g_bubbleReady = false;           // swapchain + staging created
 
 // ============================================================================
 // Matrix helpers (column-major, m[col*4 + row]) — verbatim shape from the
@@ -295,16 +332,19 @@ static bool InitializeOpenXR(AppXrSession& xr) {
     bool hasVulkan = false;
     bool hasXlibBinding = false;
     bool hasViewRig = false;
+    bool hasLocal3DZone = false;
     for (const auto& ext : extensions) {
         if (strcmp(ext.extensionName, XR_KHR_VULKAN_ENABLE_EXTENSION_NAME) == 0) hasVulkan = true;
         if (strcmp(ext.extensionName, XR_DXR_XLIB_WINDOW_BINDING_EXTENSION_NAME) == 0) hasXlibBinding = true;
         if (strcmp(ext.extensionName, XR_DXR_VIEW_RIG_EXTENSION_NAME) == 0) hasViewRig = true;
+        if (strcmp(ext.extensionName, XR_DXR_LOCAL_3D_ZONE_EXTENSION_NAME) == 0) hasLocal3DZone = true;
     }
 
     LOG_INFO("XR_KHR_vulkan_enable: %s", hasVulkan ? "AVAILABLE" : "NOT FOUND");
     if (!hasVulkan) { LOG_ERROR("XR_KHR_vulkan_enable not available"); return false; }
     LOG_INFO("XR_DXR_xlib_window_binding: %s", hasXlibBinding ? "AVAILABLE" : "NOT FOUND");
     LOG_INFO("XR_DXR_view_rig: %s", hasViewRig ? "AVAILABLE" : "NOT FOUND");
+    LOG_INFO("XR_DXR_local_3d_zone: %s", hasLocal3DZone ? "AVAILABLE" : "NOT FOUND");
 
     std::vector<const char*> enabledExtensions;
     enabledExtensions.push_back(XR_KHR_VULKAN_ENABLE_EXTENSION_NAME);
@@ -319,6 +359,14 @@ static bool InitializeOpenXR(AppXrSession& xr) {
     if (hasViewRig) {
         enabledExtensions.push_back(XR_DXR_VIEW_RIG_EXTENSION_NAME);
         xr.hasViewRig = true;
+    }
+    // Enable the Local2D layer so the runtime composites the flat 2D speech
+    // bubble in the top 25% band (the runtime's software-composite path handles
+    // Local2D on Linux with no platform guard). Guarded everywhere on
+    // g_hasLocal3DZone so the app still runs if the runtime lacks it.
+    if (hasLocal3DZone) {
+        enabledExtensions.push_back(XR_DXR_LOCAL_3D_ZONE_EXTENSION_NAME);
+        g_hasLocal3DZone = true;
     }
 
     XrInstanceCreateInfo createInfo = {XR_TYPE_INSTANCE_CREATE_INFO};
@@ -639,6 +687,350 @@ static void CleanupOpenXR(AppXrSession& xr) {
 static void SignalHandler(int) { g_running = false; }
 
 // ============================================================================
+// Speech-bubble swapchain + CPU rasterizer (stb_truetype)
+// ============================================================================
+
+static bool CreateBubbleSwapchain(AppXrSession& xr, VkDevice dev, VkPhysicalDevice phys) {
+    uint32_t fc = 0;
+    xrEnumerateSwapchainFormats(xr.session, 0, &fc, nullptr);
+    std::vector<int64_t> fmts(fc);
+    if (fc) xrEnumerateSwapchainFormats(xr.session, fc, &fc, fmts.data());
+    // Prefer UNORM RGBA8 so the CPU-drawn sRGB bytes pass through with no hidden
+    // sRGB decode (same reason the atlas swapchain uses UNORM).
+    int64_t fmt = fmts.empty() ? (int64_t)VK_FORMAT_R8G8B8A8_UNORM : fmts[0];
+    for (int64_t f : fmts) {
+        if (f == VK_FORMAT_R8G8B8A8_UNORM) { fmt = f; break; }
+        if (f == VK_FORMAT_B8G8R8A8_UNORM) fmt = f;
+    }
+    g_bubbleFormat = fmt;
+
+    XrSwapchainCreateInfo ci = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
+    ci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT |
+                    XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
+    ci.format = fmt; ci.sampleCount = 1;
+    ci.width = kBubbleTexW; ci.height = kBubbleTexH;
+    ci.faceCount = 1; ci.arraySize = 1; ci.mipCount = 1;
+    if (XR_FAILED(xrCreateSwapchain(xr.session, &ci, &g_bubbleSwapchain))) {
+        LOG_WARN("Bubble swapchain create failed");
+        return false;
+    }
+    uint32_t ic = 0;
+    xrEnumerateSwapchainImages(g_bubbleSwapchain, 0, &ic, nullptr);
+    g_bubbleImages.assign(ic, {XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR});
+    xrEnumerateSwapchainImages(g_bubbleSwapchain, ic, &ic,
+        (XrSwapchainImageBaseHeader*)g_bubbleImages.data());
+
+    g_bubbleStaging = modelCreateBuffer(dev, phys, (VkDeviceSize)kBubbleTexW * kBubbleTexH * 4,
+        VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (g_bubbleStaging.buffer == VK_NULL_HANDLE) return false;
+    if (vkMapMemory(dev, g_bubbleStaging.memory, 0, (VkDeviceSize)kBubbleTexW * kBubbleTexH * 4,
+                    0, &g_bubbleStagingMapped) != VK_SUCCESS || !g_bubbleStagingMapped)
+        return false;
+    LOG_INFO("Bubble swapchain ready (%ux%u, %u images, format=%lld)",
+             kBubbleTexW, kBubbleTexH, ic, (long long)fmt);
+    return true;
+}
+
+// Load the first available system TTF (once). No CoreText/DirectWrite on Linux.
+static stbtt_fontinfo g_bubbleFont;
+static std::vector<unsigned char> g_bubbleFontData;
+static bool g_bubbleFontLoaded = false;
+
+static void LoadBubbleFont() {
+    static bool s_tried = false;
+    if (s_tried) return;
+    s_tried = true;
+    const char* kFontPaths[] = {
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+    };
+    for (const char* p : kFontPaths) {
+        FILE* f = fopen(p, "rb");
+        if (!f) continue;
+        fseek(f, 0, SEEK_END);
+        long len = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        if (len <= 0) { fclose(f); continue; }
+        g_bubbleFontData.resize((size_t)len);
+        bool ok = fread(g_bubbleFontData.data(), 1, (size_t)len, f) == (size_t)len;
+        fclose(f);
+        if (!ok) continue;
+        if (stbtt_InitFont(&g_bubbleFont, g_bubbleFontData.data(),
+                           stbtt_GetFontOffsetForIndex(g_bubbleFontData.data(), 0))) {
+            g_bubbleFontLoaded = true;
+            LOG_INFO("Bubble font: %s", p);
+            return;
+        }
+    }
+    LOG_WARN("Bubble: no system TTF found (tried DejaVu / Liberation) — drawing the "
+             "panel without text");
+}
+
+// Straight-alpha source width of an ASCII string at a given stbtt scale.
+static float BubbleTextWidth(float scale, const char* s) {
+    float w = 0.0f;
+    for (const char* p = s; *p; ++p) {
+        int adv = 0, lsb = 0;
+        stbtt_GetCodepointHMetrics(&g_bubbleFont, (unsigned char)*p, &adv, &lsb);
+        w += adv * scale;
+        if (p[1]) w += stbtt_GetCodepointKernAdvance(&g_bubbleFont, (unsigned char)*p,
+                                                     (unsigned char)p[1]) * scale;
+    }
+    return w;
+}
+
+// Greedy word-wrap `text` to `maxW` at `scale`; returns the wrapped lines.
+static std::vector<std::string> BubbleWrap(const char* text, float scale, float maxW) {
+    std::vector<std::string> lines;
+    std::string cur, word;
+    for (const char* p = text;; ++p) {
+        if (*p != ' ' && *p != '\0') { word.push_back(*p); continue; }
+        if (!word.empty()) {
+            std::string trial = cur.empty() ? word : cur + " " + word;
+            if (cur.empty() || BubbleTextWidth(scale, trial.c_str()) <= maxW) {
+                cur.swap(trial);
+            } else {
+                lines.push_back(cur);
+                cur = word;
+            }
+            word.clear();
+        }
+        if (*p == '\0') break;
+    }
+    if (!cur.empty()) lines.push_back(cur);
+    return lines;
+}
+
+// Premultiplied source-over of a straight-alpha source (sr,sg,sb in [0,1],
+// sa in [0,1]) into an RGBA8 destination texel.
+static inline void BubbleBlend(unsigned char* d, float sr, float sg, float sb, float sa) {
+    if (sa <= 0.0f) return;
+    const float dr = d[0] / 255.0f, dg = d[1] / 255.0f, db = d[2] / 255.0f, da = d[3] / 255.0f;
+    const float ia = 1.0f - sa;
+    // Source premultiplied = s*sa; source-over in premultiplied space.
+    const float orr = sr * sa + dr * ia;
+    const float ogg = sg * sa + dg * ia;
+    const float obb = sb * sa + db * ia;
+    const float oaa = sa + da * ia;
+    d[0] = (unsigned char)(orr * 255.0f + 0.5f);
+    d[1] = (unsigned char)(ogg * 255.0f + 0.5f);
+    d[2] = (unsigned char)(obb * 255.0f + 0.5f);
+    d[3] = (unsigned char)(oaa * 255.0f + 0.5f);
+}
+
+// Signed distance to a rounded rect (centered box); negative inside.
+static float BubbleRoundedRectDist(float px, float py, float cx, float cy,
+                                   float hw, float hh, float r) {
+    const float qx = std::fabs(px - cx) - (hw - r);
+    const float qy = std::fabs(py - cy) - (hh - r);
+    const float ax = qx > 0.0f ? qx : 0.0f;
+    const float ay = qy > 0.0f ? qy : 0.0f;
+    const float outside = std::sqrt(ax * ax + ay * ay);
+    const float mx = qx > qy ? qx : qy;
+    const float inside = mx < 0.0f ? mx : 0.0f;
+    return outside + inside - r;
+}
+
+// Draw the rounded glassy pill + centred, word-wrapped, size-fitted greeting
+// into the top-left subW×subH of a kBubbleTexW×kBubbleTexH RGBA8 buffer
+// (PREMULTIPLIED, row 0 = top); the rest is left transparent. Returns the buffer
+// (static, cached by size). Replaces macos/main.mm RenderBubbleBitmap (CoreText).
+static const uint8_t* RenderBubbleBitmap(uint32_t subW, uint32_t subH) {
+    static std::vector<uint8_t> buf;
+    static uint32_t s_lastW = 0, s_lastH = 0;
+    // The greeting is static — only redraw when the band sub-rect changes size.
+    if (!buf.empty() && subW == s_lastW && subH == s_lastH) return buf.data();
+    s_lastW = subW; s_lastH = subH;
+    buf.assign((size_t)kBubbleTexW * kBubbleTexH * 4, 0); // fully transparent
+    if (subW < 2 || subH < 2) return buf.data();
+
+    LoadBubbleFont();
+
+    auto texel = [&](uint32_t x, uint32_t y) -> unsigned char* {
+        return &buf[((size_t)y * kBubbleTexW + x) * 4];
+    };
+
+    // Near-edge-to-edge panel (small margin for the rounded corners + desktop to
+    // peek through them). Same dark glassy colour as macOS: sRGB(0.05,0.05,0.09),
+    // alpha 0.64.
+    const float mX = subW * 0.010f, mY = subH * 0.020f;
+    const float panelX = mX, panelY = mY;
+    const float panelW = (float)subW - 2.0f * mX, panelH = (float)subH - 2.0f * mY;
+    const float cx = panelX + panelW * 0.5f, cy = panelY + panelH * 0.5f;
+    const float hw = panelW * 0.5f, hh = panelH * 0.5f;
+    const float radius = panelH * 0.16f;
+    const float kPanelR = 0.05f, kPanelG = 0.05f, kPanelB = 0.09f, kPanelA = 0.64f;
+
+    const uint32_t x1 = subW < kBubbleTexW ? subW : kBubbleTexW;
+    const uint32_t y1 = subH < kBubbleTexH ? subH : kBubbleTexH;
+    for (uint32_t y = 0; y < y1; ++y) {
+        for (uint32_t x = 0; x < x1; ++x) {
+            const float d = BubbleRoundedRectDist((float)x + 0.5f, (float)y + 0.5f,
+                                                  cx, cy, hw, hh, radius);
+            // 1px antialiased coverage at the edge; solid interior.
+            const float cov = d < -1.0f ? 1.0f : (d < 0.0f ? -d : 0.0f);
+            if (cov <= 0.0f) continue;
+            BubbleBlend(texel(x, y), kPanelR, kPanelG, kPanelB, kPanelA * cov);
+        }
+    }
+
+    // Text (white), centred + word-wrapped + coarse size-fit into the panel
+    // interior. If no font opened, the panel ships without text (never crash).
+    if (g_bubbleFontLoaded) {
+        const float padX = panelW * 0.06f, padY = panelH * 0.16f;
+        const float textX = panelX + padX, textY = panelY + padY;
+        const float textW = panelW - 2.0f * padX, textH = panelH - 2.0f * padY;
+        if (textW > 2.0f && textH > 2.0f) {
+            // Largest font (coarse geometric search) whose wrapped greeting fits.
+            float bestPx = 8.0f;
+            std::vector<std::string> bestLines;
+            for (float fs = textH; fs >= 8.0f; fs *= 0.92f) {
+                const float scale = stbtt_ScaleForPixelHeight(&g_bubbleFont, fs);
+                std::vector<std::string> lines = BubbleWrap(kBubbleText, scale, textW);
+                const float lineH = fs * 1.25f;
+                const float blockH = lineH * (float)lines.size();
+                bool widthOK = true;
+                for (const auto& ln : lines)
+                    if (BubbleTextWidth(scale, ln.c_str()) > textW) { widthOK = false; break; }
+                if (widthOK && blockH <= textH) { bestPx = fs; bestLines.swap(lines); break; }
+            }
+            if (bestLines.empty())
+                bestLines = BubbleWrap(kBubbleText, stbtt_ScaleForPixelHeight(&g_bubbleFont, bestPx), textW);
+
+            const float scale = stbtt_ScaleForPixelHeight(&g_bubbleFont, bestPx);
+            int ascent = 0, descent = 0, lineGap = 0;
+            stbtt_GetFontVMetrics(&g_bubbleFont, &ascent, &descent, &lineGap);
+            const float lineH = bestPx * 1.25f;
+            const float blockH = lineH * (float)bestLines.size();
+            // Vertically centre the block; first baseline one ascent below its top.
+            float lineTop = textY + (textH - blockH) * 0.5f;
+            for (const auto& ln : bestLines) {
+                const float lw = BubbleTextWidth(scale, ln.c_str());
+                float penX = textX + (textW - lw) * 0.5f;
+                const float baseline = lineTop + ascent * scale;
+                for (const char* p = ln.c_str(); *p; ++p) {
+                    int gx0, gy0, gx1, gy1;
+                    stbtt_GetCodepointBitmapBox(&g_bubbleFont, (unsigned char)*p, scale, scale,
+                                                &gx0, &gy0, &gx1, &gy1);
+                    const int gw = gx1 - gx0, gh = gy1 - gy0;
+                    if (gw > 0 && gh > 0) {
+                        std::vector<unsigned char> gb((size_t)gw * gh);
+                        stbtt_MakeCodepointBitmap(&g_bubbleFont, gb.data(), gw, gh, gw,
+                                                  scale, scale, (unsigned char)*p);
+                        const int dx0 = (int)(penX + 0.5f) + gx0;
+                        const int dy0 = (int)(baseline + 0.5f) + gy0;
+                        for (int yy = 0; yy < gh; ++yy) {
+                            const int ty = dy0 + yy;
+                            if (ty < 0 || ty >= (int)kBubbleTexH) continue;
+                            for (int xx = 0; xx < gw; ++xx) {
+                                const int tx = dx0 + xx;
+                                if (tx < 0 || tx >= (int)kBubbleTexW) continue;
+                                const float covT = gb[(size_t)yy * gw + xx] / 255.0f;
+                                if (covT <= 0.0f) continue;
+                                BubbleBlend(texel((uint32_t)tx, (uint32_t)ty),
+                                            1.0f, 1.0f, 1.0f, covT);
+                            }
+                        }
+                    }
+                    int adv = 0, lsb = 0;
+                    stbtt_GetCodepointHMetrics(&g_bubbleFont, (unsigned char)*p, &adv, &lsb);
+                    penX += adv * scale;
+                    if (p[1]) penX += stbtt_GetCodepointKernAdvance(&g_bubbleFont,
+                                        (unsigned char)*p, (unsigned char)p[1]) * scale;
+                }
+                lineTop += lineH;
+            }
+        }
+    }
+
+    // Debug: DXR_DUMP_BUBBLE → /tmp/avatar_bubble.png (once) to eyeball layout.
+    static const bool s_dump = (getenv("DXR_DUMP_BUBBLE") != nullptr);
+    static bool s_dumped = false;
+    if (s_dump && !s_dumped) {
+        s_dumped = true;
+        stbi_write_png("/tmp/avatar_bubble.png", (int)subW, (int)subH, 4, buf.data(),
+                       (int)(kBubbleTexW * 4));
+    }
+    return buf.data();
+}
+
+// Rasterize the bubble, acquire the window-space swapchain image, upload the
+// staging buffer into it, and fill `outLayer` (the panel sub-rect mapped onto
+// the full top-25% band). Returns true when the layer is ready to submit.
+static bool BuildBubbleLayer(VkDevice dev, VkQueue queue, VkCommandPool pool,
+                             uint32_t subW, uint32_t subH, int bandW, int bandH,
+                             XrCompositionLayerLocal2DDXR& outLayer) {
+    const uint8_t* px = RenderBubbleBitmap(subW, subH);
+    if (!px) return false;
+
+    XrSwapchainImageAcquireInfo bai = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+    uint32_t idx = 0;
+    if (XR_FAILED(xrAcquireSwapchainImage(g_bubbleSwapchain, &bai, &idx))) return false;
+    XrSwapchainImageWaitInfo bwi = {XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+    bwi.timeout = XR_INFINITE_DURATION;
+    if (XR_FAILED(xrWaitSwapchainImage(g_bubbleSwapchain, &bwi))) return false;
+
+    memcpy(g_bubbleStagingMapped, px, (size_t)kBubbleTexW * kBubbleTexH * 4);
+
+    VkCommandBufferAllocateInfo cai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    cai.commandPool = pool;
+    cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cai.commandBufferCount = 1;
+    VkCommandBuffer cb = VK_NULL_HANDLE;
+    if (vkAllocateCommandBuffers(dev, &cai, &cb) != VK_SUCCESS) {
+        XrSwapchainImageReleaseInfo bri = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+        xrReleaseSwapchainImage(g_bubbleSwapchain, &bri);
+        return false;
+    }
+    VkCommandBufferBeginInfo bgi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bgi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cb, &bgi);
+    VkImage img = g_bubbleImages[idx].image;
+    VkImageMemoryBarrier bar = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    bar.srcAccessMask = 0; bar.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    bar.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED; bar.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    bar.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED; bar.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    bar.image = img; bar.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         0, 0, nullptr, 0, nullptr, 1, &bar);
+    VkBufferImageCopy rg = {};
+    rg.bufferRowLength = kBubbleTexW;
+    rg.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    rg.imageOffset = {0, 0, 0};
+    rg.imageExtent = {kBubbleTexW, kBubbleTexH, 1};
+    vkCmdCopyBufferToImage(cb, g_bubbleStaging.buffer, img,
+                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &rg);
+    bar.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; bar.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    bar.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; bar.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                         0, 0, nullptr, 0, nullptr, 1, &bar);
+    vkEndCommandBuffer(cb);
+    VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.commandBufferCount = 1; si.pCommandBuffers = &cb;
+    vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE);
+    vkQueueWaitIdle(queue);
+    vkFreeCommandBuffers(dev, pool, 1, &cb);
+
+    XrSwapchainImageReleaseInfo bri = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+    xrReleaseSwapchainImage(g_bubbleSwapchain, &bri);
+
+    // Visible bubble = the panel sub-rect mapped onto the FULL top-25% band. The
+    // Local2D layer's implicit M=0 mask over `rect` flattens that band to 2D so
+    // the avatar stops weaving there; the panel fills it with the rounded pill.
+    outLayer.type = (XrStructureType)XR_TYPE_COMPOSITION_LAYER_LOCAL_2D_DXR;
+    outLayer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+    outLayer.subImage.swapchain = g_bubbleSwapchain;
+    outLayer.subImage.imageRect.offset = {0, 0};
+    outLayer.subImage.imageRect.extent = {(int32_t)subW, (int32_t)subH};
+    outLayer.subImage.imageArrayIndex = 0;
+    outLayer.rect.offset = {0, 0};
+    outLayer.rect.extent = {bandW, bandH};
+    return true;
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 int main(int argc, char** argv) {
@@ -726,6 +1118,27 @@ int main(int argc, char** argv) {
     }
     g_modelRenderer.setPlainViewConvention(true);
     ComputeAutoFit();
+
+    // Speech-bubble window-space swapchain (Local2D layer) — only when the
+    // runtime advertises XR_DXR_local_3d_zone. A dedicated transient-reset command
+    // pool feeds the per-frame staging→image upload. Guarded so the app still runs
+    // (bubble simply absent) if the extension / swapchain / font is unavailable.
+    VkCommandPool bubbleCmdPool = VK_NULL_HANDLE;
+    if (g_hasLocal3DZone) {
+        g_bubbleReady = CreateBubbleSwapchain(xr, vkDevice, physDevice);
+        if (g_bubbleReady) {
+            VkCommandPoolCreateInfo pci = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+            pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+            pci.queueFamilyIndex = queueFamilyIndex;
+            if (vkCreateCommandPool(vkDevice, &pci, nullptr, &bubbleCmdPool) != VK_SUCCESS) {
+                LOG_WARN("Bubble command pool create failed — no speech bubble");
+                bubbleCmdPool = VK_NULL_HANDLE;
+                g_bubbleReady = false;
+            }
+        }
+    } else {
+        LOG_WARN("XR_DXR_local_3d_zone unavailable — no speech bubble");
+    }
 
     LOG_INFO("=== Entering main loop (Ctrl+C to exit) ===");
     auto lastTime = std::chrono::high_resolution_clock::now();
@@ -877,15 +1290,59 @@ int main(int argc, char** argv) {
 
         XrFrameEndInfo endInfo = {XR_TYPE_FRAME_END_INFO};
         endInfo.displayTime = frameState.predictedDisplayTime;
+        // Keep the existing blend mode as-is (the runtime keys the transparent
+        // overlay off the xlib binding's transparentBackgroundEnabled flag, not
+        // this mode) — out of scope for the bubble port.
         endInfo.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
         XrCompositionLayerProjection projLayer = {XR_TYPE_COMPOSITION_LAYER_PROJECTION};
-        const XrCompositionLayerBaseHeader* layers[1];
+        XrCompositionLayerLocal2DDXR bubbleLayer = {(XrStructureType)XR_TYPE_COMPOSITION_LAYER_LOCAL_2D_DXR};
+        const XrCompositionLayerBaseHeader* layers[2];
+        uint32_t layerN = 0;
         if (rendered) {
             projLayer.space = xr.localSpace;
             projLayer.viewCount = (uint32_t)projViews.size();
             projLayer.views = projViews.data();
-            layers[0] = (XrCompositionLayerBaseHeader*)&projLayer;
-            endInfo.layerCount = 1;
+            layers[layerN++] = (XrCompositionLayerBaseHeader*)&projLayer;
+
+            // ── Speech bubble: a flat 2D nameplate pill in the top ~25% band,
+            //    submitted as a single Local2D layer. The panel is drawn into the
+            //    LARGEST band-aspect sub-rect of the fixed bubble texture, then
+            //    mapped onto the full band — equal scale on both axes so corners
+            //    stay round and text unstretched on any resize (same fit math as
+            //    windows/main.cpp:1887-1900). ──
+            if (g_bubbleReady && g_hasLocal3DZone && bubbleCmdPool != VK_NULL_HANDLE) {
+                // Client-window pixel dims for the band rect. On the app-owned
+                // path the runtime repositions/resizes the overlay onto the target
+                // panel, so query the ACTUAL geometry (xr.xWinW/xWinH hold the
+                // stale creation size); fall back to the creation size, then the
+                // per-view dims for the hosted-NULL path.
+                unsigned int winW = xr.xWinW, winH = xr.xWinH;
+                if (xr.usingAppWindow && xr.xDisplay != nullptr && xr.xWindow != 0) {
+                    Window gRoot; int gx, gy; unsigned int gw, gh, gbw, gd;
+                    if (XGetGeometry(xr.xDisplay, xr.xWindow, &gRoot, &gx, &gy,
+                                     &gw, &gh, &gbw, &gd) && gw > 0 && gh > 0) {
+                        winW = gw; winH = gh;
+                    }
+                }
+                if (winW == 0 || winH == 0) { winW = xr.viewWidth; winH = xr.viewHeight; }
+
+                const int bandH = (winH > 0) ? (int)((float)winH * (1.0f - kAvatarCanvasFrac)) : 1;
+                const int bandW = (int)winW;
+                const float bandAR = (float)bandW / (float)(bandH > 0 ? bandH : 1);
+                const float texAR = (float)kBubbleTexW / (float)kBubbleTexH;
+                uint32_t subW, subH;
+                if (bandAR >= texAR) { subW = kBubbleTexW; subH = (uint32_t)((float)kBubbleTexW / bandAR + 0.5f); }
+                else                 { subH = kBubbleTexH; subW = (uint32_t)((float)kBubbleTexH * bandAR + 0.5f); }
+                if (subW < 2) subW = 2; else if (subW > kBubbleTexW) subW = kBubbleTexW;
+                if (subH < 2) subH = 2; else if (subH > kBubbleTexH) subH = kBubbleTexH;
+
+                if (BuildBubbleLayer(vkDevice, graphicsQueue, bubbleCmdPool,
+                                     subW, subH, bandW, bandH, bubbleLayer)) {
+                    layers[layerN++] = (XrCompositionLayerBaseHeader*)&bubbleLayer;
+                }
+            }
+
+            endInfo.layerCount = layerN;
             endInfo.layers = layers;
         }
         xrEndFrame(xr.session, &endInfo);
@@ -899,6 +1356,14 @@ int main(int argc, char** argv) {
     g_modelRenderer.cleanup();
     if (vkDevice) vkDeviceWaitIdle(vkDevice);
     if (vkDevice) ClickthroughDestroy(vkDevice); // silhouette scratch + pool
+    // Speech-bubble teardown (before the swapchains/session go in CleanupOpenXR).
+    if (vkDevice && bubbleCmdPool != VK_NULL_HANDLE)
+        vkDestroyCommandPool(vkDevice, bubbleCmdPool, nullptr);
+    if (g_bubbleSwapchain != XR_NULL_HANDLE) { xrDestroySwapchain(g_bubbleSwapchain); g_bubbleSwapchain = XR_NULL_HANDLE; }
+    if (vkDevice && g_bubbleStaging.buffer != VK_NULL_HANDLE) {
+        if (g_bubbleStagingMapped) { vkUnmapMemory(vkDevice, g_bubbleStaging.memory); g_bubbleStagingMapped = nullptr; }
+        modelDestroyBuffer(vkDevice, g_bubbleStaging);
+    }
     CleanupOpenXR(xr);
     if (vkDevice) vkDestroyDevice(vkDevice, nullptr);
     if (vkInstance) vkDestroyInstance(vkInstance, nullptr);
