@@ -23,6 +23,13 @@ endif()
 find_package(Vulkan REQUIRED)
 message(STATUS "Found Vulkan: ${Vulkan_LIBRARY}")
 
+# Xlib for the app-owned transparent ARGB window (XR_DXR_xlib_window_binding).
+# libx11-dev is already a CI dep; the window path falls back to hosted-NULL at
+# runtime when no X server is present (e.g. headless CI), so this only adds a
+# link-time dependency, not a runtime one.
+find_package(X11 REQUIRED)
+message(STATUS "Found X11: ${X11_X11_LIB}")
+
 # OpenXR loader — CMake package (e.g. from a from-source /tmp/openxr-install via
 # CMAKE_PREFIX_PATH) → system library → hard error.
 set(OPENXR_FOUND FALSE)
@@ -49,17 +56,33 @@ if(NOT OPENXR_FOUND)
                         "-DCMAKE_PREFIX_PATH=<install> (see scripts/build_linux.sh).")
 endif()
 
+# ── stb (stb_truetype.h for the speech-bubble text bake; header-only) ─────
+# displayxr::common ships stb_image{,_write}.h but NOT stb_truetype.h, and there
+# is no CoreText / DirectWrite on Linux — the bubble text is CPU-rasterized with
+# stb_truetype. Mirrors the Android leg's FetchContent (android/src/main/cpp).
+include(FetchContent)
+FetchContent_Declare(stb
+    GIT_REPOSITORY https://github.com/nothings/stb.git
+    GIT_TAG        master)
+FetchContent_MakeAvailable(stb)
+
 add_executable(avatar_handle_vk_linux
     main.cpp
+    # XShape silhouette click-through for the transparent overlay (runtime#757).
+    clickthrough.cpp
     # stb_image (read) implementation TU: displayxr::common only ships a
     # macOS-gated impl, so Linux supplies its own (see the file).
     stb_image_impl.cpp
+    # stb_truetype + stb_image_write implementation TU for the speech bubble
+    # (Local2D layer text bake + optional debug dump). See the file.
+    stb_truetype_impl.cpp
 )
 
 target_include_directories(avatar_handle_vk_linux PRIVATE
     ${CMAKE_SOURCE_DIR}/openxr_includes
     ${CMAKE_SOURCE_DIR}/common
     ${CMAKE_SOURCE_DIR}/model_common
+    ${stb_SOURCE_DIR}                 # stb_truetype.h (bubble text rasterizer)
 )
 
 target_link_libraries(avatar_handle_vk_linux PRIVATE
@@ -67,6 +90,8 @@ target_link_libraries(avatar_handle_vk_linux PRIVATE
     model_renderer
     OpenXR::openxr_loader
     Vulkan::Vulkan
+    ${X11_LIBRARIES}
+    ${X11_Xext_LIB}   # XShape — click-through input region
 )
 
 # Copy the OpenXR loader .so next to the exe when it's an imported target, so a
