@@ -56,6 +56,16 @@ if(NOT OPENXR_FOUND)
                         "-DCMAKE_PREFIX_PATH=<install> (see scripts/build_linux.sh).")
 endif()
 
+# ── stb (stb_truetype.h for the speech-bubble text bake; header-only) ─────
+# displayxr::common ships stb_image{,_write}.h but NOT stb_truetype.h, and there
+# is no CoreText / DirectWrite on Linux — the bubble text is CPU-rasterized with
+# stb_truetype. Mirrors the Android leg's FetchContent (android/src/main/cpp).
+include(FetchContent)
+FetchContent_Declare(stb
+    GIT_REPOSITORY https://github.com/nothings/stb.git
+    GIT_TAG        master)
+FetchContent_MakeAvailable(stb)
+
 add_executable(avatar_handle_vk_linux
     main.cpp
     # XShape silhouette click-through for the transparent overlay (runtime#757).
@@ -63,12 +73,16 @@ add_executable(avatar_handle_vk_linux
     # stb_image (read) implementation TU: displayxr::common only ships a
     # macOS-gated impl, so Linux supplies its own (see the file).
     stb_image_impl.cpp
+    # stb_truetype + stb_image_write implementation TU for the speech bubble
+    # (Local2D layer text bake + optional debug dump). See the file.
+    stb_truetype_impl.cpp
 )
 
 target_include_directories(avatar_handle_vk_linux PRIVATE
     ${CMAKE_SOURCE_DIR}/openxr_includes
     ${CMAKE_SOURCE_DIR}/common
     ${CMAKE_SOURCE_DIR}/model_common
+    ${stb_SOURCE_DIR}                 # stb_truetype.h (bubble text rasterizer)
 )
 
 target_link_libraries(avatar_handle_vk_linux PRIVATE
