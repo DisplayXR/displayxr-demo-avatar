@@ -27,6 +27,14 @@ on:
       - 'linux'
       - 'linux-**'
       - 'feature/linux-**'
+    # Release tags: the Deb job attaches the demo .deb to the GitHub Release
+    # (the Linux meta-bundle fetches it — runtime #781 Phase 3).
+    tags:
+      - 'v*'
+
+# The Deb job attaches release assets on tags.
+permissions:
+  contents: write
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -130,3 +138,55 @@ jobs:
             echo "::error::Vulkan was not found via find_package — the model renderer cannot build"; exit 1; }
           test -x build/linux/avatar_handle_vk_linux || {
             echo "::error::avatar_handle_vk_linux was not produced"; exit 1; }
+
+  # Build the demo .deb and, on a v* tag, attach it to the GitHub Release — the
+  # asset the Linux meta-bundle fetches (runtime #781 Phase 3). Runs on every PR
+  # too (build-only) so a broken package_deb_linux.sh is caught before release.
+  # Single base (24.04) on a VM, not the tri-LTS matrix — one artifact.
+  Deb:
+    needs: DetectChanges
+    runs-on: ubuntu-latest
+    steps:
+      - name: Docs-only short-circuit
+        if: needs.DetectChanges.outputs.docs_only == 'true'
+        run: echo "Doc-only change — skipping .deb build."
+
+      - uses: actions/checkout@v5
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        with:
+          fetch-depth: 0 # git describe needs tags for the .deb version
+
+      - name: Install dependencies
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential cmake ninja-build pkg-config git ca-certificates curl \
+            libvulkan-dev vulkan-validationlayers glslang-tools \
+            libx11-dev libxext-dev libxcb1-dev libx11-xcb-dev \
+            libwayland-dev libasound2-dev \
+            libxxf86vm-dev libxcb-glx0-dev \
+            libxrandr-dev \
+            dpkg-dev fakeroot
+
+      - name: Build + package the demo .deb
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          ./scripts/package_deb_linux.sh
+          ls -lh dist/*.deb
+
+      - name: Upload .deb artifact
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: displayxr-avatar-deb
+          path: dist/*.deb
+          if-no-files-found: error
+
+      - name: Attach .deb to the GitHub Release (tags only)
+        if: needs.DetectChanges.outputs.docs_only != 'true' && startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.deb
+          fail_on_unmatched_files: true
