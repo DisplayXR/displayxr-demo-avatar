@@ -112,7 +112,8 @@ jobs:
             libvulkan-dev vulkan-validationlayers glslang-tools \
             libx11-dev libxext-dev libxcb1-dev libx11-xcb-dev \
             libwayland-dev libasound2-dev \
-            libxxf86vm-dev libxcb-glx0-dev
+            libxxf86vm-dev libxcb-glx0-dev \
+            libxrandr-dev
 
       - name: Build (build-green; app is not run — no display on CI)
         if: needs.DetectChanges.outputs.docs_only != 'true'
