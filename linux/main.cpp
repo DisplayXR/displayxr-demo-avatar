@@ -37,6 +37,9 @@
 // the app-owned-window path below.
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
+// Xrandr: query the panel (primary / largest non-eDP output) rect so the
+// portrait window opens centered on the 3D display, not the laptop panel.
+#include <X11/extensions/Xrandr.h>
 
 #define XR_USE_GRAPHICS_API_VULKAN
 #include <openxr/openxr.h>
@@ -46,6 +49,13 @@
 // transparentBackgroundEnabled — the transparent/click-through overlay (the
 // Lenovo use case). Falls back to hosted-NULL when no X server is available.
 #include <openxr/XR_DXR_xlib_window_binding.h>
+// Adaptive tiling: XR_DXR_display_info gives the physical panel dims + the
+// per-view recommended scale (recommendedViewScaleX/Y). Enabling it ALSO
+// switches the runtime off the legacy-app compromise view-scale path (the
+// "app did not enable XR_DXR_display_info → compromise view scale" WARN) — so
+// the compositor tiles window×scaleXY (window-relative Kooima), exactly like
+// cube_handle_vk_linux. This is what makes the avatar a proper EXTENSION app.
+#include <openxr/XR_DXR_display_info.h>
 // Display-centric view rig: the runtime returns render-ready XrView{pose,fov}
 // (camera at the eye, off-axis Kooima FOV) so the app doesn't hand-roll the view
 // math. This is how modelviewer/gauss/cube-handle frame correctly on the
@@ -55,11 +65,19 @@
 // top 25% band, composited post-weave so the avatar keeps weaving in the bottom
 // 75%. Mirrors the macOS/Windows peers' speech-bubble layer.
 #include <openxr/XR_DXR_local_3d_zone.h>
+// Display zones (ADR-027): the tiger-zone. The 3D avatar renders rig-framed INTO
+// one bottom-75% zone rect (no squish, 3D content kept out of the top band); the
+// speech bubble is the Local2D layer in the top 25%. XrDisplayZoneDXR is chained
+// on xrLocateViews + the projection layer; caps + per-zone view size come from
+// xrGetDisplayZone{Capabilities,RecommendedViewSize}DXR. Same sequence as
+// windows/main.cpp + the proven cube_zones_vk_linux reference.
+#include <openxr/XR_DXR_display_zones.h>
 
 #include "clickthrough.h" // XShape silhouette click-through for the overlay
 
 #include <cmath>
 #include <cstring>
+#include <strings.h>   // strncasecmp — eDP output-name filter in GetPanelRect
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>
@@ -75,6 +93,13 @@
 #include "model_renderer.h"
 #include "model_loader.h"
 #include "model_vulkan_utils.h" // modelCreateBuffer / ModelBuffer (bubble staging)
+
+// displayxr-common (via sr_common_base → displayxr::common): remap
+// GL-convention clip-depth ([-1,1]) to Vulkan's [0,1]. mat4_from_xr_fov emits
+// GL depth; without this remap, geometry nearer than the mid-range crossover is
+// near-clipped in Vulkan (the ZDP-anchored near sits close to the content).
+// Header-only static inline — same include the win/mac peers + cube_handle use.
+#include "projection_depth.h"
 
 #include "stb_truetype.h"        // CPU text rasterizer for the speech bubble
                                  // (impl defined in stb_truetype_impl.cpp)
@@ -135,6 +160,34 @@ static std::vector<XrSwapchainImageVulkanKHR> g_bubbleImages;
 static ModelBuffer g_bubbleStaging = {};            // host-visible RGBA8 upload buffer
 static void*       g_bubbleStagingMapped = nullptr;
 static bool        g_bubbleReady = false;           // swapchain + staging created
+
+// ============================================================================
+// Tiger-zone — XR_DXR_display_zones (ADR-027)
+// ============================================================================
+// The 3D avatar renders rig-framed INTO one bottom-75% display-zone rect (so it
+// stops squishing and 3D content stays out of the top band); the speech bubble
+// is the Local2D layer in the top 25%. Enabled only when the runtime advertises
+// XR_DXR_display_zones + caps.supported (else the app falls back to the full-tile
+// + Local2D path). Mirrors windows/main.cpp + cube_zones_vk_linux.
+static bool g_hasDisplayZones = false;   // ext enabled + prereqs (view_rig + local_3d_zone)
+static bool g_zonesActive = false;       // caps.supported + zone swapchain created
+static bool g_zonesAttempted = false;    // one-shot activation guard
+static PFN_xrGetDisplayZoneCapabilitiesDXR      g_pfnGetZoneCaps = nullptr;
+static PFN_xrGetDisplayZoneRecommendedViewSizeDXR g_pfnGetZoneViewSize = nullptr;
+static XrSwapchain g_zoneSwapchain = XR_NULL_HANDLE;   // pre-sized to the atlas envelope
+static std::vector<XrSwapchainImageVulkanKHR> g_zoneImages;
+static uint32_t g_zoneSwW = 0, g_zoneSwH = 0;
+
+// DXR_ZONES_VALIDATE=1 chains the strict locate/submit pairing validate bit on
+// xrEndFrame (bring-up diagnostics). Default: nothing chained = AUTO wish
+// (feathered bottom-75%), matching windows/main.cpp + cube_zones_vk_linux.
+static bool AvatarZonesValidate() {
+    static const bool e = []() {
+        const char* v = getenv("DXR_ZONES_VALIDATE");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    return e;
+}
 
 // ============================================================================
 // Matrix helpers (column-major, m[col*4 + row]) — verbatim shape from the
@@ -252,12 +305,89 @@ struct AppXrSession {
     bool hasXlibBinding = false;       // XR_DXR_xlib_window_binding enabled on the instance
     bool usingAppWindow = false;       // the xlib binding was actually handed to xrCreateSession
     bool hasViewRig = false;           // XR_DXR_view_rig enabled — chain the display rig on locate
+
+    // XR_DXR_display_info (adaptive tiling / extension-app path). When enabled +
+    // the query succeeds (displayWidthM > 0), the per-view render TILE is
+    // window×recommendedViewScale instead of the legacy-compromise fixed dims,
+    // and the runtime does window-relative Kooima via the rig.
+    bool hasDisplayInfo = false;       // XR_DXR_display_info enabled on the instance
+    float displayWidthM = 0.0f;        // physical panel dims (m); 0 = query failed/unknown
+    float displayHeightM = 0.0f;
+    uint32_t displayPixelWidth = 0;    // panel resolution (px); 0 = unknown
+    uint32_t displayPixelHeight = 0;
+    float viewScaleX = 1.0f;           // per-view fraction of the display (from display_info)
+    float viewScaleY = 1.0f;           // init to identity — only ever the extension's value
+    int32_t displayScreenLeft = 0;     // 3D-panel top-left in virtual-desktop px (INV-1.3)
+    int32_t displayScreenTop = 0;
 };
 
-// Create a 32-bit ARGB X11 window for the transparent avatar overlay. Returns
-// false (leaving xDisplay null) when no X server / no ARGB visual is available,
-// so the caller falls back to hosted-NULL. A compositing WM (GNOME/Mutter, KWin,
-// picom) must be running for the desktop to show through.
+// Default portrait client size (Windows parity: windows/main.cpp g_windowWidth ×
+// g_windowHeight). Opened windowed + centered on the 3D panel, NOT fullscreen.
+static const unsigned int kDefaultWindowW = 811;
+static const unsigned int kDefaultWindowH = 1421;
+
+// Find the target panel rect (virtual-desktop px). Prefer the RandR PRIMARY
+// output; else the largest connected NON-eDP/LVDS output (the Odyssey is an
+// external panel, not the laptop's built-in). Fills x,y,w,h with the CRTC rect.
+// Returns false if Xrandr yields nothing usable (caller centers on the screen).
+static bool GetPanelRect(Display* dpy, Window root, int& x, int& y, int& w, int& h) {
+    XRRScreenResources* res = XRRGetScreenResources(dpy, root);
+    if (res == nullptr) return false;
+
+    auto tryOutput = [&](RROutput out) -> bool {
+        XRROutputInfo* oi = XRRGetOutputInfo(dpy, res, out);
+        if (oi == nullptr) return false;
+        bool ok = false;
+        if (oi->connection == RR_Connected && oi->crtc != 0) {
+            XRRCrtcInfo* ci = XRRGetCrtcInfo(dpy, res, oi->crtc);
+            if (ci != nullptr && ci->width > 0 && ci->height > 0) {
+                x = ci->x; y = ci->y; w = (int)ci->width; h = (int)ci->height;
+                ok = true;
+            }
+            if (ci != nullptr) XRRFreeCrtcInfo(ci);
+        }
+        XRRFreeOutputInfo(oi);
+        return ok;
+    };
+
+    bool found = false;
+    RROutput primary = XRRGetOutputPrimary(dpy, root);
+    if (primary != 0 && tryOutput(primary)) {
+        found = true;
+    }
+    if (!found) {
+        long bestArea = 0;
+        for (int i = 0; i < res->noutput; i++) {
+            XRROutputInfo* oi = XRRGetOutputInfo(dpy, res, res->outputs[i]);
+            if (oi == nullptr) continue;
+            const bool isBuiltin = oi->name != nullptr &&
+                (strncasecmp(oi->name, "eDP", 3) == 0 || strncasecmp(oi->name, "LVDS", 4) == 0);
+            if (oi->connection == RR_Connected && oi->crtc != 0 && !isBuiltin) {
+                XRRCrtcInfo* ci = XRRGetCrtcInfo(dpy, res, oi->crtc);
+                if (ci != nullptr && ci->width > 0 && ci->height > 0) {
+                    const long area = (long)ci->width * (long)ci->height;
+                    if (area > bestArea) {
+                        bestArea = area;
+                        x = ci->x; y = ci->y; w = (int)ci->width; h = (int)ci->height;
+                        found = true;
+                    }
+                }
+                if (ci != nullptr) XRRFreeCrtcInfo(ci);
+            }
+            XRRFreeOutputInfo(oi);
+        }
+    }
+    XRRFreeScreenResources(res);
+    return found;
+}
+
+// Create a 32-bit ARGB X11 window for the avatar overlay. Windowed PORTRAIT
+// (811×1421, Windows parity) centered on the 3D panel — NOT fullscreen. Override
+// with AVATAR_WINDOW="WxH+X+Y" (X,Y = absolute virtual-desktop px; parsed like
+// cube_handle_vk_linux's DXR_CUBE_WINDOW). Returns false (leaving xDisplay null)
+// when no X server / no ARGB visual is available, so the caller falls back to
+// hosted-NULL. A compositing WM (GNOME/Mutter, KWin, picom) must be running for
+// the desktop to show through in transparent mode.
 static bool CreateAppWindow(AppXrSession& xr) {
     Display* dpy = XOpenDisplay(nullptr);
     if (dpy == nullptr) {
@@ -282,12 +412,43 @@ static bool CreateAppWindow(AppXrSession& xr) {
     attrs.background_pixel = 0;  // fully-transparent fill
     attrs.event_mask = StructureNotifyMask | KeyPressMask;
 
-    // Size to the screen for a full-panel overlay; on-hardware placement is
-    // tuned separately (the app owns its window geometry on the xlib path).
-    unsigned int w = (unsigned int)DisplayWidth(dpy, screen);
-    unsigned int h = (unsigned int)DisplayHeight(dpy, screen);
+    // Portrait default, centered on the 3D panel (RandR). Fall back to centering
+    // on the default screen if Xrandr yields nothing.
+    unsigned int w = kDefaultWindowW, h = kDefaultWindowH;
+    int px = 0, py = 0;
+    int prx = 0, pry = 0, prw = 0, prh = 0;
+    if (GetPanelRect(dpy, root, prx, pry, prw, prh)) {
+        px = prx + (prw - (int)w) / 2;
+        py = pry + (prh - (int)h) / 2;
+        LOG_INFO("Panel rect %dx%d at (%d,%d) — centering %ux%u portrait window at (%d,%d)",
+                 prw, prh, prx, pry, w, h, px, py);
+    } else {
+        const int sw = DisplayWidth(dpy, screen), sh = DisplayHeight(dpy, screen);
+        px = (sw - (int)w) / 2;
+        py = (sh - (int)h) / 2;
+        LOG_INFO("Xrandr panel query failed — centering %ux%u on default screen %dx%d at (%d,%d)",
+                 w, h, sw, sh, px, py);
+    }
 
-    Window win = XCreateWindow(dpy, root, 0, 0, w, h, 0, 32, InputOutput, vinfo.visual,
+    // AVATAR_WINDOW="WxH+X+Y" override (X,Y absolute virtual-desktop px). Parsed
+    // like cube_handle_vk_linux's DXR_CUBE_WINDOW; W×H alone re-centers.
+    if (const char* wenv = getenv("AVATAR_WINDOW")) {
+        unsigned int ow = 0, oh = 0; int ox = 0, oy = 0;
+        int n = sscanf(wenv, "%ux%u+%d+%d", &ow, &oh, &ox, &oy);
+        if (n >= 2 && ow > 0 && oh > 0) {
+            w = ow; h = oh;
+            if (n >= 4) {
+                px = ox; py = oy;
+                LOG_INFO("AVATAR_WINDOW override: %ux%u at absolute (%d,%d)", w, h, px, py);
+            } else {
+                // Re-center the overridden size on the same panel/screen origin.
+                if (prw > 0 && prh > 0) { px = prx + (prw - (int)w) / 2; py = pry + (prh - (int)h) / 2; }
+                LOG_INFO("AVATAR_WINDOW override: %ux%u (re-centered at %d,%d)", w, h, px, py);
+            }
+        }
+    }
+
+    Window win = XCreateWindow(dpy, root, px, py, w, h, 0, 32, InputOutput, vinfo.visual,
                                CWColormap | CWBorderPixel | CWBackPixel | CWEventMask, &attrs);
     if (win == 0) {
         LOG_ERROR("XCreateWindow failed — using hosted-NULL windowing");
@@ -309,7 +470,22 @@ static bool CreateAppWindow(AppXrSession& xr) {
         }
     }
 
+    // WM_NORMAL_HINTS with USPosition|PPosition so the WM honors the create-time
+    // position instead of auto-placing (GNOME/Mutter auto-places without this).
+    // Same as cube_handle_vk_linux / the runtime's own hosted-window placement.
+    {
+        XSizeHints hints = {};
+        hints.flags = USPosition | PPosition;
+        hints.x = px; hints.y = py;
+        XSetWMNormalHints(dpy, win, &hints);
+    }
+
     XMapWindow(dpy, win);
+    XFlush(dpy);
+
+    // Re-assert the position after mapping — Mutter (and others) ignore the
+    // create-time x/y of a freshly-mapped toplevel but honor a post-map move.
+    XMoveWindow(dpy, win, px, py);
     XFlush(dpy);
 
     xr.xDisplay = dpy;
@@ -317,7 +493,7 @@ static bool CreateAppWindow(AppXrSession& xr) {
     xr.xColormap = cmap;
     xr.xWinW = w;
     xr.xWinH = h;
-    LOG_INFO("Created %ux%u 32-bit ARGB app window for transparent overlay", w, h);
+    LOG_INFO("Created %ux%u 32-bit ARGB portrait app window at (%d,%d)", w, h, px, py);
     return true;
 }
 
@@ -331,20 +507,26 @@ static bool InitializeOpenXR(AppXrSession& xr) {
 
     bool hasVulkan = false;
     bool hasXlibBinding = false;
+    bool hasDisplayInfo = false;
     bool hasViewRig = false;
     bool hasLocal3DZone = false;
+    bool hasDisplayZones = false;
     for (const auto& ext : extensions) {
         if (strcmp(ext.extensionName, XR_KHR_VULKAN_ENABLE_EXTENSION_NAME) == 0) hasVulkan = true;
         if (strcmp(ext.extensionName, XR_DXR_XLIB_WINDOW_BINDING_EXTENSION_NAME) == 0) hasXlibBinding = true;
+        if (strcmp(ext.extensionName, XR_DXR_DISPLAY_INFO_EXTENSION_NAME) == 0) hasDisplayInfo = true;
         if (strcmp(ext.extensionName, XR_DXR_VIEW_RIG_EXTENSION_NAME) == 0) hasViewRig = true;
         if (strcmp(ext.extensionName, XR_DXR_LOCAL_3D_ZONE_EXTENSION_NAME) == 0) hasLocal3DZone = true;
+        if (strcmp(ext.extensionName, XR_DXR_DISPLAY_ZONES_EXTENSION_NAME) == 0) hasDisplayZones = true;
     }
 
     LOG_INFO("XR_KHR_vulkan_enable: %s", hasVulkan ? "AVAILABLE" : "NOT FOUND");
     if (!hasVulkan) { LOG_ERROR("XR_KHR_vulkan_enable not available"); return false; }
     LOG_INFO("XR_DXR_xlib_window_binding: %s", hasXlibBinding ? "AVAILABLE" : "NOT FOUND");
+    LOG_INFO("XR_DXR_display_info: %s", hasDisplayInfo ? "AVAILABLE" : "NOT FOUND");
     LOG_INFO("XR_DXR_view_rig: %s", hasViewRig ? "AVAILABLE" : "NOT FOUND");
     LOG_INFO("XR_DXR_local_3d_zone: %s", hasLocal3DZone ? "AVAILABLE" : "NOT FOUND");
+    LOG_INFO("XR_DXR_display_zones: %s", hasDisplayZones ? "AVAILABLE" : "NOT FOUND");
 
     std::vector<const char*> enabledExtensions;
     enabledExtensions.push_back(XR_KHR_VULKAN_ENABLE_EXTENSION_NAME);
@@ -354,11 +536,26 @@ static bool InitializeOpenXR(AppXrSession& xr) {
         enabledExtensions.push_back(XR_DXR_XLIB_WINDOW_BINDING_EXTENSION_NAME);
         xr.hasXlibBinding = true;
     }
+    // Enable XR_DXR_display_info — the switch that makes this an EXTENSION app:
+    // the runtime tiles window×recommendedViewScale (window-relative Kooima)
+    // instead of the legacy 0.50×1.00 compromise, and we query the panel dims +
+    // per-view scale + desktop position below. Same enable/query as
+    // cube_handle_vk_linux.
+    if (hasDisplayInfo) {
+        enabledExtensions.push_back(XR_DXR_DISPLAY_INFO_EXTENSION_NAME);
+        xr.hasDisplayInfo = true;
+    }
     // Enable the display view rig so the runtime returns render-ready view
     // poses/FOV (camera at the eye) instead of us hand-rolling the Kooima math.
-    if (hasViewRig) {
+    // The rig needs display_info to do the window-relative Kooima, so gate the
+    // enable on both — exactly like cube_handle_vk_linux ("view_rig needs
+    // display_info"). Falls back to raw xrLocateViews fov if either is absent.
+    if (hasViewRig && hasDisplayInfo) {
         enabledExtensions.push_back(XR_DXR_VIEW_RIG_EXTENSION_NAME);
         xr.hasViewRig = true;
+    } else if (hasViewRig) {
+        LOG_INFO("XR_DXR_view_rig present but XR_DXR_display_info is not — "
+                 "not enabling the rig (needs display_info for window-relative Kooima)");
     }
     // Enable the Local2D layer so the runtime composites the flat 2D speech
     // bubble in the top 25% band (the runtime's software-composite path handles
@@ -367,6 +564,19 @@ static bool InitializeOpenXR(AppXrSession& xr) {
     if (hasLocal3DZone) {
         enabledExtensions.push_back(XR_DXR_LOCAL_3D_ZONE_EXTENSION_NAME);
         g_hasLocal3DZone = true;
+    }
+    // Enable XR_DXR_display_zones (the tiger-zone). It composes view_rig +
+    // local_3d_zone, so require both prerequisites (view_rig is enabled above
+    // only when display_info is also present). Without them the app degrades to
+    // the full-tile + Local2D path. Same gate as cube_zones_vk_linux.
+    if (hasDisplayZones && (!hasLocal3DZone || !xr.hasViewRig)) {
+        LOG_WARN("XR_DXR_display_zones advertised without its prerequisites "
+                 "(local_3d_zone / view_rig+display_info) — tiger-zone disabled");
+        hasDisplayZones = false;
+    }
+    if (hasDisplayZones) {
+        enabledExtensions.push_back(XR_DXR_DISPLAY_ZONES_EXTENSION_NAME);
+        g_hasDisplayZones = true;
     }
 
     XrInstanceCreateInfo createInfo = {XR_TYPE_INSTANCE_CREATE_INFO};
@@ -380,9 +590,53 @@ static bool InitializeOpenXR(AppXrSession& xr) {
     createInfo.enabledExtensionNames = enabledExtensions.data();
     XR_CHECK(xrCreateInstance(&createInfo, &xr.instance));
 
+    // Resolve the XR_DXR_display_zones entry points (caps + per-zone view size).
+    // If either is unresolved the tiger-zone is disabled → full-tile fallback.
+    if (g_hasDisplayZones) {
+        xrGetInstanceProcAddr(xr.instance, "xrGetDisplayZoneCapabilitiesDXR",
+            (PFN_xrVoidFunction*)&g_pfnGetZoneCaps);
+        xrGetInstanceProcAddr(xr.instance, "xrGetDisplayZoneRecommendedViewSizeDXR",
+            (PFN_xrVoidFunction*)&g_pfnGetZoneViewSize);
+        if (g_pfnGetZoneCaps == nullptr || g_pfnGetZoneViewSize == nullptr) {
+            LOG_WARN("XR_DXR_display_zones entry points unresolved — tiger-zone disabled");
+            g_hasDisplayZones = false;
+        }
+    }
+
     XrSystemGetInfo systemInfo = {XR_TYPE_SYSTEM_GET_INFO};
     systemInfo.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
     XR_CHECK(xrGetSystem(xr.instance, &systemInfo, &xr.systemId));
+
+    // Query XR_DXR_display_info: physical panel dims (m2v anchor), pixel dims,
+    // per-view recommended scale (window×scale tiling), and the 3D-panel desktop
+    // position (INV-1.3). The runtime fills the chained structs only when
+    // XR_DXR_display_info is enabled; the zero-init defaults are the safe
+    // fallback. Same chain as cube_handle_vk_linux.
+    if (xr.hasDisplayInfo) {
+        XrSystemProperties sysProps = {XR_TYPE_SYSTEM_PROPERTIES};
+        XrDisplayInfoDXR displayInfo = {XR_TYPE_DISPLAY_INFO_DXR};
+        XrDisplayDesktopPositionDXR desktopPos = {};
+        desktopPos.type = XR_TYPE_DISPLAY_DESKTOP_POSITION_DXR;
+        displayInfo.next = &desktopPos;
+        sysProps.next = &displayInfo;
+        if (XR_SUCCEEDED(xrGetSystemProperties(xr.instance, xr.systemId, &sysProps))) {
+            xr.displayScreenLeft = desktopPos.left;
+            xr.displayScreenTop = desktopPos.top;
+            xr.displayWidthM = displayInfo.displaySizeMeters.width;
+            xr.displayHeightM = displayInfo.displaySizeMeters.height;
+            xr.displayPixelWidth = displayInfo.displayPixelWidth;
+            xr.displayPixelHeight = displayInfo.displayPixelHeight;
+            if (displayInfo.recommendedViewScaleX > 0.0f) xr.viewScaleX = displayInfo.recommendedViewScaleX;
+            if (displayInfo.recommendedViewScaleY > 0.0f) xr.viewScaleY = displayInfo.recommendedViewScaleY;
+            LOG_INFO("Display info: desktop (%d,%d), %.4f x %.4f m, %ux%u px, view scale %.3fx%.3f",
+                     xr.displayScreenLeft, xr.displayScreenTop,
+                     xr.displayWidthM, xr.displayHeightM,
+                     xr.displayPixelWidth, xr.displayPixelHeight,
+                     xr.viewScaleX, xr.viewScaleY);
+        } else {
+            LOG_WARN("xrGetSystemProperties(display_info) failed — falling back to per-view recommended dims");
+        }
+    }
 
     uint32_t viewCount = 0;
     XR_CHECK(xrEnumerateViewConfigurationViews(xr.instance, xr.systemId, xr.viewConfigType, 0, &viewCount, nullptr));
@@ -551,16 +805,29 @@ static bool CreateSession(AppXrSession& xr, VkInstance vkInstance, VkPhysicalDev
     vkBinding.queueIndex = 0;
 
     // App-owned-window path: chain the xlib binding (→ vkBinding) so the runtime
-    // renders into our 32-bit ARGB window, with transparentBackgroundEnabled so
-    // transparent pixels compose through to the desktop (the avatar overlay).
-    // Falls back to hosted-NULL when no window / the extension is absent (e.g.
-    // headless CI), where the graphics binding is chained straight in and the
-    // runtime self-creates its window.
+    // renders into our X11 window — this is what makes the avatar a proper HANDLE
+    // app (win/mac parity), so the compositor tiles window×scaleXY (window-relative
+    // Kooima) instead of the display-scoped hosted-NULL path. Falls back to
+    // hosted-NULL when no window / the extension is absent (e.g. headless CI),
+    // where the graphics binding is chained straight in and the runtime
+    // self-creates its window.
+    //
+    // Transparency (transparentBackgroundEnabled) is DECOUPLED from the handle
+    // path: it is the compose-through-to-desktop overlay (runtime#757 / #758),
+    // which the shipped Linux runtime does not yet support — requesting it there
+    // aborts the compositor. So it is an OPT-IN (AVATAR_TRANSPARENT=1), OFF by
+    // default, giving a working opaque handle app on the shipped stack today.
+    // Win/mac default it ON because their shipped runtimes support it; flip the
+    // Linux default once #758 (transparent xcb surface) lands + is stable.
+    const bool wantTransparent = []() {
+        const char* e = getenv("AVATAR_TRANSPARENT");
+        return e != nullptr && e[0] != '\0' && e[0] != '0';
+    }();
     XrXlibWindowBindingCreateInfoDXR xlibBinding = {XR_TYPE_XLIB_WINDOW_BINDING_CREATE_INFO_DXR};
     xlibBinding.next = &vkBinding;
     xlibBinding.xDisplay = xr.xDisplay;
     xlibBinding.window = xr.xWindow;
-    xlibBinding.transparentBackgroundEnabled = XR_TRUE;
+    xlibBinding.transparentBackgroundEnabled = wantTransparent ? XR_TRUE : XR_FALSE;
 
     const bool useAppWindow = xr.hasXlibBinding && xr.xDisplay != nullptr && xr.xWindow != 0;
     xr.usingAppWindow = useAppWindow;
@@ -570,7 +837,8 @@ static bool CreateSession(AppXrSession& xr, VkInstance vkInstance, VkPhysicalDev
     sessionInfo.systemId = xr.systemId;
     XR_CHECK(xrCreateSession(xr.instance, &sessionInfo, &xr.session));
     LOG_INFO("Session created (%s)",
-             useAppWindow ? "app-owned ARGB window, transparent overlay"
+             useAppWindow ? (wantTransparent ? "app-owned window, transparent overlay (AVATAR_TRANSPARENT=1)"
+                                             : "app-owned window, opaque handle app")
                           : "hosted-NULL: runtime self-creates the window");
     return true;
 }
@@ -1031,6 +1299,181 @@ static bool BuildBubbleLayer(VkDevice dev, VkQueue queue, VkCommandPool pool,
 }
 
 // ============================================================================
+// Tiger-zone activation + per-frame render (XR_DXR_display_zones)
+// ============================================================================
+
+// One-shot activation: capabilities check + pre-sized zone swapchain. The zone
+// swapchain is sized to the main atlas envelope (worst-case display×scale SBS);
+// per-frame zone tiles are clamped into it (matches windows/main.cpp's
+// fullscreen-worst-case pre-size). Requires the external window (has_external_
+// window — same gate as Local2D/zone submission). Falls back to full-tile on any
+// failure (g_hasDisplayZones cleared).
+static bool TryActivateTigerZone(AppXrSession& xr) {
+    if (g_zonesAttempted) return g_zonesActive;
+    g_zonesAttempted = true;
+    if (!g_hasDisplayZones || !xr.usingAppWindow) return false;
+    if (g_pfnGetZoneCaps == nullptr || g_pfnGetZoneViewSize == nullptr) return false;
+
+    XrDisplayZoneCapabilitiesDXR caps = {(XrStructureType)XR_TYPE_DISPLAY_ZONE_CAPABILITIES_DXR};
+    XrResult r = g_pfnGetZoneCaps(xr.session, &caps);
+    if (XR_FAILED(r) || !caps.supported || caps.maxZones3D < 1) {
+        LOG_WARN("[zones] caps rc=0x%x supported=%d maxZones3D=%u — tiger-zone disabled, "
+                 "full-tile + Local2D fallback",
+                 (unsigned)r, (int)caps.supported, caps.maxZones3D);
+        g_hasDisplayZones = false;
+        return false;
+    }
+
+    g_zoneSwW = xr.swapchain.width;   // atlas envelope: 2 SBS tiles wide
+    g_zoneSwH = xr.swapchain.height;
+    XrSwapchainCreateInfo sci = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
+    sci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT |
+                     XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
+    sci.format = xr.swapchain.format;
+    sci.sampleCount = 1;
+    sci.width = g_zoneSwW;
+    sci.height = g_zoneSwH;
+    sci.faceCount = 1; sci.arraySize = 1; sci.mipCount = 1;
+    if (XR_FAILED(xrCreateSwapchain(xr.session, &sci, &g_zoneSwapchain))) {
+        LOG_WARN("[zones] zone swapchain create failed (%ux%u) — full-tile fallback", g_zoneSwW, g_zoneSwH);
+        g_zoneSwapchain = XR_NULL_HANDLE;
+        g_hasDisplayZones = false;
+        return false;
+    }
+    uint32_t n = 0;
+    xrEnumerateSwapchainImages(g_zoneSwapchain, 0, &n, nullptr);
+    g_zoneImages.assign(n, {XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR});
+    xrEnumerateSwapchainImages(g_zoneSwapchain, n, &n,
+        (XrSwapchainImageBaseHeader*)g_zoneImages.data());
+
+    g_zonesActive = true;
+    LOG_INFO("[zones] tiger-zone ACTIVE: maxZones3D=%u, zone swapchain %ux%u (%u images)",
+             caps.maxZones3D, g_zoneSwW, g_zoneSwH, n);
+    return true;
+}
+
+// Per-frame tiger-zone render: zone rect = bottom kAvatarCanvasFrac (75%) of the
+// window; the avatar renders rig-framed INTO that rect (runtime Kooima via the
+// zone-scoped locate) — no squish, 3D kept out of the top band. Fills projViews
+// (zone-swapchain subimages) + outZone (zoneId/rect; caller clears .next before
+// submit) + the view-0 silhouette matrices. Returns true on success; false →
+// caller falls back to the full-tile path for this frame. Mirrors
+// windows/main.cpp's zones branch + the cube_zones_vk_linux locate/render loop.
+static bool RenderTigerZone(AppXrSession& xr, const XrFrameState& frameState,
+                            std::vector<XrCompositionLayerProjectionView>& projViews,
+                            XrDisplayZoneDXR& outZone,
+                            float silView[16], float silProj[16], bool& haveSil) {
+    haveSil = false;
+    if (g_zoneSwapchain == XR_NULL_HANDLE || g_zoneSwW == 0 || g_zoneSwH == 0) return false;
+
+    // Live client-window size (fixed portrait, but query so a resize tracks).
+    uint32_t winW = 0, winH = 0;
+    if (xr.xDisplay != nullptr && xr.xWindow != 0) {
+        XWindowAttributes wa = {};
+        if (XGetWindowAttributes(xr.xDisplay, xr.xWindow, &wa) && wa.width > 0 && wa.height > 0) {
+            winW = (uint32_t)wa.width;
+            winH = (uint32_t)wa.height;
+        }
+    }
+    if (winW == 0 || winH == 0) { winW = xr.xWinW; winH = xr.xWinH; }
+    if (winW == 0 || winH == 0) return false;
+
+    // Zone rect = bottom 75% (client px, y-down); the top 25% is the bubble band.
+    const int32_t topBand = (int32_t)((float)winH * (1.0f - kAvatarCanvasFrac) + 0.5f);
+    XrDisplayRigDXR rig = {XR_TYPE_DISPLAY_RIG_DXR};
+    rig.pose.orientation = {0.0f, 0.0f, 0.0f, 1.0f};
+    rig.pose.position = {g_fitCenter[0], g_fitCenter[1], g_fitCenter[2]};
+    rig.virtualDisplayHeight = g_fitValid ? g_fitVHeight : kFallbackVHeightM;
+    rig.ipdFactor = 1.0f; rig.parallaxFactor = 1.0f; rig.perspectiveFactor = 1.0f;
+
+    outZone = {(XrStructureType)XR_TYPE_DISPLAY_ZONE_DXR};
+    outZone.next = &rig;                 // rig chained for the locate (framing)
+    outZone.zoneId = 1;
+    outZone.rect.offset = {0, topBand};
+    outZone.rect.extent = {(int32_t)winW, (int32_t)winH - topBand};
+
+    // Per-zone recommended view size, clamped to the pre-sized swapchain.
+    const uint32_t eyeCount = 2;
+    uint32_t tileW = 0, tileH = 0;
+    XrExtent2Di rec = {};
+    if (XR_SUCCEEDED(g_pfnGetZoneViewSize(xr.session, &outZone.rect, &rec)) &&
+        rec.width > 0 && rec.height > 0) {
+        tileW = (uint32_t)rec.width;
+        tileH = (uint32_t)rec.height;
+    } else {
+        tileW = (uint32_t)outZone.rect.extent.width;
+        tileH = (uint32_t)outZone.rect.extent.height;
+    }
+    if (tileW > g_zoneSwW / eyeCount) tileW = g_zoneSwW / eyeCount;
+    if (tileH > g_zoneSwH) tileH = g_zoneSwH;
+    if (tileW == 0) tileW = 1;
+    if (tileH == 0) tileH = 1;
+
+    // Zone-scoped locate: runtime Kooima framed to the rect → render-ready views.
+    XrViewLocateInfo locateInfo = {XR_TYPE_VIEW_LOCATE_INFO};
+    locateInfo.next = &outZone;
+    locateInfo.viewConfigurationType = xr.viewConfigType;
+    locateInfo.displayTime = frameState.predictedDisplayTime;
+    locateInfo.space = xr.localSpace;
+    XrViewState viewState = {XR_TYPE_VIEW_STATE};
+    uint32_t viewCountOut = 0;
+    XrView zoneViews[8];
+    for (uint32_t i = 0; i < 8; i++) zoneViews[i] = {XR_TYPE_VIEW};
+    if (XR_FAILED(xrLocateViews(xr.session, &locateInfo, &viewState, 8, &viewCountOut, zoneViews)) ||
+        viewCountOut == 0) {
+        static bool s_warned = false;
+        if (!s_warned) { s_warned = true; LOG_WARN("[zones] zone-scoped xrLocateViews failed — full-tile fallback"); }
+        return false;
+    }
+    const uint32_t n = viewCountOut < eyeCount ? viewCountOut : eyeCount;
+
+    XrSwapchainImageAcquireInfo ai = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+    uint32_t imageIndex = 0;
+    if (XR_FAILED(xrAcquireSwapchainImage(g_zoneSwapchain, &ai, &imageIndex))) return false;
+    XrSwapchainImageWaitInfo wi = {XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+    wi.timeout = XR_INFINITE_DURATION;
+    if (XR_FAILED(xrWaitSwapchainImage(g_zoneSwapchain, &wi))) {
+        XrSwapchainImageReleaseInfo ri = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+        xrReleaseSwapchainImage(g_zoneSwapchain, &ri);
+        return false;
+    }
+
+    projViews.assign(n, {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW});
+    for (uint32_t i = 0; i < n; i++) {
+        float viewMat[16], projMat[16];
+        mat4_view_from_xr_pose(viewMat, zoneViews[i].pose);
+        // Same foreground-clip recipe as the full-tile path: far = eye→display
+        // distance (display plane at the model center); GL depth → Vulkan [0,1].
+        float ez = fabsf(zoneViews[i].pose.position.z - g_fitCenter[2]);
+        float farZ = (ez > 0.02f) ? ez : 100.0f;
+        mat4_from_xr_fov(projMat, zoneViews[i].fov, 0.01f, farZ);
+        convert_projection_gl_to_zero_to_one(projMat);
+        if (i == 0) {
+            memcpy(silView, viewMat, 16 * sizeof(float));
+            memcpy(silProj, projMat, 16 * sizeof(float));
+            haveSil = true;
+        }
+        // Render the avatar into this eye's tile of the zone swapchain.
+        g_modelRenderer.renderEye(
+            g_zoneImages[imageIndex].image, (VkFormat)xr.swapchain.format,
+            g_zoneSwW, g_zoneSwH,
+            i * tileW, 0, tileW, tileH,
+            viewMat, projMat, /*transparentBg*/ true);
+
+        projViews[i].type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
+        projViews[i].subImage.swapchain = g_zoneSwapchain;
+        projViews[i].subImage.imageRect.offset = {(int32_t)(i * tileW), 0};
+        projViews[i].subImage.imageRect.extent = {(int32_t)tileW, (int32_t)tileH};
+        projViews[i].subImage.imageArrayIndex = 0;
+        projViews[i].pose = zoneViews[i].pose;
+        projViews[i].fov = zoneViews[i].fov;
+    }
+    XrSwapchainImageReleaseInfo ri = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+    xrReleaseSwapchainImage(g_zoneSwapchain, &ri);
+    return true;
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 int main(int argc, char** argv) {
@@ -1123,8 +1566,16 @@ int main(int argc, char** argv) {
     // runtime advertises XR_DXR_local_3d_zone. A dedicated transient-reset command
     // pool feeds the per-frame staging→image upload. Guarded so the app still runs
     // (bubble simply absent) if the extension / swapchain / font is unavailable.
+    // The Local2D speech bubble requires a session created WITH a window binding
+    // (the runtime's verify_local_2d_layer gate: has_external_window on the VK
+    // native path — oxr_session_frame_end.c). On the hosted-NULL fallback (no X
+    // server / headless CI, or the extension absent) there is no external window,
+    // so a submitted Local2D layer is rejected with XR_ERROR_LAYER_INVALID and
+    // the WHOLE frame is dropped (the black-screen bug). Only build + submit the
+    // bubble when we actually handed the runtime our window (xr.usingAppWindow);
+    // otherwise the projection layer[0] submits alone and the avatar renders.
     VkCommandPool bubbleCmdPool = VK_NULL_HANDLE;
-    if (g_hasLocal3DZone) {
+    if (g_hasLocal3DZone && xr.usingAppWindow) {
         g_bubbleReady = CreateBubbleSwapchain(xr, vkDevice, physDevice);
         if (g_bubbleReady) {
             VkCommandPoolCreateInfo pci = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
@@ -1136,6 +1587,9 @@ int main(int argc, char** argv) {
                 g_bubbleReady = false;
             }
         }
+    } else if (g_hasLocal3DZone && !xr.usingAppWindow) {
+        LOG_WARN("No external window (hosted-NULL) — Local2D speech bubble disabled "
+                 "(a Local2D layer would be rejected by xrEndFrame and drop the frame)");
     } else {
         LOG_WARN("XR_DXR_local_3d_zone unavailable — no speech bubble");
     }
@@ -1160,9 +1614,45 @@ int main(int argc, char** argv) {
         xrBeginFrame(xr.session, &beginInfo);
 
         bool rendered = false;
+        bool zonesFrame = false;   // this frame used the tiger-zone path
+        // Persists locate→submit: chained on the projection layer at xrEndFrame.
+        XrDisplayZoneDXR tigerZone = {(XrStructureType)XR_TYPE_DISPLAY_ZONE_DXR};
         std::vector<XrCompositionLayerProjectionView> projViews;
 
         if (frameState.shouldRender) {
+            // Lazily activate the tiger-zone once the session + window are up
+            // (caps query + pre-sized zone swapchain). No-op after the first call.
+            if (!g_zonesAttempted) TryActivateTigerZone(xr);
+
+            // ── Tiger-zone path: avatar confined to the bottom-75% zone rect ──
+            if (g_zonesActive) {
+                float zSilView[16], zSilProj[16];
+                bool zHaveSil = false;
+                zonesFrame = RenderTigerZone(xr, frameState, projViews, tigerZone,
+                                             zSilView, zSilProj, zHaveSil);
+                rendered = zonesFrame;
+                // Click-through silhouette (throttled), same as the full-tile path.
+                if (zonesFrame && xr.usingAppWindow && zHaveSil) {
+                    static uint32_t s_zClickFrame = 0;
+                    constexpr uint32_t kClickUpdateEveryN = 15; // ~4 Hz at 60 fps
+                    if ((s_zClickFrame++ % kClickUpdateEveryN) == 0) {
+                        unsigned int cw = xr.xWinW, ch = xr.xWinH;
+                        Window gRoot; int gx, gy; unsigned int gw, gh, gbw, gd;
+                        if (XGetGeometry(xr.xDisplay, xr.xWindow, &gRoot, &gx, &gy,
+                                         &gw, &gh, &gbw, &gd) && gw > 0 && gh > 0) {
+                            cw = gw; ch = gh;
+                        }
+                        ClickthroughUpdate(vkDevice, physDevice, graphicsQueue, queueFamilyIndex,
+                                           g_modelRenderer, xr.xDisplay, xr.xWindow, cw, ch,
+                                           zSilView, zSilProj);
+                    }
+                }
+            }
+
+            // ── Full-tile fallback path (zones inactive / a transient zone-frame
+            //    failure): the avatar renders across the whole tile + Local2D
+            //    bubble. Preserved verbatim from the pre-tiger-zone build. ──
+            if (!zonesFrame) {
             XrViewLocateInfo locateInfo = {XR_TYPE_VIEW_LOCATE_INFO};
             locateInfo.viewConfigurationType = xr.viewConfigType;
             locateInfo.displayTime = frameState.predictedDisplayTime;
@@ -1185,7 +1675,11 @@ int main(int argc, char** argv) {
             displayRig.ipdFactor = 1.0f;
             displayRig.parallaxFactor = 1.0f;
             displayRig.perspectiveFactor = 1.0f;
-            if (xr.hasViewRig) {
+            // Only chain the rig when display_info actually gave us panel dims —
+            // the runtime needs them for the window-relative Kooima. Matches
+            // cube_handle_vk_linux's useDisplayRig gate.
+            const bool useDisplayRig = xr.hasViewRig && xr.displayWidthM > 0.0f;
+            if (useDisplayRig) {
                 locateInfo.next = &displayRig;
             }
 
@@ -1207,7 +1701,39 @@ int main(int argc, char** argv) {
                     if (XR_SUCCEEDED(xrWaitSwapchainImage(xr.swapchain.swapchain, &swWait))) {
                         rendered = true;
                         uint32_t eyeCount = 2;
-                        uint32_t eyeW = xr.viewWidth, eyeH = xr.viewHeight;
+                        // Per-eye RENDER TILE = window × recommendedViewScale
+                        // (docs/specs/runtime/multiview-tiling.md + ADR-010/030):
+                        // the swapchain is the worst-case display×scale envelope,
+                        // but a WINDOWED extension app renders view = window×scale
+                        // and the compositor crops. Using the frozen recommended
+                        // (display-sized) tile made the window-relative Kooima fov
+                        // render oversized + off-center when windowed. Query the
+                        // LIVE window each frame; clamp to the swapchain envelope.
+                        // Falls back to the recommended per-view dims on the
+                        // hosted-NULL path (no app window) or if display_info is
+                        // absent (viewScale stays 1.0). Mirrors cube_handle_vk_linux.
+                        uint32_t winW = 0, winH = 0;
+                        if (xr.usingAppWindow && xr.xDisplay != nullptr && xr.xWindow != 0) {
+                            XWindowAttributes wa = {};
+                            if (XGetWindowAttributes(xr.xDisplay, xr.xWindow, &wa) &&
+                                wa.width > 0 && wa.height > 0) {
+                                winW = (uint32_t)wa.width;
+                                winH = (uint32_t)wa.height;
+                            }
+                        }
+                        uint32_t eyeW, eyeH;
+                        if (winW > 0 && winH > 0) {
+                            eyeW = (uint32_t)(winW * xr.viewScaleX);
+                            eyeH = (uint32_t)(winH * xr.viewScaleY);
+                        } else {
+                            eyeW = xr.viewWidth;   // fallback: recommended (fullscreen envelope)
+                            eyeH = xr.viewHeight;
+                        }
+                        if (eyeW == 0) eyeW = 1;
+                        if (eyeH == 0) eyeH = 1;
+                        // Clamp to the worst-case swapchain (SBS packs 2 tiles wide).
+                        if (eyeW > xr.swapchain.width / eyeCount) eyeW = xr.swapchain.width / eyeCount;
+                        if (eyeH > xr.swapchain.height) eyeH = xr.swapchain.height;
                         projViews.resize(eyeCount, {});
                         float silView[16], silProj[16];
                         bool haveSil = false;
@@ -1227,6 +1753,12 @@ int main(int argc, char** argv) {
                             float ez = fabsf(views[i].pose.position.z - g_fitCenter[2]);
                             float farZ = (ez > 0.02f) ? ez : 100.0f;
                             mat4_from_xr_fov(projMat, views[i].fov, 0.01f, farZ);
+                            // mat4_from_xr_fov emits GL [-1,1] clip-depth; Vulkan
+                            // clips [0,1], so remap or the avatar is near-clipped
+                            // whenever the near sits close to the content
+                            // (invisible windowed). displayxr-common shared fn,
+                            // exactly like cube_handle_vk_linux + the win/mac peers.
+                            convert_projection_gl_to_zero_to_one(projMat);
                             if (i == 0) { // view 0 drives the click-through silhouette
                                 memcpy(silView, viewMat, sizeof(silView));
                                 memcpy(silProj, projMat, sizeof(silProj));
@@ -1286,6 +1818,7 @@ int main(int argc, char** argv) {
                     }
                 }
             }
+            } // end if (!zonesFrame) — full-tile fallback path
         }
 
         XrFrameEndInfo endInfo = {XR_TYPE_FRAME_END_INFO};
@@ -1302,6 +1835,15 @@ int main(int argc, char** argv) {
             projLayer.space = xr.localSpace;
             projLayer.viewCount = (uint32_t)projViews.size();
             projLayer.views = projViews.data();
+            if (zonesFrame) {
+                // Same XrDisplayZoneDXR instance as the zone locate, rig chain
+                // CLEARED (windows/main.cpp semantics) — this makes it a ZONES
+                // frame: the runtime weaves the avatar into the bottom-75% rect and
+                // auto-derives the wish (feathered bottom-75%), leaving the top 25%
+                // flat for the Local2D bubble. No mask object.
+                tigerZone.next = nullptr;
+                projLayer.next = &tigerZone;
+            }
             layers[layerN++] = (XrCompositionLayerBaseHeader*)&projLayer;
 
             // ── Speech bubble: a flat 2D nameplate pill in the top ~25% band,
@@ -1310,7 +1852,10 @@ int main(int argc, char** argv) {
             //    mapped onto the full band — equal scale on both axes so corners
             //    stay round and text unstretched on any resize (same fit math as
             //    windows/main.cpp:1887-1900). ──
-            if (g_bubbleReady && g_hasLocal3DZone && bubbleCmdPool != VK_NULL_HANDLE) {
+            // Gate the Local2D bubble on the external window (has_external_window)
+            // so xrEndFrame accepts the frame — see the swapchain-create comment.
+            if (g_bubbleReady && g_hasLocal3DZone && xr.usingAppWindow &&
+                bubbleCmdPool != VK_NULL_HANDLE) {
                 // Client-window pixel dims for the band rect. On the app-owned
                 // path the runtime repositions/resizes the overlay onto the target
                 // panel, so query the ACTUAL geometry (xr.xWinW/xWinH hold the
@@ -1345,6 +1890,15 @@ int main(int argc, char** argv) {
             endInfo.layerCount = layerN;
             endInfo.layers = layers;
         }
+        // DXR_ZONES_VALIDATE=1 chains the strict locate/submit pairing validate
+        // bit (bring-up diagnostics). Default: nothing chained = AUTO wish
+        // (feathered bottom-75%), matching windows/main.cpp + cube_zones_vk_linux.
+        XrDisplayZonesFrameEndInfoDXR zonesEnd = {(XrStructureType)XR_TYPE_DISPLAY_ZONES_FRAME_END_INFO_DXR};
+        if (rendered && zonesFrame && AvatarZonesValidate()) {
+            zonesEnd.flags = XR_DISPLAY_ZONES_FRAME_END_VALIDATE_BIT_DXR;
+            zonesEnd.wishMask = XR_NULL_HANDLE;
+            endInfo.next = &zonesEnd;
+        }
         xrEndFrame(xr.session, &endInfo);
     }
 
@@ -1360,6 +1914,7 @@ int main(int argc, char** argv) {
     if (vkDevice && bubbleCmdPool != VK_NULL_HANDLE)
         vkDestroyCommandPool(vkDevice, bubbleCmdPool, nullptr);
     if (g_bubbleSwapchain != XR_NULL_HANDLE) { xrDestroySwapchain(g_bubbleSwapchain); g_bubbleSwapchain = XR_NULL_HANDLE; }
+    if (g_zoneSwapchain != XR_NULL_HANDLE) { xrDestroySwapchain(g_zoneSwapchain); g_zoneSwapchain = XR_NULL_HANDLE; }
     if (vkDevice && g_bubbleStaging.buffer != VK_NULL_HANDLE) {
         if (g_bubbleStagingMapped) { vkUnmapMemory(vkDevice, g_bubbleStaging.memory); g_bubbleStagingMapped = nullptr; }
         modelDestroyBuffer(vkDevice, g_bubbleStaging);

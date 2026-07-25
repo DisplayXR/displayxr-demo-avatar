@@ -91,7 +91,8 @@ target_link_libraries(avatar_handle_vk_linux PRIVATE
     OpenXR::openxr_loader
     Vulkan::Vulkan
     ${X11_LIBRARIES}
-    ${X11_Xext_LIB}   # XShape — click-through input region
+    ${X11_Xext_LIB}     # XShape — click-through input region
+    ${X11_Xrandr_LIB}   # Xrandr — panel rect for portrait window centering (needs libxrandr-dev)
 )
 
 # Copy the OpenXR loader .so next to the exe when it's an imported target, so a
