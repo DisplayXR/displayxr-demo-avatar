@@ -36,6 +36,7 @@
 #include "hud_renderer.h"   // HudRenderer + text_overlay (RenderFilledRect/RenderText) — drive the speech bubble
 #include "atlas_capture.h"
 #include "recenter_control.h"  // dynamic-recenter per-axis pins (P then X/Y/Z; DXR_RECENTER_PIN)
+#include "toast.h"             // dxr::ToastState — transient on-screen confirmation
 #include <dwrite.h>
 #pragma comment(lib, "dwrite.lib")
 
@@ -70,6 +71,28 @@ static const wchar_t* WINDOW_TITLE = L"DisplayXR 3D Avatar";
 static const uint32_t BTN_BAR_TEX_W = 2048;
 static const uint32_t BTN_BAR_TEX_H = 512;
 static const uint32_t BTN_BAR_FONT_BASE = 256;  // HudRenderer init only; the bubble swaps its own format
+
+// ── Toast layer (transient confirmation chip) ────────────────────────────────
+// Its own window-space layer, bottom-centre, submitted ONLY while a toast is
+// live (dxr::ToastState decides). Deliberately NOT gated on the Local3D zone
+// the speech bubble needs: a confirmation must appear whatever the frame shape,
+// and independent of the Tab-toggled HUD panel.
+// Geometry comes from dxr::ComputeToastLayerRect (displayxr-common): the chip is
+// sized off the window's SHORTER side. This window is PORTRAIT, so sizing off
+// width (the obvious choice) would render the chip far smaller here than in the
+// landscape model-viewer demo — the reason that rule lives in common.
+static const uint32_t TOAST_TEX_W = 768;
+static const uint32_t TOAST_TEX_H = 96;
+static const uint32_t TOAST_FONT_BASE = TOAST_TEX_H * 11;   // ~45px glyphs in a 96px pill
+static const float    TOAST_SIZE_FRACTION = 0.60f;          // of the shorter window side
+// The toast lives in the TOP-25% 2D band (with the speech bubble), NOT near the
+// bottom edge like the model viewer's. Below the band is the tiger's display
+// zone: content there is woven and gated by the avatar's transparency
+// silhouette, which clips a flat chip down to the avatar's outline. The band is
+// pure 2D (that is why the bubble sits there), so the chip composites intact.
+// Anchored to the BOTTOM of the band so it reads as its own strip.
+static const float    TOAST_BAND_BOTTOM = 0.25f;            // = zone rect offset.y / windowH
+static const float    TOAST_BAND_MARGIN = 0.012f;
 
 // Speech-bubble greeting. Wrapped + balanced + centred at render time, re-fit to
 // the panel whenever the window (hence the band sub-rect) is resized.
@@ -255,6 +278,19 @@ static std::mutex g_sceneMutex;
 // fields, #396 W4) — created via the lib's CreateWindowSpaceSwapchain generic,
 // destroyed before CleanupOpenXR. The g_animBtn* slot names predate the strip
 // of the old chrome buttons; they now drive only the bubble pill.
+// Toast layer resources — same shape as the speech-bubble set below, but only
+// submitted on the frames dxr::ToastState says a message is live.
+static dxr::ToastState g_toast;
+static SwapchainInfo  g_toastSwapchain;
+static bool           g_hasToastSwapchain = false;
+static HudRenderer    g_toastHud = {};
+static bool           g_toastReady = false;
+static VkBuffer       g_toastStaging = VK_NULL_HANDLE;
+static VkDeviceMemory g_toastStagingMem = VK_NULL_HANDLE;
+static void*          g_toastStagingMapped = nullptr;
+static VkCommandPool  g_toastCmdPool = VK_NULL_HANDLE;
+static std::vector<XrSwapchainImageVulkanKHR> g_toastSwapImages;
+
 static SwapchainInfo  g_animBtnSwapchain;                // app-owned window-space swapchain
 static bool           g_hasAnimBtnSwapchain = false;
 static HudRenderer    g_animBtnHud = {};                 // own D3D11 text renderer (256×80)
@@ -1149,10 +1185,18 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         // Dynamic-recenter pins: P arms, then X/Y/Z toggle that axis' pin.
         // onKey consumes P (arm) and X/Y/Z (while armed); otherwise falls through.
         if (wParam == 'P' || wParam == 'X' || wParam == 'Y' || wParam == 'Z') {
+            const bool wasArmed = g_recenter.armed();
             if (g_recenter.onKey((char)wParam)) {
                 char lbl[24];
                 g_recenter.hudLabel(lbl, sizeof(lbl));
                 LOG_INFO("Recenter: %s", lbl);
+                // Confirm on screen. The arm prompt stays up for the whole arm
+                // window so the toast and the armed state expire together; a
+                // completed toggle uses the default (shorter) toast lifetime.
+                wchar_t w[64];
+                swprintf(w, 64, L"Recenter  %hs", lbl);
+                g_toast.Show(w, wasArmed ? dxr::ToastState::kDefaultSeconds
+                                         : dxr::RecenterControl::kArmSeconds);
                 return 0;
             }
         }
@@ -2495,6 +2539,106 @@ static void RenderThreadFunc(
                     }
                 }
 
+                // ── Toast layer ──────────────────────────────────────────────
+                // Only built + submitted while a message is live; once it
+                // expires the layer is simply absent from the submission.
+                // Local2D, NOT window-space: window-space layers are stamped into
+                // the projection atlas, which on a zones frame maps to the tiger's
+                // zone rect (bottom 75%) — a chip placed in the top band would fall
+                // outside it and never appear, and one placed inside the zone gets
+                // woven + silhouette-gated. Local2D is how the band is addressed
+                // (it is what the speech bubble uses).
+                XrCompositionLayerLocal2DDXR toastLayer = {(XrStructureType)XR_TYPE_COMPOSITION_LAYER_LOCAL_2D_DXR};
+                bool toastLayerReady = false;
+                {
+                    std::wstring toastText;
+                    float toastAlpha = 1.0f;
+                    if (g_toastReady && g_hasToastSwapchain &&
+                        g_toast.Snapshot(toastText, toastAlpha)) {
+                        uint32_t pitch = 0;
+                        const void* px = RenderToastStandalone(g_toastHud, &pitch,
+                            toastText, toastAlpha);
+                        uint32_t idx = 0;
+                        if (px && AcquireWindowSpaceImage(g_toastSwapchain, idx)) {
+                            uint8_t* dst = (uint8_t*)g_toastStagingMapped;
+                            for (uint32_t row = 0; row < TOAST_TEX_H; ++row)
+                                memcpy(dst + row * TOAST_TEX_W * 4,
+                                       (const uint8_t*)px + row * pitch, TOAST_TEX_W * 4);
+                            UnmapHud(g_toastHud);
+
+                            VkCommandBufferAllocateInfo cai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+                            cai.commandPool = g_toastCmdPool;
+                            cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+                            cai.commandBufferCount = 1;
+                            VkCommandBuffer cb = VK_NULL_HANDLE;
+                            vkAllocateCommandBuffers(vkDevice, &cai, &cb);
+                            VkCommandBufferBeginInfo bgi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+                            bgi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+                            vkBeginCommandBuffer(cb, &bgi);
+                            VkImage img = g_toastSwapImages[idx].image;
+                            VkImageMemoryBarrier bar = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+                            bar.srcAccessMask = 0; bar.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                            bar.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+                            bar.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                            bar.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                            bar.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                            bar.image = img;
+                            bar.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+                            vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                                VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &bar);
+                            VkBufferImageCopy rg = {};
+                            rg.bufferRowLength = TOAST_TEX_W;
+                            rg.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                            rg.imageOffset = {0, 0, 0};
+                            rg.imageExtent = {TOAST_TEX_W, TOAST_TEX_H, 1};
+                            vkCmdCopyBufferToImage(cb, g_toastStaging, img,
+                                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &rg);
+                            bar.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                            bar.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+                            bar.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                            bar.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+                            vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr, 1, &bar);
+                            vkEndCommandBuffer(cb);
+                            VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
+                            si.commandBufferCount = 1; si.pCommandBuffers = &cb;
+                            vkQueueSubmit(graphicsQueue, 1, &si, VK_NULL_HANDLE);
+                            vkQueueWaitIdle(graphicsQueue);
+                            vkFreeCommandBuffers(vkDevice, g_toastCmdPool, 1, &cb);
+                            ReleaseWindowSpaceImage(g_toastSwapchain);
+
+                            // Size from the shared helper, then re-anchor into the
+                            // 2D band (see TOAST_BAND_BOTTOM above). Pass y=0 so
+                            // the helper's off-screen clamp can't fight the
+                            // band placement we apply next.
+                            dxr::ToastLayerRect tr = dxr::ComputeToastLayerRect(
+                                windowW, windowH, (float)TOAST_TEX_W / (float)TOAST_TEX_H,
+                                TOAST_SIZE_FRACTION, 0.0f);
+                            tr.y = TOAST_BAND_BOTTOM - TOAST_BAND_MARGIN - tr.height;
+                            if (tr.y < TOAST_BAND_MARGIN) tr.y = TOAST_BAND_MARGIN;
+
+                            // Local2D takes a PIXEL rect in the window, not fractions.
+                            int32_t rx = (int32_t)(tr.x * (float)windowW + 0.5f);
+                            int32_t ry = (int32_t)(tr.y * (float)windowH + 0.5f);
+                            int32_t rw = (int32_t)(tr.width  * (float)windowW + 0.5f);
+                            int32_t rh = (int32_t)(tr.height * (float)windowH + 0.5f);
+                            if (rw < 2) rw = 2;
+                            if (rh < 2) rh = 2;
+
+                            toastLayer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+                            toastLayer.subImage.swapchain = g_toastSwapchain.swapchain;
+                            toastLayer.subImage.imageRect.offset = {0, 0};
+                            toastLayer.subImage.imageRect.extent = {(int32_t)TOAST_TEX_W, (int32_t)TOAST_TEX_H};
+                            toastLayer.subImage.imageArrayIndex = 0;
+                            toastLayer.rect.offset = {rx, ry};
+                            toastLayer.rect.extent = {rw, rh};
+                            toastLayerReady = true;
+                        } else if (px) {
+                            UnmapHud(g_toastHud);
+                        }
+                    }
+                }
+
                 // Submit frame
                 uint32_t submitViewCount = (xr->renderingModeCount > 0 && xr->currentModeIndex < xr->renderingModeCount) ? xr->renderingModeViewCounts[xr->currentModeIndex] : 2;
                 if (submitViewCount == 0) submitViewCount = 1;
@@ -2519,7 +2663,7 @@ static void RenderThreadFunc(
                         tigerZone.next = nullptr;
                         proj.next = &tigerZone;
                     }
-                    const XrCompositionLayerBaseHeader* layers[2];
+                    const XrCompositionLayerBaseHeader* layers[3];
                     uint32_t layerN = 0;
                     layers[layerN++] = (const XrCompositionLayerBaseHeader*)&proj;
                     if (bubbleReady) {
@@ -2529,6 +2673,10 @@ static void RenderThreadFunc(
                         // top band is already pure 2D — the old full-band transparent
                         // backer that extended the implicit mask is redundant and gone.
                         layers[layerN++] = (const XrCompositionLayerBaseHeader*)&bubbleLayer;
+                    }
+                    // Toast last = on top of both the avatar and the bubble.
+                    if (toastLayerReady) {
+                        layers[layerN++] = (const XrCompositionLayerBaseHeader*)&toastLayer;
                     }
                     XrFrameEndInfo endInfo = {XR_TYPE_FRAME_END_INFO};
                     endInfo.displayTime = frameState.predictedDisplayTime;
@@ -2841,6 +2989,54 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         }
     }
 
+    // ── Toast window-space layer resources ───────────────────────────────────
+    // Same shape as the speech bubble above, sized to the chip, and NOT gated on
+    // g_hasLocal3DZone — confirmations must show on every frame shape. Failure is
+    // non-fatal: the toast just doesn't draw and the HUD line still reports.
+    {
+        if (InitializeHudRenderer(g_toastHud, TOAST_TEX_W, TOAST_TEX_H, TOAST_FONT_BASE) &&
+            CreateWindowSpaceSwapchain(xr, g_toastSwapchain, TOAST_TEX_W, TOAST_TEX_H)) {
+            g_hasToastSwapchain = true;
+            uint32_t c = g_toastSwapchain.imageCount;
+            g_toastSwapImages.resize(c, {XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR});
+            xrEnumerateSwapchainImages(g_toastSwapchain.swapchain, c, &c,
+                (XrSwapchainImageBaseHeader*)g_toastSwapImages.data());
+
+            VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+            bi.size = (VkDeviceSize)TOAST_TEX_W * TOAST_TEX_H * 4;
+            bi.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+            bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+            bool ok = vkCreateBuffer(vkDevice, &bi, nullptr, &g_toastStaging) == VK_SUCCESS;
+            if (ok) {
+                VkMemoryRequirements mr; vkGetBufferMemoryRequirements(vkDevice, g_toastStaging, &mr);
+                VkPhysicalDeviceMemoryProperties mp; vkGetPhysicalDeviceMemoryProperties(physDevice, &mp);
+                uint32_t mt = UINT32_MAX;
+                for (uint32_t i = 0; i < mp.memoryTypeCount; i++)
+                    if ((mr.memoryTypeBits & (1u << i)) &&
+                        (mp.memoryTypes[i].propertyFlags &
+                         (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) ==
+                         (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) { mt = i; break; }
+                if (mt != UINT32_MAX) {
+                    VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+                    ai.allocationSize = mr.size; ai.memoryTypeIndex = mt;
+                    vkAllocateMemory(vkDevice, &ai, nullptr, &g_toastStagingMem);
+                    vkBindBufferMemory(vkDevice, g_toastStaging, g_toastStagingMem, 0);
+                    vkMapMemory(vkDevice, g_toastStagingMem, 0, bi.size, 0, &g_toastStagingMapped);
+                } else ok = false;
+            }
+            if (ok) {
+                VkCommandPoolCreateInfo pci = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+                pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+                pci.queueFamilyIndex = queueFamilyIndex;
+                ok = vkCreateCommandPool(vkDevice, &pci, nullptr, &g_toastCmdPool) == VK_SUCCESS;
+            }
+            g_toastReady = ok;
+            LOG_INFO("Toast layer resources %s", ok ? "created" : "FAILED");
+        } else {
+            LOG_WARN("Toast layer init failed — toasts will not show");
+        }
+    }
+
     ShowWindow(hwnd, nCmdShow);
     UpdateWindow(hwnd);
 
@@ -2903,6 +3099,20 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         xrDestroySwapchain(g_animBtnSwapchain.swapchain);
         g_animBtnSwapchain.swapchain = XR_NULL_HANDLE;
         g_hasAnimBtnSwapchain = false;
+    }
+
+    // Toast layer resources (same teardown order as the bubble above).
+    if (g_toastCmdPool != VK_NULL_HANDLE) vkDestroyCommandPool(vkDevice, g_toastCmdPool, nullptr);
+    if (g_toastStaging != VK_NULL_HANDLE) {
+        if (g_toastStagingMapped) vkUnmapMemory(vkDevice, g_toastStagingMem);
+        vkDestroyBuffer(vkDevice, g_toastStaging, nullptr);
+    }
+    if (g_toastStagingMem != VK_NULL_HANDLE) vkFreeMemory(vkDevice, g_toastStagingMem, nullptr);
+    if (g_toastReady) CleanupHudRenderer(g_toastHud);
+    if (g_toastSwapchain.swapchain != XR_NULL_HANDLE) {
+        xrDestroySwapchain(g_toastSwapchain.swapchain);
+        g_toastSwapchain.swapchain = XR_NULL_HANDLE;
+        g_hasToastSwapchain = false;
     }
 
     // App-owned tiger-zone swapchain (display-zones path), same ordering rule.
