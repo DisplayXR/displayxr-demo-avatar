@@ -417,10 +417,24 @@ static bool CreateAppWindow(AppXrSession& xr) {
     unsigned int w = kDefaultWindowW, h = kDefaultWindowH;
     int px = 0, py = 0;
     int prx = 0, pry = 0, prw = 0, prh = 0;
-    if (GetPanelRect(dpy, root, prx, pry, prw, prh)) {
+    if (xr.displayPixelWidth > 0 && xr.displayPixelHeight > 0) {
+        // Authoritative: XR_DXR_display_info reports the 3D panel's desktop rect
+        // (RandR-derived in the plug-in, queried before this call). Prefer it —
+        // on a multi-monitor box the RandR PRIMARY is often NOT the Leia panel
+        // (e.g. the laptop's own display is primary), so GetPanelRect would center
+        // the avatar on the wrong (2D, non-weaving) monitor.
+        prx = xr.displayScreenLeft;
+        pry = xr.displayScreenTop;
+        prw = (int)xr.displayPixelWidth;
+        prh = (int)xr.displayPixelHeight;
         px = prx + (prw - (int)w) / 2;
         py = pry + (prh - (int)h) / 2;
-        LOG_INFO("Panel rect %dx%d at (%d,%d) — centering %ux%u portrait window at (%d,%d)",
+        LOG_INFO("3D panel (display_info) %dx%d at (%d,%d) — centering %ux%u portrait window at (%d,%d)",
+                 prw, prh, prx, pry, w, h, px, py);
+    } else if (GetPanelRect(dpy, root, prx, pry, prw, prh)) {
+        px = prx + (prw - (int)w) / 2;
+        py = pry + (prh - (int)h) / 2;
+        LOG_INFO("Panel rect (Xrandr) %dx%d at (%d,%d) — centering %ux%u portrait window at (%d,%d)",
                  prw, prh, prx, pry, w, h, px, py);
     } else {
         const int sw = DisplayWidth(dpy, screen), sh = DisplayHeight(dpy, screen);
