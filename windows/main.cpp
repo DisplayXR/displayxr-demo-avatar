@@ -35,6 +35,7 @@
 
 #include "hud_renderer.h"   // HudRenderer + text_overlay (RenderFilledRect/RenderText) — drive the speech bubble
 #include "atlas_capture.h"
+#include "recenter_control.h"  // dynamic-recenter per-axis pins (P then X/Y/Z; DXR_RECENTER_PIN)
 #include <dwrite.h>
 #pragma comment(lib, "dwrite.lib")
 
@@ -279,6 +280,11 @@ static float g_fitCenter[3] = {0.0f, 0.0f, 0.0f};
 static float g_fitVHeight   = kFallbackVirtualDisplayHeightM;
 static float g_fitYaw       = 0.0f;
 static std::atomic<bool> g_fitValid{false};
+
+// Dynamic-recenter pins. Default X Y (not Z) = the avatar's historical behaviour:
+// pin the centroid horizontally+vertically (with A/D pan on X), leave Z as the
+// free W/S dolly. DXR_RECENTER_PIN overrides (e.g. XYZ also pins depth/in-focus).
+static dxr::RecenterControl g_recenter;
 
 // XR_DXR_mcp_tools (#30): agent-tool session state. `g_mcpToolsReady` is set
 // once the appId + base tools are registered (RegisterMcpBaseTools, after
@@ -1140,6 +1146,16 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         if (wParam == 'I' || wParam == 'i') {
             g_captureAtlasRequested.store(true);
         }
+        // Dynamic-recenter pins: P arms, then X/Y/Z toggle that axis' pin.
+        // onKey consumes P (arm) and X/Y/Z (while armed); otherwise falls through.
+        if (wParam == 'P' || wParam == 'X' || wParam == 'Y' || wParam == 'Z') {
+            if (g_recenter.onKey((char)wParam)) {
+                char lbl[24];
+                g_recenter.hudLabel(lbl, sizeof(lbl));
+                LOG_INFO("Recenter: %s", lbl);
+                return 0;
+            }
+        }
         // G key = toggle the alpha edge-softening post-pass (Gaussian silhouette
         // blur). 8× MSAA is always on; this extra per-eye pass is opt-in so the
         // softening / its cost can be A/B'd live on the display.
@@ -1791,13 +1807,23 @@ static void RenderThreadFunc(
         // drift-removing anchor. Applied to inputSnapshot only; g_inputState keeps
         // the accumulated pose (and the pan resets to 0 on Space, which restores
         // cameraPosX = g_fitCenter[0]).
+        //
+        // Per-axis pins (P then X/Y/Z; DXR_RECENTER_PIN): a pinned axis tracks the
+        // animated centroid, an unpinned axis stays at the fit centre. The user's
+        // pan/dolly (cameraPos - fitCentre; A/D->X with kPanSign, W/S->Z) adds on
+        // top of both. Default X Y (Z unpinned) reproduces the historical avatar
+        // exactly: X = anchor + pan, Y = anchor, Z = fitCentre + dolly.
         {
             float anchor[3];
             if (g_fitValid.load() && g_modelRenderer.getAnimatedAnchor(anchor)) {
+                const dxr::RecenterPins pins = g_recenter.pins();
                 const float kPanSign = -1.0f;  // D = avatar right; flip if reversed
-                inputSnapshot.cameraPosX = anchor[0] + kPanSign * (inputSnapshot.cameraPosX - g_fitCenter[0]);
-                inputSnapshot.cameraPosY = anchor[1];
-                // cameraPosZ intentionally left as the user's W/S-driven value.
+                const float offX = kPanSign * (inputSnapshot.cameraPosX - g_fitCenter[0]);
+                const float offY =            (inputSnapshot.cameraPosY - g_fitCenter[1]);
+                const float offZ =            (inputSnapshot.cameraPosZ - g_fitCenter[2]);
+                inputSnapshot.cameraPosX = (pins.x ? anchor[0] : g_fitCenter[0]) + offX;
+                inputSnapshot.cameraPosY = (pins.y ? anchor[1] : g_fitCenter[1]) + offY;
+                inputSnapshot.cameraPosZ = (pins.z ? anchor[2] : g_fitCenter[2]) + offZ;
             }
         }
 
@@ -2590,6 +2616,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     }
 
     LOG_INFO("=== DisplayXR 3D Avatar (Vulkan) ===");
+
+    // Dynamic-recenter pins: default pin X+Y (avatar's historical behaviour),
+    // leave Z as the free W/S dolly. DXR_RECENTER_PIN=XYZ|XY|Z|- overrides.
+    g_recenter.init(/*x=*/true, /*y=*/true, /*z=*/false);
 
     // Add DisplayXR to DLL search path
     {

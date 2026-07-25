@@ -91,6 +91,7 @@
 #include <sys/stat.h>
 
 #include "model_renderer.h"
+#include "recenter_control.h"  // dynamic-recenter per-axis pins (DXR_RECENTER_PIN on Linux)
 #include "model_loader.h"
 #include "model_vulkan_utils.h" // modelCreateBuffer / ModelBuffer (bubble staging)
 
@@ -249,6 +250,10 @@ static float g_fitCenter[3] = {0.0f, 0.0f, 0.0f};        // rig pose position (m
 static float g_fitVHeight = kFallbackVHeightM;           // rig virtualDisplayHeight (model height × comfort)
 static bool g_fitValid = false;
 
+// Dynamic-recenter pins. Default X Y (Z off) matches the Windows avatar. Linux
+// has no keyboard pan/dolly, so control is via DXR_RECENTER_PIN=XYZ|XY|Z|- .
+static dxr::RecenterControl g_recenter;
+
 static void ComputeAutoFit() {
     float center[3], extent[3];
     if (!g_modelRenderer.getRobustSceneBounds(0.05f, 0.95f, center, extent)) {
@@ -264,6 +269,24 @@ static void ComputeAutoFit() {
     g_fitValid = true;
     LOG_INFO("Auto-fit: center=(%.3f,%.3f,%.3f) extent=(%.3f,%.3f,%.3f) vHeight=%.3f",
              center[0], center[1], center[2], extent[0], extent[1], extent[2], vh);
+}
+
+// Rig position for this frame (concept 2, dynamic recenter): a pinned axis tracks
+// the smoothed animated centroid; an unpinned axis stays at the initial fit
+// centre. The Linux avatar has no keyboard pan/dolly, so there is no user offset
+// to add on top (unlike the Windows avatar). Default pins X Y → X,Y track the
+// centroid, Z stays at the framed depth — matching the Windows avatar's default.
+static void ComputeRigPosition(float out[3]) {
+    out[0] = g_fitCenter[0];
+    out[1] = g_fitCenter[1];
+    out[2] = g_fitCenter[2];
+    float anchor[3];
+    if (g_fitValid && g_modelRenderer.getAnimatedAnchor(anchor)) {
+        const dxr::RecenterPins pins = g_recenter.pins();
+        if (pins.x) out[0] = anchor[0];
+        if (pins.y) out[1] = anchor[1];
+        if (pins.z) out[2] = anchor[2];
+    }
 }
 
 // ============================================================================
@@ -1396,7 +1419,8 @@ static bool RenderTigerZone(AppXrSession& xr, const XrFrameState& frameState,
     const int32_t topBand = (int32_t)((float)winH * (1.0f - kAvatarCanvasFrac) + 0.5f);
     XrDisplayRigDXR rig = {XR_TYPE_DISPLAY_RIG_DXR};
     rig.pose.orientation = {0.0f, 0.0f, 0.0f, 1.0f};
-    rig.pose.position = {g_fitCenter[0], g_fitCenter[1], g_fitCenter[2]};
+    float rigPos[3]; ComputeRigPosition(rigPos);
+    rig.pose.position = {rigPos[0], rigPos[1], rigPos[2]};
     rig.virtualDisplayHeight = g_fitValid ? g_fitVHeight : kFallbackVHeightM;
     rig.ipdFactor = 1.0f; rig.parallaxFactor = 1.0f; rig.perspectiveFactor = 1.0f;
 
@@ -1576,6 +1600,15 @@ int main(int argc, char** argv) {
     g_modelRenderer.setPlainViewConvention(true);
     ComputeAutoFit();
 
+    // Dynamic-recenter pins: default pin X+Y (avatar parity), leave Z as the
+    // framed depth. DXR_RECENTER_PIN=XYZ|XY|Z|- overrides (the Linux control path).
+    g_recenter.init(/*x=*/true, /*y=*/true, /*z=*/false);
+    {
+        char lbl[24];
+        g_recenter.hudLabel(lbl, sizeof(lbl));
+        LOG_INFO("Recenter: %s", lbl);
+    }
+
     // Speech-bubble window-space swapchain (Local2D layer) — only when the
     // runtime advertises XR_DXR_local_3d_zone. A dedicated transient-reset command
     // pool feeds the per-frame staging→image upload. Guarded so the app still runs
@@ -1684,7 +1717,8 @@ int main(int argc, char** argv) {
             // (windows/macOS approach) — the model renders at native scale and
             // the rig frames it. Identity orientation (forward = world -Z).
             displayRig.pose.orientation = {0.0f, 0.0f, 0.0f, 1.0f};
-            displayRig.pose.position = {g_fitCenter[0], g_fitCenter[1], g_fitCenter[2]};
+            float dispRigPos[3]; ComputeRigPosition(dispRigPos);
+            displayRig.pose.position = {dispRigPos[0], dispRigPos[1], dispRigPos[2]};
             displayRig.virtualDisplayHeight = g_fitValid ? g_fitVHeight : kFallbackVHeightM;
             displayRig.ipdFactor = 1.0f;
             displayRig.parallaxFactor = 1.0f;
