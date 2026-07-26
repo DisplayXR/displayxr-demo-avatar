@@ -950,16 +950,17 @@ static bool CreateSession(AppXrSession& xr, VkInstance vkInstance, VkPhysicalDev
     // where the graphics binding is chained straight in and the runtime
     // self-creates its window.
     //
-    // Transparency (transparentBackgroundEnabled) is DECOUPLED from the handle
-    // path: it is the compose-through-to-desktop overlay (runtime#757 / #758),
-    // which the shipped Linux runtime does not yet support — requesting it there
-    // aborts the compositor. So it is an OPT-IN (AVATAR_TRANSPARENT=1), OFF by
-    // default, giving a working opaque handle app on the shipped stack today.
-    // Win/mac default it ON because their shipped runtimes support it; flip the
-    // Linux default once #758 (transparent xcb surface) lands + is stable.
+    // Transparency (transparentBackgroundEnabled) is the avatar's raison
+    // d'être — the compose-through-to-desktop overlay (runtime#757 / #758) —
+    // and is ON by default, matching Windows/macOS/Android. The shipped Linux
+    // runtime supports the transparent XCB surface since runtime#758 (v2.1.2+)
+    // and live desktop weave-under (portal/PipeWire bg-capture) since the
+    // dma-buf device-extension enable (runtime v2.2.0 + leia-sr v2.0.5).
+    // AVATAR_TRANSPARENT=0 opts OUT (debug escape hatch, e.g. an old runtime
+    // whose compositor aborts on the transparent surface).
     const bool wantTransparent = []() {
         const char* e = getenv("AVATAR_TRANSPARENT");
-        return e != nullptr && e[0] != '\0' && e[0] != '0';
+        return e == nullptr || e[0] == '\0' || e[0] != '0';
     }();
     XrXlibWindowBindingCreateInfoDXR xlibBinding = {XR_TYPE_XLIB_WINDOW_BINDING_CREATE_INFO_DXR};
     xlibBinding.next = &vkBinding;
@@ -975,8 +976,8 @@ static bool CreateSession(AppXrSession& xr, VkInstance vkInstance, VkPhysicalDev
     sessionInfo.systemId = xr.systemId;
     XR_CHECK(xrCreateSession(xr.instance, &sessionInfo, &xr.session));
     LOG_INFO("Session created (%s)",
-             useAppWindow ? (wantTransparent ? "app-owned window, transparent overlay (AVATAR_TRANSPARENT=1)"
-                                             : "app-owned window, opaque handle app")
+             useAppWindow ? (wantTransparent ? "app-owned window, transparent overlay (default)"
+                                             : "app-owned window, opaque handle app (AVATAR_TRANSPARENT=0)")
                           : "hosted-NULL: runtime self-creates the window");
     return true;
 }
