@@ -14,7 +14,7 @@
  * - XR_DXR_display_info: Kooima projection, display metrics
  * - V key cycles rendering modes via xrRequestDisplayRenderingModeDXR
  * - 0-3 keys select rendering mode directly
- * - L key or button click: NSOpenPanel to load .glb/.gltf models
+ * - Cmd+O or button click: NSOpenPanel to load .glb/.gltf models
  * - Tab: toggle HUD overlay, Space: reset camera, ESC: quit
  */
 
@@ -642,6 +642,12 @@ static void OpenLoadDialog() {
     NSString *chars = [event charactersIgnoringModifiers];
     if ([chars length] == 0) return;
     unichar ch = [chars characterAtIndex:0];
+    // Cmd+O = open a model (uniform across demos + platforms — the native macOS
+    // equivalent of Ctrl+O on Win/Linux). Strict: Cmd must be held.
+    if ((ch == 'o' || ch == 'O') && ([event modifierFlags] & NSEventModifierFlagCommand)) {
+        g_input.loadRequested = true;
+        return;
+    }
     switch (ch) {
         case 'w': case 'W': g_input.keyW = true; break;
         case 'a': case 'A': g_input.keyA = true; break;
@@ -708,9 +714,7 @@ static void OpenLoadDialog() {
                 g_input.eyeTrackingModeToggleRequested = true;
             }
             break;
-        case 'l': case 'L':
-            g_input.loadRequested = true;
-            break;
+        // (model open moved to Cmd+O — see the modifier check above keyDown's switch)
         case '-': case '_': {
             // Edit steadyIpdFactor (the ModeSwitch ramp target); seed ipdFactor
             // in lockstep for the idle/non-ramp render path.

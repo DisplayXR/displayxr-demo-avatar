@@ -1193,9 +1193,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             ToggleFullscreen(hwnd);
             return 0;
         }
-        // O / Ctrl+O = open a model via the native file dialog (Windows parity
-        // for the Linux zenity picker). Fires with or without Ctrl held.
-        if (wParam == 'O') {
+        // Ctrl+O = open a model via the native file dialog (uniform across demos
+        // + platforms; the Linux zenity picker + macOS NSOpenPanel use the same
+        // chord — Cmd+O on macOS). Strict: Ctrl must be held.
+        if (wParam == 'O' && (GetKeyState(VK_CONTROL) & 0x8000)) {
             OpenModelDialog(hwnd);
             return 0;
         }
@@ -3081,7 +3082,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     LOG_INFO("");
     LOG_INFO("=== Entering main loop ===");
-    LOG_INFO("Controls: A/D=Move L/R  W/S=Dolly depth  Ctrl+T=Transparency  G=Edge-soften");
+    LOG_INFO("Controls: A/D=Move L/R  W/S=Dolly depth  Ctrl+O=Open  Ctrl+T=Transparency  G=Edge-soften");
     LOG_INFO("          Space=Reset  V=Mode  N=Clip  K=Play/Pause");
     LOG_INFO("          B=Decoration(move/resize)  I=Capture  F11=Fullscreen  ESC=Quit");
     LOG_INFO("");

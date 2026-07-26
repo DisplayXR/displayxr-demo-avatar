@@ -619,7 +619,9 @@ static void PumpXEvents(AppXrSession& xr) {
         switch (ev.type) {
         case KeyPress: {
             KeySym sym = XLookupKeysym(&ev.xkey, 0);
-            if (sym == XK_o || sym == XK_O) StartFilePicker(); // with or without Ctrl
+            // Ctrl+O = open a model (uniform across demos + platforms). Strict:
+            // Ctrl must be held (bare O does nothing).
+            if ((sym == XK_o || sym == XK_O) && (ev.xkey.state & ControlMask)) StartFilePicker();
             break;
         }
         case ConfigureNotify:
