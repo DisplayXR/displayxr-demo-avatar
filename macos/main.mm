@@ -14,7 +14,7 @@
  * - XR_DXR_display_info: Kooima projection, display metrics
  * - V key cycles rendering modes via xrRequestDisplayRenderingModeDXR
  * - 0-3 keys select rendering mode directly
- * - Cmd+O or button click: NSOpenPanel to load .glb/.gltf models
+ * - Ctrl+O or button click: NSOpenPanel to load .glb/.gltf models
  * - Tab: toggle HUD overlay, Space: reset camera, ESC: quit
  */
 
@@ -642,9 +642,10 @@ static void OpenLoadDialog() {
     NSString *chars = [event charactersIgnoringModifiers];
     if ([chars length] == 0) return;
     unichar ch = [chars characterAtIndex:0];
-    // Cmd+O = open a model (uniform across demos + platforms — the native macOS
-    // equivalent of Ctrl+O on Win/Linux). Strict: Cmd must be held.
-    if ((ch == 'o' || ch == 'O') && ([event modifierFlags] & NSEventModifierFlagCommand)) {
+    // Ctrl+O = open a model. Literal Ctrl (NOT Cmd) on every platform — uniform
+    // with the Win/Linux demos AND the mediaplayer (SDL SDL_KMOD_CTRL). Strict:
+    // Ctrl must be held.
+    if ((ch == 'o' || ch == 'O') && ([event modifierFlags] & NSEventModifierFlagControl)) {
         g_input.loadRequested = true;
         return;
     }
