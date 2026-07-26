@@ -2758,9 +2758,26 @@ static void RenderThreadFunc(
                         // cleared — this makes the frame a ZONES frame: the runtime
                         // weaves the tiger views into the bottom-75% rect, composites
                         // the bubble flat in the top 25%, and auto-derives the wish
-                        // (feathered bottom-75%) — no mask object, nothing chained
-                        // on xrEndFrame.
-                        tigerZone.next = nullptr;
+                        // (BINARY bottom-75%; runtime#800) — no mask object.
+                        //
+                        // Cosmetic edge feather (XrDisplayZoneFeatherDXR, spec v3):
+                        // zone edges are HARD by default; DXR_ZONE_FEATHER_PX=N
+                        // opts this zone's composite edge into an N-px inward
+                        // ramp. Env-gated so the request can be A/B'd live on
+                        // hardware; the published hardware wish stays binary
+                        // either way.
+                        static float s_featherPx = [] {
+                            const char* e = getenv("DXR_ZONE_FEATHER_PX");
+                            return e != nullptr ? (float)atof(e) : 0.0f;
+                        }();
+                        static XrDisplayZoneFeatherDXR s_feather = {
+                            (XrStructureType)XR_TYPE_DISPLAY_ZONE_FEATHER_DXR};
+                        if (s_featherPx > 0.0f) {
+                            s_feather.radiusPx = s_featherPx;
+                            tigerZone.next = &s_feather;
+                        } else {
+                            tigerZone.next = nullptr;
+                        }
                         proj.next = &tigerZone;
                     }
                     const XrCompositionLayerBaseHeader* layers[3];
