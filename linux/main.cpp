@@ -37,6 +37,7 @@
 // the app-owned-window path below.
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
+#include <X11/keysym.h>
 // Xrandr: query the panel (primary / largest non-eDP output) rect so the
 // portrait window opens centered on the 3D display, not the laptop panel.
 #include <X11/extensions/Xrandr.h>
@@ -86,6 +87,8 @@
 #include <string>
 #include <vector>
 #include <unistd.h>
+#include <fcntl.h>
+#include <sys/wait.h>
 #include <libgen.h>
 #include <limits.h>
 #include <sys/stat.h>
@@ -349,6 +352,76 @@ struct AppXrSession {
 static const unsigned int kDefaultWindowW = 811;
 static const unsigned int kDefaultWindowH = 1421;
 
+// ============================================================================
+// File-open dialog (O / Ctrl+O) — async zenity picker + X11 event pump
+// ============================================================================
+
+// Non-blocking zenity file-selection: fork/exec with a pipe, polled every
+// frame so the XR frame loop never stalls. zenity is NOT a hard dependency —
+// when absent the child exits 127 and we log a hint. On success the chosen
+// model replaces the current one and auto-fit re-frames it.
+static pid_t g_pickerPid = -1;
+static int g_pickerFd = -1;
+static std::string g_pickerBuf;
+
+static void StartFilePicker() {
+    if (g_pickerPid > 0) return; // dialog already open
+    int fds[2];
+    if (pipe(fds) != 0) { LOG_WARN("file picker: pipe() failed"); return; }
+    pid_t pid = fork();
+    if (pid < 0) { close(fds[0]); close(fds[1]); LOG_WARN("file picker: fork() failed"); return; }
+    if (pid == 0) {
+        dup2(fds[1], STDOUT_FILENO);
+        close(fds[0]); close(fds[1]);
+        // Start in the exe dir — the bundled models live next to the binary.
+        std::string startDir;
+        { char buf[PATH_MAX];
+          ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+          if (n > 0) { buf[n] = '\0'; startDir = std::string(dirname(buf)) + "/"; } }
+        std::string filenameArg = "--filename=" + startDir;
+        const char* argv[] = {"zenity", "--file-selection", "--title=Open avatar model",
+                              filenameArg.c_str(),
+                              "--file-filter=3D models | *.fbx *.glb *.gltf *.obj *.stl *.FBX *.GLB",
+                              "--file-filter=All files | *", nullptr};
+        execvp("zenity", const_cast<char* const*>(argv));
+        _exit(127); // zenity not installed
+    }
+    close(fds[1]);
+    fcntl(fds[0], F_SETFL, O_NONBLOCK);
+    g_pickerPid = pid;
+    g_pickerFd = fds[0];
+    g_pickerBuf.clear();
+    LOG_INFO("file picker: zenity dialog opened");
+}
+
+static void PollFilePicker() {
+    if (g_pickerPid <= 0) return;
+    char buf[512];
+    ssize_t n;
+    while ((n = read(g_pickerFd, buf, sizeof(buf))) > 0) g_pickerBuf.append(buf, (size_t)n);
+    int status = 0;
+    pid_t r = waitpid(g_pickerPid, &status, WNOHANG);
+    if (r != g_pickerPid) return; // still open
+    while ((n = read(g_pickerFd, buf, sizeof(buf))) > 0) g_pickerBuf.append(buf, (size_t)n);
+    close(g_pickerFd);
+    g_pickerFd = -1; g_pickerPid = -1;
+
+    const int code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    if (code == 127) { LOG_WARN("file picker: zenity not installed (apt install zenity)"); return; }
+    if (code != 0) { LOG_INFO("file picker: cancelled"); return; }
+    while (!g_pickerBuf.empty() && (g_pickerBuf.back() == '\n' || g_pickerBuf.back() == '\r'))
+        g_pickerBuf.pop_back();
+    if (g_pickerBuf.empty()) return;
+    if (!model_validate_file(g_pickerBuf)) { LOG_WARN("file picker: unsupported file '%s'", g_pickerBuf.c_str()); return; }
+    LOG_INFO("Loading model: %s", g_pickerBuf.c_str());
+    if (g_modelRenderer.loadModel(g_pickerBuf.c_str())) {
+        ComputeAutoFit();
+        LOG_INFO("Loaded %s", g_pickerBuf.c_str());
+    } else {
+        LOG_WARN("file picker: load failed for %s", g_pickerBuf.c_str());
+    }
+}
+
 // Find the target panel rect (virtual-desktop px). Prefer the RandR PRIMARY
 // output; else the largest connected NON-eDP/LVDS output (the Odyssey is an
 // external panel, not the laptop's built-in). Fills x,y,w,h with the CRTC rect.
@@ -532,6 +605,34 @@ static bool CreateAppWindow(AppXrSession& xr) {
     xr.xWinH = h;
     LOG_INFO("Created %ux%u 32-bit ARGB portrait app window at (%d,%d)", w, h, px, py);
     return true;
+}
+
+// Pump the app window's X11 events: O / Ctrl+O = open-file dialog (zenity),
+// ConfigureNotify = track the live window size. The window already selects
+// StructureNotifyMask | KeyPressMask at creation; without this pump those
+// events just queued up unread.
+static void PumpXEvents(AppXrSession& xr) {
+    if (xr.xDisplay == nullptr) return;
+    while (XPending(xr.xDisplay) > 0) {
+        XEvent ev;
+        XNextEvent(xr.xDisplay, &ev);
+        switch (ev.type) {
+        case KeyPress: {
+            KeySym sym = XLookupKeysym(&ev.xkey, 0);
+            // Ctrl+O = open a model (uniform across demos + platforms). Strict:
+            // Ctrl must be held (bare O does nothing).
+            if ((sym == XK_o || sym == XK_O) && (ev.xkey.state & ControlMask)) StartFilePicker();
+            break;
+        }
+        case ConfigureNotify:
+            if (ev.xconfigure.width > 0 && ev.xconfigure.height > 0) {
+                xr.xWinW = (unsigned int)ev.xconfigure.width;
+                xr.xWinH = (unsigned int)ev.xconfigure.height;
+            }
+            break;
+        default: break;
+        }
+    }
 }
 
 static bool InitializeOpenXR(AppXrSession& xr) {
@@ -1646,6 +1747,8 @@ int main(int argc, char** argv) {
 
     while (g_running && !xr.exitRequested) {
         PollEvents(xr);
+        PumpXEvents(xr);   // O / Ctrl+O = open-file dialog
+        PollFilePicker();  // async zenity result → loadModel + auto-fit
 
         auto now = std::chrono::high_resolution_clock::now();
         float dt = std::chrono::duration<float>(now - lastTime).count();

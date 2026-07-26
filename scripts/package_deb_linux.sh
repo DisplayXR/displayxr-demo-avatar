@@ -27,7 +27,14 @@ DISPLAY_NAME="DisplayXR 3D Avatar"
 DESCRIPTION="Skeletal-animated glTF avatar/character viewer for glasses-free 3D displays."
 BINARY="avatar_handle_vk_linux"                     # build/linux/<BINARY>
 DESKTOP_CATEGORIES="Graphics;Viewer;"
-ASSETS_SUBDIR="assets"                              # repo dir to bundle, "" if none
+ASSETS_SUBDIR=""                                    # repo dir to bundle under assets/, "" if none
+# Default asset(s) the app auto-loads at startup, staged FLAT next to the binary.
+# The Linux app resolves its bundled model via /proc/self/exe → <exe_dir>/avatar.fbx
+# (NOT an assets/ subdir), and the .fbx references rgb.jpg from the same dir — the
+# same place the Windows NSI drops both in $INSTDIR. Without this the app finds no
+# model and launches empty. Deliberately defaults-only (no assets/ dir bundling).
+# "repo-relative-src:installed-basename" pairs.
+DEFAULT_ASSETS=("assets/tiger/avatar.fbx:avatar.fbx" "assets/tiger/rgb.jpg:rgb.jpg")
 
 set -euo pipefail
 
@@ -74,10 +81,24 @@ for f in "$OPENXR_DIR"/lib/libopenxr_loader.so*; do
 done
 [ -e "$APPDIR/libopenxr_loader.so.1" ] || echo "warn: no bundled OpenXR loader — the demo may need a system libopenxr-loader1." >&2
 
-# Bundle assets (sample models etc.).
+# Bundle assets (extra sample models etc.) under assets/.
 if [ -n "$ASSETS_SUBDIR" ] && [ -d "$ROOT/$ASSETS_SUBDIR" ]; then
   cp -aR "$ROOT/$ASSETS_SUBDIR" "$APPDIR/assets"
 fi
+
+# Stage the default asset(s) FLAT next to the binary. The app resolves its
+# bundled model at <exe_dir>/<name> (via /proc/self/exe), so these must sit
+# beside the binary, NOT under assets/. Mirrors the Windows installer layout.
+for pair in "${DEFAULT_ASSETS[@]:-}"; do
+  [ -n "$pair" ] || continue
+  src="$ROOT/${pair%%:*}"; dst="${pair##*:}"
+  if [ -f "$src" ]; then
+    install -m 0644 "$src" "$APPDIR/$dst"
+    echo "==> default asset staged: $dst ($(du -h "$src" | cut -f1))"
+  else
+    echo "warn: default asset '${pair%%:*}' not found — the demo launches with NO bundled model." >&2
+  fi
+done
 
 # Launcher wrapper on PATH.
 cat > "$STAGE/usr/bin/$PKG" <<EOF

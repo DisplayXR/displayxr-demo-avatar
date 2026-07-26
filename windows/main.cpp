@@ -519,6 +519,35 @@ static void TryAutoLoadBundledScene(const std::string& overridePath = std::strin
     }
 }
 
+// O / Ctrl+O — native GetOpenFileNameA picker → load the chosen model. Windows
+// parity for the Linux zenity dialog + the load_model MCP tool. Runs modally on
+// the message thread; the swap takes g_sceneMutex like every other load path.
+static void OpenModelDialog(HWND hwnd) {
+    OPENFILENAMEA ofn = {};
+    char filePath[MAX_PATH] = {};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = hwnd;
+    ofn.lpstrFilter = "3D Models (fbx;glb;gltf;stl;obj;usd*)\0*.fbx;*.glb;*.gltf;*.stl;*.obj;*.usdz;*.usd;*.usda;*.usdc\0FBX (*.fbx)\0*.fbx\0glTF (*.glb;*.gltf)\0*.glb;*.gltf\0All Files (*.*)\0*.*\0";
+    ofn.lpstrFile = filePath;
+    ofn.nMaxFile = MAX_PATH;
+    ofn.lpstrTitle = "Open avatar model";
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+    if (!GetOpenFileNameA(&ofn)) return; // cancelled
+    if (!model_validate_file(filePath)) {
+        LOG_WARN("Open: unsupported file '%s'", filePath);
+        return;
+    }
+    LOG_INFO("Loading model: %s", filePath);
+    std::lock_guard<std::mutex> lock(g_sceneMutex);
+    if (g_modelRenderer.loadModel(filePath)) {
+        g_loadedFileName = model_basename(filePath);
+        LOG_INFO("Loaded %s (%s)", g_loadedFileName.c_str(), model_filesize_str(filePath).c_str());
+        ApplyAutoFitForLoadedScene_locked();
+    } else {
+        LOG_WARN("Open: load failed for %s", filePath);
+    }
+}
+
 // ============================================================================
 // XR_DXR_mcp_tools (#30) — app-defined agent tools
 // ============================================================================
@@ -1162,6 +1191,13 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         if (wParam == VK_F11) {
             ToggleFullscreen(hwnd);
+            return 0;
+        }
+        // Ctrl+O = open a model via the native file dialog (uniform across demos
+        // + platforms; the Linux zenity picker + macOS NSOpenPanel use the same
+        // chord — Cmd+O on macOS). Strict: Ctrl must be held.
+        if (wParam == 'O' && (GetKeyState(VK_CONTROL) & 0x8000)) {
+            OpenModelDialog(hwnd);
             return 0;
         }
         // B key = toggle window decoration (borderless ⇄ title bar for move/resize)
@@ -3046,7 +3082,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     LOG_INFO("");
     LOG_INFO("=== Entering main loop ===");
-    LOG_INFO("Controls: A/D=Move L/R  W/S=Dolly depth  Ctrl+T=Transparency  G=Edge-soften");
+    LOG_INFO("Controls: A/D=Move L/R  W/S=Dolly depth  Ctrl+O=Open  Ctrl+T=Transparency  G=Edge-soften");
     LOG_INFO("          Space=Reset  V=Mode  N=Clip  K=Play/Pause");
     LOG_INFO("          B=Decoration(move/resize)  I=Capture  F11=Fullscreen  ESC=Quit");
     LOG_INFO("");
