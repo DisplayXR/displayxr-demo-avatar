@@ -124,11 +124,21 @@ GPU-engine attribution) in the session scratchpad.
 - **Item 6 — render directly into the runtime swapchain image.** Needs
   per-swapchain-image framebuffers and the MSAA resolve retargeted at the
   swapchain. Ceiling is the copy engine, measured at 1.2–2.8 %.
-- **Item 9 — `xrGetDisplayZoneRecommendedViewSizeDXR` scale factor**
-  (`oxr_display_zones.c`, `displayxr-runtime`). Genuinely trades quality. Note
-  the measurement narrows its case: the weave runs at panel resolution
-  regardless of tile size, so its reach is smaller than "~4× the fragments"
-  suggests.
+Item 9 is **done**, in `displayxr-runtime` on branch `perf/zone-view-scale`:
+`DXR_ZONE_VIEW_SCALE` trims the advertised per-view size toward the mode's
+resolved resolution, clamped so it never goes below the active mode's own view
+scale. Unset = 1:1 as before.
+
+| `DXR_ZONE_VIEW_SCALE` | per-view tile | views/s | app GPU % |
+|---|---|---|---|
+| unset | 811×1066 | 119.4 | 13.53 |
+| 0.5 | 406×533 | 119.2 | **11.41** |
+
+−15.7 % with frame rate unchanged, so it is real fill reduction. I had predicted
+1–3 % on the grounds that the weave is panel-resolution — true, but the app's own
+shading, its per-view blits and the atlas composite all scale with tile size.
+This is the one change here that costs image quality, so it stays opt-in until
+someone eyeballs 0.5 and a couple of intermediate values on hardware.
 - **Item 4's depth/alpha-only silhouette pipeline.** Measured silhouette cost is
   ~0.3 % of GPU, which does not justify a second pipeline + shader + render pass.
 
