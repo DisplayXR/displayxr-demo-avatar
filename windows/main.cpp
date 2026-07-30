@@ -1758,6 +1758,67 @@ static void TryActivateZones(XrSessionManager* xr) {
              caps.maxZones3D, capW, capH, n);
 }
 
+// ── Idle throttling ─────────────────────────────────────────────────────────
+// Leo is an ambient companion: most of its life it sits still with the clip
+// paused and nothing to redraw. Measurement on a Meteor Lake iGPU showed the
+// model render is only ~2.5 % of GPU while the app process sits at ~15 % — the
+// rest is the in-process compositor, the Leia weave and the copy-engine blits,
+// all of which are driven by SUBMISSION rate, not by how cheap the render is.
+// So the lever is to submit fewer frames, not to shave the render.
+//
+// Whole frames are skipped rather than just the render: the Windows Leia DP
+// does not self-submit, so a submitted-but-unchanged frame still pays for the
+// full weave. Skipping the frame lets the display hold the last weave instead.
+//
+// The cost is that head-motion is only noticed on frames we DO run, so the ramp
+// back to full rate takes up to 1/idleHz. That is why the default is a fairly
+// brisk 15 Hz rather than the 2-3 Hz the still-image case would allow: a stale
+// weave under head motion shows up as crosstalk, and this needs a hardware
+// eyeball to tune. All three knobs are env-overridable.
+namespace {
+
+struct IdleThrottleCfg {
+    bool     enabled  = true;
+    uint32_t hz       = 15;    // frame rate while idle
+    uint32_t graceMs  = 2000;  // quiet time before throttling engages
+};
+
+IdleThrottleCfg ReadIdleThrottleCfg() {
+    IdleThrottleCfg c;
+    if (const char* e = std::getenv("DXR_AVATAR_IDLE_THROTTLE")) c.enabled = (std::atoi(e) != 0);
+    if (const char* e = std::getenv("DXR_AVATAR_IDLE_HZ")) {
+        const int v = std::atoi(e);
+        if (v >= 1 && v <= 240) c.hz = (uint32_t)v;
+    }
+    if (const char* e = std::getenv("DXR_AVATAR_IDLE_GRACE_MS")) {
+        const int v = std::atoi(e);
+        if (v >= 0 && v <= 60000) c.graceMs = (uint32_t)v;
+    }
+    std::printf("Idle throttling: %s (idle %u Hz, grace %u ms)\n",
+                c.enabled ? "ON" : "OFF", c.hz, c.graceMs);
+    std::fflush(stdout);
+    return c;
+}
+
+// Head/viewer motion large enough to need a fresh weave. 2 mm and ~0.5 deg are
+// below what is visible but above tracker jitter at rest.
+// Set on frames we run when the located pose has moved; consumed (and cleared)
+// by the throttle gate on the next iteration.
+std::atomic<bool> g_headMoved{false};
+uint32_t g_throttlePrevWinW = 0, g_throttlePrevWinH = 0;
+
+bool PoseMovedEnough(const XrPosef& a, const XrPosef& b) {
+    const float dx = a.position.x - b.position.x;
+    const float dy = a.position.y - b.position.y;
+    const float dz = a.position.z - b.position.z;
+    if ((dx * dx + dy * dy + dz * dz) > (0.002f * 0.002f)) return true;
+    const float dot = a.orientation.x * b.orientation.x + a.orientation.y * b.orientation.y +
+                      a.orientation.z * b.orientation.z + a.orientation.w * b.orientation.w;
+    return std::fabs(dot) < 0.99996f;   // ~0.5 deg
+}
+
+}  // namespace
+
 static void RenderThreadFunc(
     HWND hwnd,
     XrSessionManager* xr,
@@ -1965,6 +2026,123 @@ static void RenderThreadFunc(
         // dispatch via the app-supplied mcpToolHandler hook (common #18, #30).
         PollEvents(*xr);
 
+        // ── Idle throttle gate ──────────────────────────────────────────────
+        // Placed after PollEvents (events must keep pumping while throttled) and
+        // after the g_inputState write-back above, so skipping the rest of the
+        // iteration cannot drop consumed input flags.
+        static const IdleThrottleCfg s_idle = ReadIdleThrottleCfg();
+        {
+            static uint64_t s_lastActivityMs = GetTickCount64();
+            static uint64_t s_lastFrameMs    = 0;
+            static float    s_prevCamX = 0.0f, s_prevCamY = 0.0f, s_prevCamZ = 0.0f, s_prevYaw = 0.0f;
+            static bool     s_havePrevCam = false;
+
+            const uint64_t nowMs = GetTickCount64();
+
+            // Anything that changes what should be on screen counts as activity.
+            // g_headMoved is set from the located pose on frames we actually run.
+            // Epsilon, not exact equality: the camera anchor is rebased each frame
+            // onto the skeleton centroid, so while a clip plays it drifts by tiny
+            // amounts every frame. That drift is a CONSEQUENCE of the animation
+            // (which is counted separately below), not independent activity — an
+            // exact compare made camMoved true on 100 % of iterations and idle
+            // unreachable. 0.5 mm / ~0.03 deg is well under visible.
+            const bool camMoved = !s_havePrevCam ||
+                std::fabs(inputSnapshot.cameraPosX - s_prevCamX) > 0.0005f ||
+                std::fabs(inputSnapshot.cameraPosY - s_prevCamY) > 0.0005f ||
+                std::fabs(inputSnapshot.cameraPosZ - s_prevCamZ) > 0.0005f ||
+                std::fabs(inputSnapshot.yaw        - s_prevYaw)  > 0.0005f;
+            s_prevCamX = inputSnapshot.cameraPosX; s_prevCamY = inputSnapshot.cameraPosY;
+            s_prevCamZ = inputSnapshot.cameraPosZ; s_prevYaw  = inputSnapshot.yaw;
+            s_havePrevCam = true;
+
+            // A playing skeletal clip is the real "there is something to redraw"
+            // signal — the avatar changes every frame regardless of input or head
+            // pose, so throttling is only ever legitimate once it is paused.
+            // DXR_AVATAR_START_PAUSED=1: begin with the clip paused. A measurement
+            // hook — the idle path is otherwise only reachable by pressing pause,
+            // which a headless perf run cannot do.
+            static bool s_startPausedDone = false;
+            if (!s_startPausedDone) {
+                s_startPausedDone = true;
+                const char* e = std::getenv("DXR_AVATAR_START_PAUSED");
+                if (e && std::atoi(e) != 0) {
+                    std::lock_guard<std::mutex> lock(g_sceneMutex);
+                    if (g_modelRenderer.hasAnimations()) g_modelRenderer.setPaused(true);
+                }
+            }
+
+            bool clipPlaying;
+            {
+                std::lock_guard<std::mutex> lock(g_sceneMutex);
+                clipPlaying = g_modelRenderer.hasAnimations() && !g_modelRenderer.isPaused();
+            }
+
+            const bool headMoved = g_headMoved.exchange(false);
+            const bool active =
+                headMoved ||
+                camMoved || resetRequested || animateToggle || cycleClip || playPause ||
+                bgToggled ||
+                clipPlaying ||
+                inputSnapshot.animationActive || inputSnapshot.transitioning ||
+                inputSnapshot.animateEnabled ||
+                inputSnapshot.teleportRequested ||
+                inputSnapshot.fullscreenToggleRequested ||
+                inputSnapshot.cycleRenderingModeRequested ||
+                inputSnapshot.absoluteRenderingModeRequested >= 0 ||
+                inputSnapshot.eyeTrackingModeToggleRequested ||
+                windowW != g_throttlePrevWinW || windowH != g_throttlePrevWinH;
+
+            g_throttlePrevWinW = windowW;
+            g_throttlePrevWinH = windowH;
+
+            // DXR_AVATAR_IDLE_DEBUG=1: count which reasons hold the app awake and
+            // dump every 2 s. Without this it is guesswork which single condition
+            // is pinning the frame rate.
+            static const bool s_idleDebug = [] {
+                const char* e = std::getenv("DXR_AVATAR_IDLE_DEBUG");
+                return e && std::atoi(e) != 0;
+            }();
+            if (s_idleDebug) {
+                static uint64_t s_dbgT0 = nowMs;
+                static uint32_t nIter = 0, nCam = 0, nHead = 0, nAnim = 0, nTrans = 0,
+                                nWin = 0, nInput = 0, nActive = 0, nClip = 0;
+                nIter++;
+                if (clipPlaying) nClip++;
+                if (camMoved) nCam++;
+                if (inputSnapshot.animationActive) nAnim++;
+                if (inputSnapshot.transitioning)   nTrans++;
+                if (windowW != g_throttlePrevWinW || windowH != g_throttlePrevWinH) nWin++;
+                if (resetRequested || animateToggle || cycleClip || playPause || bgToggled ||
+                    inputSnapshot.teleportRequested || inputSnapshot.fullscreenToggleRequested ||
+                    inputSnapshot.cycleRenderingModeRequested ||
+                    inputSnapshot.absoluteRenderingModeRequested >= 0 ||
+                    inputSnapshot.eyeTrackingModeToggleRequested) nInput++;
+                if (headMoved) nHead++;
+                if (active) nActive++;
+                if (nowMs - s_dbgT0 >= 2000) {
+                    std::printf("idle-debug over %llu ms: iters=%u active=%u | clip=%u cam=%u "
+                                "head=%u anim=%u trans=%u win=%u input=%u\n",
+                                (unsigned long long)(nowMs - s_dbgT0), nIter, nActive,
+                                nClip, nCam, nHead, nAnim, nTrans, nWin, nInput);
+                    std::fflush(stdout);
+                    s_dbgT0 = nowMs;
+                    nIter = nCam = nHead = nAnim = nTrans = nWin = nInput = nActive = nClip = 0;
+                }
+            }
+
+            if (active) s_lastActivityMs = nowMs;
+
+            if (s_idle.enabled && (nowMs - s_lastActivityMs) > s_idle.graceMs) {
+                const uint64_t periodMs = 1000ull / s_idle.hz;
+                if ((nowMs - s_lastFrameMs) < periodMs) {
+                    Sleep(2);   // stay responsive to input without spinning
+                    continue;
+                }
+            }
+            s_lastFrameMs = nowMs;
+        }
+
         if (xr->sessionRunning) {
             XrFrameState frameState;
             if (BeginFrame(*xr, frameState)) {
@@ -2006,6 +2184,21 @@ static void RenderThreadFunc(
                         XrView rawViews[8];
                         for (uint32_t i = 0; i < 8; i++) rawViews[i] = {XR_TYPE_VIEW};
                         xrLocateViews(xr->session, &locateInfo, &viewState, 8, &viewCount, rawViews);
+
+                        // Idle throttle: the raw located pose is the head/viewer
+                        // position the weave depends on. Latch any real motion so
+                        // the gate above drops back to full rate — a stale weave
+                        // under head motion reads as crosstalk, and the DP will
+                        // not re-weave on its own on Windows.
+                        if (viewCount > 0 && (viewState.viewStateFlags &
+                                              XR_VIEW_STATE_POSITION_VALID_BIT)) {
+                            static XrPosef s_prevHeadPose = {};
+                            static bool    s_havePrevHead = false;
+                            if (s_havePrevHead && PoseMovedEnough(rawViews[0].pose, s_prevHeadPose))
+                                g_headMoved.store(true);
+                            s_prevHeadPose = rawViews[0].pose;
+                            s_havePrevHead = true;
+                        }
 
                         bool monoMode = (xr->renderingModeCount > 0 && !xr->renderingModeDisplay3D[xr->currentModeIndex]);
 
