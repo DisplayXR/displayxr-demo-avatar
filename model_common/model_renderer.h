@@ -48,6 +48,13 @@ struct ModelRenderer {
     // still recomputed, so a clip switch / pause shows the correct frame).
     void updateAnimation(float dtSeconds);
 
+    // Frame boundary — call once per frame BEFORE updateAnimation and any
+    // renderEye. Waits for the previous frame's per-view submissions so their
+    // ring slots and the joint-matrix SSBO can be safely rewritten. Skipping
+    // this call would race the GPU; it is what replaces the old per-view
+    // vkQueueWaitIdle.
+    void beginFrame();
+
     // ── Playback control (Phase 4). All no-op without animations. ────────────
     void setActiveAnimation(int index);   // clamps/wraps; resets time + bind pose
     void cycleAnimation();                 // → next clip (wraps); no-op if <2 clips
@@ -255,7 +262,18 @@ private:
     VkPipeline fadePipeline_ = VK_NULL_HANDLE;
     VkDescriptorPool descriptorPool_ = VK_NULL_HANDLE;
     VkDescriptorSet descriptorSet_ = VK_NULL_HANDLE;
-    ModelBuffer uniformBuffer_;   // host-visible UniformBlock
+    // Ring of per-view UniformBlocks + matching command buffers and fences, so
+    // renderEye no longer has to drain the queue after every view. kRingSlots
+    // must be >= the most renderEye calls in one frame: max view count (4 for a
+    // 2x2 quad mode) plus the 2 silhouette passes.
+    static constexpr uint32_t kRingSlots = 8;
+    ModelBuffer   uniformBuffer_;                 // host-visible UniformBlock[kRingSlots]
+    VkDeviceSize  uboStride_ = 0;                 // aligned per-slot stride
+    VkCommandBuffer ringCmd_[kRingSlots]   = {};  // pre-allocated, reused
+    VkFence         ringFence_[kRingSlots] = {};
+    bool            ringSubmitted_[kRingSlots] = {};
+    uint32_t        ringSlot_  = 0;               // next slot to use this frame
+    uint32_t        ringInUse_ = 0;               // slots submitted this frame
 
     // ── Material textures (set = 1: 5 combined image samplers) ───────────
     VkSampler sampler_ = VK_NULL_HANDLE;
@@ -294,6 +312,7 @@ private:
     ModelBuffer jointBuffer_;                            // host-visible mat4[] SSBO
     std::vector<ModelSkin> skins_;
     uint32_t jointCount_ = 0;                            // matrices in jointBuffer_
+    float    skinAccum_ = 0.0f;                          // DXR_AVATAR_SKIN_HZ accumulator
 
     // ── Morph targets (Phase 3: CPU blend into a host-visible vertex buffer) ─
     bool hasMorph_ = false;                  // → vertexBuffer_ is host-visible

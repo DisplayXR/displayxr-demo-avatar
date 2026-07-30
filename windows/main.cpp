@@ -1470,8 +1470,14 @@ static void UpdateSilhouette(VkDevice dev, VkPhysicalDevice phys, VkQueue queue,
                             const float (*viewMats)[16], const float (*projMats)[16],
                             const float* clipFars, uint32_t numViews) {
     if (winW == 0 || winH == 0 || numViews == 0) return;
-    uint32_t w = winW / 3; if (w < 64) w = 64; if (w > 640) w = 640;
-    uint32_t h = winH / 3; if (h < 64) h = 64; if (h > 360) h = 360;
+    // Capped to 256x144 (was 640x360 — 6.2x the pixels). This mask is only ever
+    // consumed by WM_NCHITTEST, at a 3x3 dilation, to decide whether a click is
+    // on the avatar: a 256-wide mask over an ~800 px window is ~3 px of hit
+    // precision, which is finer than the dilation already applied. The extra
+    // resolution was buying nothing and every pixel is a full PBR+IBL+skinned
+    // shade at the renderer's MSAA level, twice (first and last view).
+    uint32_t w = winW / 3; if (w < 64) w = 64; if (w > 256) w = 256;
+    uint32_t h = winH / 3; if (h < 64) h = 64; if (h > 144) h = 144;
     if (!EnsureSilhouetteTargets(dev, phys, w, h)) return;
 
     const uint32_t silIdx[2] = {0, numViews - 1};
@@ -1523,8 +1529,25 @@ static void UpdateSilhouette(VkDevice dev, VkPhysicalDevice phys, VkQueue queue,
         vkEndCommandBuffer(cmd);
         VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
         si.commandBufferCount = 1; si.pCommandBuffers = &cmd;
-        vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE);
-        vkQueueWaitIdle(queue);
+
+        // Wait on a fence for THIS submission rather than vkQueueWaitIdle. The
+        // readback genuinely has to land before the CPU reads g_silMapped, so the
+        // wait cannot be removed outright here — but draining the entire queue
+        // also flushed the eye renders and anything else in flight. A fence
+        // scopes the stall to the copy we actually depend on.
+        static VkFence s_silFence = VK_NULL_HANDLE;
+        if (s_silFence == VK_NULL_HANDLE) {
+            VkFenceCreateInfo fci = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+            vkCreateFence(dev, &fci, nullptr, &s_silFence);
+        }
+        if (s_silFence != VK_NULL_HANDLE) {
+            vkResetFences(dev, 1, &s_silFence);
+            vkQueueSubmit(queue, 1, &si, s_silFence);
+            vkWaitForFences(dev, 1, &s_silFence, VK_TRUE, UINT64_MAX);
+        } else {
+            vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE);
+            vkQueueWaitIdle(queue);
+        }
         vkFreeCommandBuffers(dev, pool, 1, &cmd);
 
         const uint8_t* px = (const uint8_t*)g_silMapped;
@@ -1970,6 +1993,12 @@ static void RenderThreadFunc(
             }
         }
         // Advance node/TRS animation once per frame (no-op for static models).
+        // Frame boundary for the renderer's per-view ring. MUST precede
+        // updateAnimation: that rewrites the joint-matrix SSBO, which the
+        // previous frame's views may still be reading now that renderEye no
+        // longer drains the queue after each one.
+        g_modelRenderer.beginFrame();
+
         g_modelRenderer.updateAnimation(perfStats.deltaTime);
 
         // On Space-reset: shared UpdateCameraMovement returns to (0,0,0) + default

@@ -323,7 +323,15 @@ bool ModelRenderer::createRenderTargets() {
     VkSubpassDependency deps[2] = {};
     deps[0].srcSubpass    = VK_SUBPASS_EXTERNAL;
     deps[0].dstSubpass    = 0;
-    deps[0].srcStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+    // TRANSFER is in the source scope so this pass's colour/resolve WRITES are
+    // ordered after the PREVIOUS view's vkCmdBlitImage READ of colorImage_ — a
+    // write-after-read on a target set that every view shares. With the per-view
+    // queue drain gone, nothing else provides that ordering. (Barriers' source
+    // scope covers everything earlier in submission order on the queue, so this
+    // reaches back into the previous submission.)
+    deps[0].srcStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                            VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
+                            VK_PIPELINE_STAGE_TRANSFER_BIT;
     deps[0].dstStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
     deps[0].srcAccessMask = 0;
     deps[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
@@ -528,7 +536,7 @@ bool ModelRenderer::createPipeline() {
     // Set-0: one UBO, visible to vertex + fragment.
     VkDescriptorSetLayoutBinding b0 = {};
     b0.binding = 0;
-    b0.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    b0.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
     b0.descriptorCount = 1;
     b0.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
     VkDescriptorSetLayoutCreateInfo dlci = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
@@ -853,7 +861,7 @@ bool ModelRenderer::createPipeline() {
     }
 
     // Descriptor pool + set + the host-visible uniform buffer.
-    VkDescriptorPoolSize ps = {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1};
+    VkDescriptorPoolSize ps = {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1};
     VkDescriptorPoolCreateInfo dpci = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     dpci.maxSets = 1;
     dpci.poolSizeCount = 1;
@@ -866,17 +874,31 @@ bool ModelRenderer::createPipeline() {
     dsai.pSetLayouts = &dsLayout_;
     if (vkAllocateDescriptorSets(device_, &dsai, &descriptorSet_) != VK_SUCCESS) return false;
 
-    uniformBuffer_ = modelCreateBuffer(device_, physDevice_, sizeof(UniformBlock),
+    // One UniformBlock PER SLOT, not one shared block. updateUniforms is called
+    // once per view, so a single block plus a per-view queue stall was the only
+    // thing stopping view 2 from overwriting view 1's matrices mid-flight —
+    // removing that stall without ringing this would silently collapse stereo.
+    // Slots are handed out per renderEye call and reused a frame later, gated by
+    // the matching fence in beginFrame().
+    {
+        VkPhysicalDeviceProperties props;
+        vkGetPhysicalDeviceProperties(physDevice_, &props);
+        const VkDeviceSize align = props.limits.minUniformBufferOffsetAlignment;
+        uboStride_ = sizeof(UniformBlock);
+        if (align > 0) uboStride_ = ((uboStride_ + align - 1) / align) * align;
+    }
+    uniformBuffer_ = modelCreateBuffer(device_, physDevice_, uboStride_ * kRingSlots,
         VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
     if (uniformBuffer_.buffer == VK_NULL_HANDLE) return false;
 
+    // range = ONE block; the dynamic offset selects the slot at bind time.
     VkDescriptorBufferInfo dbi = {uniformBuffer_.buffer, 0, sizeof(UniformBlock)};
     VkWriteDescriptorSet w = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
     w.dstSet = descriptorSet_;
     w.dstBinding = 0;
     w.descriptorCount = 1;
-    w.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    w.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
     w.pBufferInfo = &dbi;
     vkUpdateDescriptorSets(device_, 1, &w, 0, nullptr);
     return true;
@@ -1417,10 +1439,35 @@ void ModelRenderer::updateUniforms(const float viewMatrix[16], const float projM
     ub.lightDir[0] = lx / ln; ub.lightDir[1] = ly / ln; ub.lightDir[2] = lz / ln;
     ub.lightDir[3] = (clipFar > 0.0f) ? clipFar : 0.0f;  // foreground clip (view-space)
 
+    // Write this view's own slot; the dynamic descriptor offset in renderEye
+    // points the shader at it.
+    const VkDeviceSize off = (VkDeviceSize)ringSlot_ * uboStride_;
     void* mapped = nullptr;
-    vkMapMemory(device_, uniformBuffer_.memory, 0, sizeof(UniformBlock), 0, &mapped);
+    vkMapMemory(device_, uniformBuffer_.memory, off, sizeof(UniformBlock), 0, &mapped);
     std::memcpy(mapped, &ub, sizeof(UniformBlock));
     vkUnmapMemory(device_, uniformBuffer_.memory);
+}
+
+// Frame boundary. Called once per frame BEFORE any renderEye. Waits for the
+// previous frame's submissions so this frame can safely reuse ring slots and so
+// the caller can safely rewrite the joint-matrix SSBO (which is per-frame, not
+// per-slot, and is therefore what bounds us to one frame in flight rather than
+// two or three — ringing it is the next step if more overlap is wanted).
+void ModelRenderer::beginFrame() {
+    if (!initialized_) return;
+    if (ringInUse_ > 0) {
+        VkFence waitFences[kRingSlots];
+        uint32_t n = 0;
+        for (uint32_t i = 0; i < ringInUse_ && i < kRingSlots; i++)
+            if (ringSubmitted_[i] && ringFence_[i] != VK_NULL_HANDLE) waitFences[n++] = ringFence_[i];
+        if (n > 0) {
+            vkWaitForFences(device_, n, waitFences, VK_TRUE, UINT64_MAX);
+            vkResetFences(device_, n, waitFences);
+        }
+        for (uint32_t i = 0; i < kRingSlots; i++) ringSubmitted_[i] = false;
+    }
+    ringSlot_ = 0;
+    ringInUse_ = 0;
 }
 
 namespace {
@@ -1516,6 +1563,30 @@ glm::mat4 nodeLocal(const ModelNode& n) {
 void ModelRenderer::updateAnimation(float dtSeconds) {
     // Static fast-path: no clip → primitives keep their once-baked modelMatrix.
     if (activeAnim_ < 0 || activeAnim_ >= (int)animations_.size()) return;
+
+    // Optional skinning rate cap (DXR_AVATAR_SKIN_HZ, 0 = uncapped = default).
+    // Time still advances at full rate; only the resample + hierarchy re-walk +
+    // joint upload are skipped, so playback speed is unaffected — but the pose
+    // is held between updates, which IS visible as judder on fast motion. Hence
+    // off by default: this is a CPU/upload saving, not a GPU-pixel one (the
+    // joint SSBO is a few KB), so it does not buy back iGPU fill rate.
+    static const float s_skinHz = [] {
+        const char* e = std::getenv("DXR_AVATAR_SKIN_HZ");
+        const float v = e ? (float)std::atof(e) : 0.0f;
+        if (v > 0.0f) std::printf("ModelRenderer: skinning capped to %.1f Hz\n", v);
+        return v;
+    }();
+    if (s_skinHz > 0.0f && !paused_) {
+        skinAccum_ += dtSeconds;
+        const float period = 1.0f / s_skinHz;
+        if (skinAccum_ < period) {
+            animTime_ += dtSeconds;   // keep the clock honest; skip the resample
+            const float dur = animations_[activeAnim_].duration;
+            if (dur > 0.0f) while (animTime_ > dur) animTime_ -= dur;
+            return;
+        }
+        skinAccum_ = 0.0f;
+    }
     const Animation& anim = animations_[activeAnim_];
 
     // Advance + loop the playhead within the clip duration (frozen when paused;
@@ -1923,14 +1994,36 @@ void ModelRenderer::renderEye(VkImage swapchainImage,
                         swapchainFormat == VK_FORMAT_B8G8R8A8_SRGB ||
                         swapchainFormat == VK_FORMAT_A8B8G8R8_SRGB_PACK32);
 
+    // Pre-allocated ring slot instead of an allocate/free pair per view. If a
+    // frame somehow needs more than kRingSlots views, fall back to waiting so we
+    // can safely reuse slot 0 rather than corrupting in-flight work.
+    if (ringSlot_ >= kRingSlots) {
+        vkQueueWaitIdle(queue_);
+        for (uint32_t i = 0; i < kRingSlots; i++) {
+            if (ringSubmitted_[i] && ringFence_[i] != VK_NULL_HANDLE)
+                vkResetFences(device_, 1, &ringFence_[i]);
+            ringSubmitted_[i] = false;
+        }
+        ringSlot_ = 0;
+        ringInUse_ = 0;
+    }
+    const uint32_t slot = ringSlot_;
+    if (ringCmd_[slot] == VK_NULL_HANDLE) {
+        VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        ai.commandPool = cmdPool_;
+        ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        ai.commandBufferCount = 1;
+        if (vkAllocateCommandBuffers(device_, &ai, &ringCmd_[slot]) != VK_SUCCESS) return;
+        VkFenceCreateInfo fci = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        if (vkCreateFence(device_, &fci, nullptr, &ringFence_[slot]) != VK_SUCCESS) return;
+    }
+    VkCommandBuffer cmd = ringCmd_[slot];
+    vkResetCommandBuffer(cmd, 0);
+
+    // AFTER the slot is settled: updateUniforms writes into slot `ringSlot_`, so
+    // the fallback above must not be able to move the slot out from under it.
     updateUniforms(viewMatrix, projMatrix, clipFarViewSpace);
 
-    VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-    ai.commandPool = cmdPool_;
-    ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    ai.commandBufferCount = 1;
-    VkCommandBuffer cmd;
-    vkAllocateCommandBuffers(device_, &ai, &cmd);
     VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(cmd, &bi);
@@ -1995,7 +2088,12 @@ void ModelRenderer::renderEye(VkImage swapchainImage,
 
     // Set 0 (camera UBO) + set 2 (IBL): constant for the frame, shared by the
     // skybox and model pipelines (same layout).
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_, 0, 1, &descriptorSet_, 0, nullptr);
+    // Dynamic offset selects THIS view's UniformBlock slot.
+    {
+        const uint32_t dynOffset = (uint32_t)((VkDeviceSize)slot * uboStride_);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_,
+                                0, 1, &descriptorSet_, 1, &dynOffset);
+    }
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_, 2, 1, &iblSet_, 0, nullptr);
     // Set 3 (joint-matrix SSBO): one buffer for the whole model, bound once.
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_, 3, 1, &jointSet_, 0, nullptr);
@@ -2055,7 +2153,35 @@ void ModelRenderer::renderEye(VkImage swapchainImage,
         const float fadePush[3] = {(float)viewportWidth, (float)viewportHeight, edgeFadePx};
         vkCmdPushConstants(cmd, fadePipelineLayout_, VK_SHADER_STAGE_FRAGMENT_BIT,
                            0, sizeof(fadePush), fadePush);
-        vkCmdDraw(cmd, 3, 1, 0, 0);
+
+        // Only the border band can change anything: edge_fade.frag computes
+        // f = clamp(d/featherPx, 0, 1), so at d >= featherPx it emits alpha 0 and
+        // the blend degenerates to dst *= 1. Scissoring to a band of featherPx is
+        // therefore byte-identical while skipping the whole tile interior — which
+        // matters here because this blends against MSAA samples, so the interior
+        // was costing a full-tile read-modify-write per sample per view.
+        //
+        // The band is drawn as FOUR NON-OVERLAPPING strips. An overlapping ring
+        // (e.g. two full-width bars plus two full-height bars) would multiply the
+        // corners twice and darken them.
+        const uint32_t band = (uint32_t)std::ceil(edgeFadePx);
+        if (band > 0 && viewportWidth > 2 * band && viewportHeight > 2 * band) {
+            const VkRect2D strips[4] = {
+                {{0, 0},                                  {viewportWidth, band}},
+                {{0, (int32_t)(viewportHeight - band)},    {viewportWidth, band}},
+                {{0, (int32_t)band},                       {band, viewportHeight - 2 * band}},
+                {{(int32_t)(viewportWidth - band), (int32_t)band},
+                                                           {band, viewportHeight - 2 * band}},
+            };
+            for (const VkRect2D& s : strips) {
+                vkCmdSetScissor(cmd, 0, 1, &s);
+                vkCmdDraw(cmd, 3, 1, 0, 0);
+            }
+            vkCmdSetScissor(cmd, 0, 1, &scissor);   // restore for anything after
+        } else {
+            // Tile too small to split — the band would cover it anyway.
+            vkCmdDraw(cmd, 3, 1, 0, 0);
+        }
     }
 
     vkCmdEndRenderPass(cmd);
@@ -2157,12 +2283,20 @@ void ModelRenderer::renderEye(VkImage swapchainImage,
     VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
     si.commandBufferCount = 1;
     si.pCommandBuffers = &cmd;
-    vkQueueSubmit(queue_, 1, &si, VK_NULL_HANDLE);
-    vkQueueWaitIdle(queue_);
+    // No queue drain: this slot's fence is waited on in beginFrame() before the
+    // slot (and its UniformBlock) is reused next frame.
+    vkQueueSubmit(queue_, 1, &si, ringFence_[slot]);
+    ringSubmitted_[slot] = true;
+    ringSlot_++;
+    ringInUse_ = ringSlot_;
 
-    // Safe to read the queries straight back while the stall above is still
-    // here; whoever removes it must move this to a one-frame-late read.
+    // GPU timing needs the results to be ready, so it keeps its own targeted
+    // wait on just this submission rather than reinstating the queue drain. Only
+    // active under DXR_AVATAR_GPUTIME, so the measured path is slightly more
+    // serialised than the shipping one — fine for comparing configs, but do not
+    // read absolute frame rates off a GPUTIME run.
     if (gpuTimeOn_) {
+        vkWaitForFences(device_, 1, &ringFence_[slot], VK_TRUE, UINT64_MAX);
         uint64_t ts[2] = {0, 0};
         if (vkGetQueryPoolResults(device_, tsPool_, 0, 2, sizeof(ts), ts,
                                   sizeof(uint64_t),
@@ -2203,8 +2337,7 @@ void ModelRenderer::renderEye(VkImage swapchainImage,
             }
         }
     }
-
-    vkFreeCommandBuffers(device_, cmdPool_, 1, &cmd);
+    // cmd + fence belong to the ring — freed in cleanup(), not here.
 }
 
 void ModelRenderer::cleanupModel() {
@@ -2269,6 +2402,17 @@ void ModelRenderer::cleanup() {
     }
     if (uniformBuffer_.buffer != VK_NULL_HANDLE) modelDestroyBuffer(device_, uniformBuffer_);
     if (tsPool_ != VK_NULL_HANDLE) { vkDestroyQueryPool(device_, tsPool_, nullptr); tsPool_ = VK_NULL_HANDLE; gpuTimeOn_ = false; }
+    for (uint32_t i = 0; i < kRingSlots; i++) {
+        if (ringCmd_[i] != VK_NULL_HANDLE && cmdPool_ != VK_NULL_HANDLE) {
+            vkFreeCommandBuffers(device_, cmdPool_, 1, &ringCmd_[i]);
+            ringCmd_[i] = VK_NULL_HANDLE;
+        }
+        if (ringFence_[i] != VK_NULL_HANDLE) {
+            vkDestroyFence(device_, ringFence_[i], nullptr);
+            ringFence_[i] = VK_NULL_HANDLE;
+        }
+        ringSubmitted_[i] = false;
+    }
     if (descriptorPool_ != VK_NULL_HANDLE) { vkDestroyDescriptorPool(device_, descriptorPool_, nullptr); descriptorPool_ = VK_NULL_HANDLE; }
     if (pipeline_ != VK_NULL_HANDLE) { vkDestroyPipeline(device_, pipeline_, nullptr); pipeline_ = VK_NULL_HANDLE; }
     if (skyboxPipeline_ != VK_NULL_HANDLE) { vkDestroyPipeline(device_, skyboxPipeline_, nullptr); skyboxPipeline_ = VK_NULL_HANDLE; }
