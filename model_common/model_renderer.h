@@ -193,9 +193,42 @@ private:
     ModelImage colorImageMS_;  // MSAA color target; resolved into colorImage_ at pass end
     ModelImage colorImage_;    // 1-sample resolve target (also sole target when MSAA=1)
     ModelImage depthImage_;
-    VkSampleCountFlagBits msaaSamples_ = VK_SAMPLE_COUNT_8_BIT;
+    // Default 2x, not 8x — the weave already resamples ~2x-supersampled content
+    // down, so extra samples cost iGPU bandwidth for no visible detail. Override
+    // with DXR_AVATAR_MSAA (1|2|4|8); clamped to device support in
+    // createRenderTargets().
+    VkSampleCountFlagBits msaaSamples_ = VK_SAMPLE_COUNT_2_BIT;
     VkRenderPass renderPass_ = VK_NULL_HANDLE;
     VkFramebuffer framebuffer_ = VK_NULL_HANDLE;
+
+    // Target sizing is driven by the largest VIEWPORT any caller has asked for
+    // recently, not by the swapchain — the zone swapchain is pre-sized to the
+    // fullscreen worst case (2·dispW × 2·(0.75·dispH), i.e. 7680×3240 on a 4K
+    // panel) and sizing 8×-MSAA colour+depth to that costs ~1.8 GB of shared
+    // iGPU memory to draw a small window's tile.
+    //
+    // Grow-only, because renderEye has two callers with very different extents
+    // in the same frame (the per-eye tile and the ~1/3-scale silhouette) and
+    // sizing to each exactly would destroy/recreate the targets twice a frame.
+    // peakW_/peakH_ track the high-water viewport over a sliding window of calls
+    // so a maximise→restore still gives the memory back.
+    uint32_t peakW_ = 0, peakH_ = 0;   // high-water viewport this window
+    uint32_t sizeObsCalls_ = 0;        // renderEye calls in the current window
+    static constexpr uint32_t kSizeObsWindow = 256;  // ~2 s at 2 views + silhouette
+
+    // ── GPU timing (DXR_AVATAR_GPUTIME=1) ────────────────────────────────
+    // Timestamp queries bracketing the per-view command buffer, so a change can
+    // be judged on GPU ms/view instead of Task Manager %. Off by default.
+    VkQueryPool tsPool_     = VK_NULL_HANDLE;
+    bool        gpuTimeOn_  = false;
+    double      tsPeriodNs_ = 0.0;      // ns per timestamp tick
+    size_t      targetBytes_ = 0;       // device memory held by the render targets
+
+    // Bucketed by viewport extent, because renderEye serves both the per-eye
+    // tile and the ~1/3-scale silhouette pass — averaging them together would
+    // understate the tile, which is the number that matters.
+    struct GpuTimeBucket { uint32_t w = 0, h = 0; double ms = 0.0; uint32_t n = 0; };
+    GpuTimeBucket gpuBuckets_[4];
 
     // ── Edge-softening post-pass (Step B AA) ──────────────────────────────
     // Reads the MSAA-resolved colorImage_ and applies a 3×3 alpha-weighted
