@@ -1779,7 +1779,8 @@ namespace {
 
 struct IdleThrottleCfg {
     bool     enabled  = true;
-    uint32_t hz       = 15;    // frame rate while idle
+    uint32_t hz       = 15;    // frame rate while idle, viewer present
+    uint32_t awayHz   = 5;     // frame rate while no viewer is tracked
     uint32_t graceMs  = 2000;  // quiet time before throttling engages
 };
 
@@ -1790,12 +1791,16 @@ IdleThrottleCfg ReadIdleThrottleCfg() {
         const int v = std::atoi(e);
         if (v >= 1 && v <= 240) c.hz = (uint32_t)v;
     }
+    if (const char* e = std::getenv("DXR_AVATAR_AWAY_HZ")) {
+        const int v = std::atoi(e);
+        if (v >= 1 && v <= 240) c.awayHz = (uint32_t)v;
+    }
     if (const char* e = std::getenv("DXR_AVATAR_IDLE_GRACE_MS")) {
         const int v = std::atoi(e);
         if (v >= 0 && v <= 60000) c.graceMs = (uint32_t)v;
     }
-    std::printf("Idle throttling: %s (idle %u Hz, grace %u ms)\n",
-                c.enabled ? "ON" : "OFF", c.hz, c.graceMs);
+    std::printf("Idle throttling: %s (idle %u Hz, away %u Hz, grace %u ms)\n",
+                c.enabled ? "ON" : "OFF", c.hz, c.awayHz, c.graceMs);
     std::fflush(stdout);
     return c;
 }
@@ -1806,6 +1811,11 @@ IdleThrottleCfg ReadIdleThrottleCfg() {
 // by the throttle gate on the next iteration.
 std::atomic<bool> g_headMoved{false};
 uint32_t g_throttlePrevWinW = 0, g_throttlePrevWinH = 0;
+
+// Whether a viewer is actually tracked this frame (XrViewEyeTrackingStateDXR).
+// Starts true so a runtime that never reports tracking state behaves exactly as
+// before rather than silently throttling to the away rate.
+std::atomic<bool> g_viewerTracked{true};
 
 bool PoseMovedEnough(const XrPosef& a, const XrPosef& b) {
     const float dx = a.position.x - b.position.x;
@@ -2078,7 +2088,12 @@ static void RenderThreadFunc(
                 clipPlaying = g_modelRenderer.hasAnimations() && !g_modelRenderer.isPaused();
             }
 
-            const bool headMoved = g_headMoved.exchange(false);
+            // Head motion only counts as activity while a viewer is actually
+            // tracked. With no face detected the pose is a fallback whose jitter
+            // would otherwise hold the app awake forever — which is what stopped
+            // the first cut of this from ever engaging.
+            const bool viewerTracked = g_viewerTracked.load();
+            const bool headMoved = g_headMoved.exchange(false) && viewerTracked;
             const bool active =
                 headMoved ||
                 camMoved || resetRequested || animateToggle || cycleClip || playPause ||
@@ -2106,8 +2121,9 @@ static void RenderThreadFunc(
             if (s_idleDebug) {
                 static uint64_t s_dbgT0 = nowMs;
                 static uint32_t nIter = 0, nCam = 0, nHead = 0, nAnim = 0, nTrans = 0,
-                                nWin = 0, nInput = 0, nActive = 0, nClip = 0;
+                                nWin = 0, nInput = 0, nActive = 0, nClip = 0, nTracked = 0;
                 nIter++;
+                if (viewerTracked) nTracked++;
                 if (clipPlaying) nClip++;
                 if (camMoved) nCam++;
                 if (inputSnapshot.animationActive) nAnim++;
@@ -2122,19 +2138,23 @@ static void RenderThreadFunc(
                 if (active) nActive++;
                 if (nowMs - s_dbgT0 >= 2000) {
                     std::printf("idle-debug over %llu ms: iters=%u active=%u | clip=%u cam=%u "
-                                "head=%u anim=%u trans=%u win=%u input=%u\n",
+                                "head=%u anim=%u trans=%u win=%u input=%u tracked=%u\n",
                                 (unsigned long long)(nowMs - s_dbgT0), nIter, nActive,
-                                nClip, nCam, nHead, nAnim, nTrans, nWin, nInput);
+                                nClip, nCam, nHead, nAnim, nTrans, nWin, nInput, nTracked);
                     std::fflush(stdout);
                     s_dbgT0 = nowMs;
-                    nIter = nCam = nHead = nAnim = nTrans = nWin = nInput = nActive = nClip = 0;
+                    nIter = nCam = nHead = nAnim = nTrans = nWin = nInput = nActive = nClip =
+                        nTracked = 0;
                 }
             }
 
             if (active) s_lastActivityMs = nowMs;
 
             if (s_idle.enabled && (nowMs - s_lastActivityMs) > s_idle.graceMs) {
-                const uint64_t periodMs = 1000ull / s_idle.hz;
+                // Nobody looking → the weave cannot be wrong for anyone, so drop
+                // further than the viewer-present idle rate.
+                const uint64_t periodMs =
+                    1000ull / (viewerTracked ? s_idle.hz : s_idle.awayHz);
                 if ((nowMs - s_lastFrameMs) < periodMs) {
                     Sleep(2);   // stay responsive to input without spinning
                     continue;
@@ -2177,6 +2197,14 @@ static void RenderThreadFunc(
                         locateInfo.space = xr->localSpace;
 
                         XrViewState viewState = {XR_TYPE_VIEW_STATE};
+                        // Authoritative per-frame "is a viewer actually being
+                        // tracked". Drives the idle throttle: with no face
+                        // detected the reported pose is a fallback (last known /
+                        // nominal viewer), so its jitter must NOT be treated as
+                        // someone moving — and nobody is looking, so there is
+                        // nothing for a fresh weave to be correct for.
+                        XrViewEyeTrackingStateDXR etState = {XR_TYPE_VIEW_EYE_TRACKING_STATE_DXR};
+                        viewState.next = &etState;
                         // Over-allocate to the runtime's max possible view_count (sim_display
                         // reports 4 for Quad mode; LeiaSR reports 2). Hardcoding 2 here used
                         // to fail with XR_ERROR_SIZE_INSUFFICIENT under sim_display.
@@ -2190,6 +2218,8 @@ static void RenderThreadFunc(
                         // the gate above drops back to full rate — a stale weave
                         // under head motion reads as crosstalk, and the DP will
                         // not re-weave on its own on Windows.
+                        g_viewerTracked.store(etState.isTracking == XR_TRUE);
+
                         if (viewCount > 0 && (viewState.viewStateFlags &
                                               XR_VIEW_STATE_POSITION_VALID_BIT)) {
                             static XrPosef s_prevHeadPose = {};
