@@ -2644,6 +2644,35 @@ static void RenderThreadFunc(
                                     // it collapses to (0, 0).
                                     uint32_t col = (uint32_t)eye % cols;
                                     uint32_t row = (uint32_t)eye / cols;
+                                    // One-shot: are the per-view matrices the app
+                                    // receives actually different? Distinguishes
+                                    // "runtime handed us identical eye poses" from
+                                    // "the renderer lost the per-view uniforms".
+                                    // Sampled PERIODICALLY, not just at startup: at
+                                    // frame 0 eye tracking has not engaged and both
+                                    // eyes sit on the nominal viewer, so an early-only
+                                    // sample says nothing about steady state.
+                                    if (std::getenv("DXR_AVATAR_DUMP_VIEWMATS")) {
+                                        static uint64_t s_lastDump = 0;
+                                        static int  s_dumps = 0;
+                                        static bool s_dumpThisFrame = false;
+                                        const uint64_t nowD = GetTickCount64();
+                                        if (eye == 0) {
+                                            s_dumpThisFrame =
+                                                (s_dumps < 16) && (nowD - s_lastDump >= 1500);
+                                            if (s_dumpThisFrame) { s_lastDump = nowD; s_dumps++; }
+                                        }
+                                        if (s_dumpThisFrame) {
+                                            std::printf("viewmat t=%llums eye=%d "
+                                                        "T=(%.6f,%.6f,%.6f) proj[0]=%.6f "
+                                                        "proj[8]=%.6f proj[9]=%.6f\n",
+                                                        (unsigned long long)nowD, eye,
+                                                        viewMat[eye][12], viewMat[eye][13],
+                                                        viewMat[eye][14], projMat[eye][0],
+                                                        projMat[eye][8], projMat[eye][9]);
+                                            std::fflush(stdout);
+                                        }
+                                    }
                                     if (zonesFrame) {
                                         // Full tile + content-alpha edge feather
                                         // (ADR-027 rule 4 — the wish mask can't
@@ -2685,6 +2714,23 @@ static void RenderThreadFunc(
                             // any multi-view layout the runtime advertises; skipped
                             // for mono (1×1). Filename auto-increments. The prefix
                             // has no ".png"; the runtime appends "_atlas.png".
+                            // DXR_AVATAR_CAPTURE_AFTER_MS=N: fire one atlas capture
+                            // N ms in, without needing the 'I' key. Verification
+                            // hook — the two views in the captured atlas are how
+                            // you confirm stereo is intact (see the UBO ring).
+                            {
+                                static const int s_capAfterMs = [] {
+                                    const char* e = std::getenv("DXR_AVATAR_CAPTURE_AFTER_MS");
+                                    return e ? std::atoi(e) : 0;
+                                }();
+                                static bool s_capFired = false;
+                                static const uint64_t s_capT0 = GetTickCount64();
+                                if (s_capAfterMs > 0 && !s_capFired &&
+                                    (GetTickCount64() - s_capT0) >= (uint64_t)s_capAfterMs) {
+                                    s_capFired = true;
+                                    g_captureAtlasRequested.store(true);
+                                }
+                            }
                             if (g_captureAtlasRequested.exchange(false)) {
                                 if (!hasGsScene) {
                                     LOG_WARN("Capture skipped: no model loaded");
