@@ -176,6 +176,34 @@ time, `-Only` to isolate one item), `luid_probe.ps1`, `bgcap_ab.ps1`,
 - `DXR_AVATAR_GPUTIME` adds a per-view fence wait, so absolute frame rates from a
   GPUTIME run are slightly pessimistic. Fine for comparing configs.
 
+## Where the bottleneck actually is: presentation, not the app
+
+Running the same binary in-process vs under `XRT_FORCE_MODE=ipc` with
+`displayxr-service` (3 reps, clean runs only):
+
+| | app | service | dwm | system total |
+|---|---|---|---|---|
+| in-process (`_handle`) | 15.5–15.8 | 0 | 12.9–13.1 | **30.3–30.4** |
+| IPC / service compositor | 18.0–18.7 | 3.75 | **3.0** | **26.9–27.7** |
+
+Two things fall out, and one hypothesis dies:
+
+- **The transparent overlay window costs ~10 points of dwm.** dwm collapses from
+  ~13 to ~3.0 when presentation moves to the service, taking the system total down
+  ~3.5 points even though the app's own column *rises*. That is the largest single
+  lever found anywhere in this work, it is worth more than every app-side item
+  combined, and it is a presentation-model question — runtime and plug-in, not this
+  repo. (dwm was on the original "don't chase, both samples use transparency"
+  list.)
+- **IPC does not move the weave out of the app's column.** The app stays at ~18.4
+  while the service accounts for only 3.75, and views/s *drops* (114–120 → ~103),
+  so the client→service path costs more per frame in-app than it removes. The
+  theory that Unity's 18 % looks cheaper because its weave is attributed to the
+  service is **not supported**: the weave cost does not follow the mode switch
+  here. Do not use it to explain the 18-vs-33 gap.
+- The app's own model render is ~2 of ~15 points, and is now ~1. There is no
+  app-side work left that is worth more than a point.
+
 ## Side finding: the transparency path is cheap, its fallback is not
 
 `LEIA_DP_DISABLE_BG_CAPTURE=1` makes the plug-in fall back from WGC background
