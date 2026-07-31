@@ -184,16 +184,44 @@ views/s 116 → 105). Whatever else is true of the transparency path, WGC captur
 not the expensive part of it, and this env var is not a perf win despite reading
 like one.
 
+## Landmines in what shipped
+
+- **The per-view `vkQueueWaitIdle` was load-bearing.** One shared
+  `uniformBuffer_` was rewritten per view, so the drain was the only thing
+  stopping view 2 clobbering view 1's matrices. Removing it without ringing the
+  UBO silently collapses stereo — frame rate up, GPU down, 3D quietly broken.
+  Now a `UNIFORM_BUFFER_DYNAMIC` ring with one block per view.
+- **`beginFrame()` must precede `updateAnimation()`.** It waits the previous
+  frame's submissions; `updateAnimation` rewrites the joint SSBO, which is
+  per-frame rather than per-slot and is what bounds us to one frame in flight.
+  Ringing the joint buffer is the prerequisite for 2–3 frames in flight.
+- **The feather band must be four non-overlapping strips.** An overlapping ring
+  multiplies the corners twice and darkens them.
+- **Removing stalls raises frame rate, which raises GPU %.** Item 3 alone would
+  have read as a regression against a GPU-% target. It has to land with
+  throttling or a cap.
+
 ## Not done
 
-- **Item 6 — render directly into the runtime swapchain image.** Now the largest
-  remaining app-side lever: the copy engine costs a steady **3.4–3.6 points** while
-  playing (and falls to ~1.5 when throttled, so it is submission-scaled, i.e. it
-  really is the per-frame blit). That is ~23 % of the app's ~15 points, against
-  item 9's 0.5. Earlier notes put the ceiling at 1.2–2.8 % and treated it as the
-  low-value leftover; on the counter method it outranks everything except
-  throttling. Needs per-swapchain-image framebuffers and the MSAA resolve
-  retargeted at the swapchain.
+- **Item 6 — render directly into the runtime swapchain image.** Ceiling is **well
+  under 1 point**; not worth the refactor. Two measurements bound it:
+  - The `renderEye` timestamps bracket everything *including* the final
+    `vkCmdBlitImage`, and that whole per-view total is only **1.9 points** at MSAA
+    2× / full tile. The blit is a part of that, not an addition to it.
+  - Quartering the tile area (`DXR_ZONE_VIEW_SCALE=0.5`) takes that total 1.97 →
+    1.02, so **all** area-proportional per-view work — render + feather + blit —
+    is ~1.3 points combined. Removing only the blit saves a fraction of that.
+
+  The copy engine's steady 3.4–3.6 points is **not** this blit: it is unchanged
+  when the tile is quartered (3.54→3.57, 3.59→3.59, 3.33→3.27), so it is a
+  fixed-size per-frame cost — the weave/present at panel resolution — and it is
+  submission-scaled only in the sense that it happens once per frame. A
+  graphics-queue blit lands on the 3d engine anyway, not the copy engine.
+
+  Against that, the change needs per-swapchain-image framebuffers and the MSAA
+  resolve retargeted at the swapchain, in the code path where removing a
+  synchronisation mistake already silently collapsed stereo once (see landmines).
+  Not a good trade.
 - **Item 4's depth/alpha-only silhouette pipeline.** Measured silhouette cost is
   ~0.3 % of GPU, which does not justify a second pipeline + shader + render pass.
 - **Root cause of the intermittent +8-point state.** Ruled out: adapter switch,
