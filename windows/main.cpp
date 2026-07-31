@@ -2761,14 +2761,16 @@ static void RenderThreadFunc(
                         // (BINARY bottom-75%; runtime#800) — no mask object.
                         //
                         // Cosmetic edge feather (XrDisplayZoneFeatherDXR, spec v3):
-                        // zone edges are HARD by default; DXR_ZONE_FEATHER_PX=N
-                        // opts this zone's composite edge into an N-px inward
-                        // ramp. Env-gated so the request can be A/B'd live on
-                        // hardware; the published hardware wish stays binary
-                        // either way.
+                        // zone edges are HARD by default at the runtime; this
+                        // demo SHIPS a 16-px soft zone-vs-band edge (the product
+                        // call deferred in #48, made for the avatar look when the
+                        // Unity desktop-avatar shipped the same radius —
+                        // unity#238). DXR_ZONE_FEATHER_PX=N still overrides for
+                        // live A/B (0 = hard); the published hardware wish stays
+                        // binary either way.
                         static float s_featherPx = [] {
                             const char* e = getenv("DXR_ZONE_FEATHER_PX");
-                            return e != nullptr ? (float)atof(e) : 0.0f;
+                            return e != nullptr ? (float)atof(e) : 16.0f;
                         }();
                         static XrDisplayZoneFeatherDXR s_feather = {
                             (XrStructureType)XR_TYPE_DISPLAY_ZONE_FEATHER_DXR};
