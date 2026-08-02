@@ -4,7 +4,7 @@ Context: Lenovo benchmarked the Unity desktop-avatar sample at ~18 % GPU and thi
 native demo at ~33 % on their iGPU, same content and window size. Goal was
 single-digit iGPU usage with no visible quality regression.
 
-Measured on a Meteor Lake box (Intel Arc iGPU driving a Leia DS1_156, 3840×2160
+Measured on a Meteor Lake box (Intel Arc iGPU driving a Leia display, DS1_156, 3840×2160
 panel), window 463×812, tile 811×1066 per view, 60 Hz → ~117 views/s.
 
 ## Read the measurement section first
@@ -118,7 +118,7 @@ reachable from one binary.
 The last four are test hooks. They earned their keep and are all inert unless
 set, but they are test surface in a shipping demo and want a keep/strip call.
 
-Not ours, but load-bearing for any measurement here: `LEIA_DP_DISABLE_BG_CAPTURE`
+Not ours, but load-bearing for any measurement here: the Leia DP env `LEIA_DP_DISABLE_BG_CAPTURE`
 (plug-in side) — see the chroma-key note below.
 
 ## Measurement
@@ -206,7 +206,7 @@ Two things fall out, and one hypothesis dies:
 
 ## Side finding: the transparency path is cheap, its fallback is not
 
-`LEIA_DP_DISABLE_BG_CAPTURE=1` makes the plug-in fall back from WGC background
+Setting the Leia DP env `LEIA_DP_DISABLE_BG_CAPTURE=1` makes the plug-in fall back from WGC background
 capture to chroma-key, and app GPU **rises** from ~18 % to ~39 % (paired, 3 reps;
 views/s 116 → 105). Whatever else is true of the transparency path, WGC capture is
 not the expensive part of it, and this env var is not a perf win despite reading

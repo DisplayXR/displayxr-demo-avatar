@@ -233,7 +233,7 @@ static void perfLogf(const char* fmt, ...) {
 
 bool ModelRenderer::createRenderTargets() {
     // MSAA sample count. Default 2x: the zone views already render the zone rect
-    // 1:1 while Leia's 3D modes weave at 0.5x0.5 view scale, so the content is
+    // 1:1 while the Leia SR 3D modes weave at 0.5x0.5 view scale, so the content is
     // ~2x linear supersampled before the weave resamples it down — samples beyond
     // 2x are spent on detail the panel cannot resolve. On a bandwidth-bound iGPU
     // each extra sample is another full-tile colour+depth write plus more resolve
