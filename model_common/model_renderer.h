@@ -48,6 +48,13 @@ struct ModelRenderer {
     // still recomputed, so a clip switch / pause shows the correct frame).
     void updateAnimation(float dtSeconds);
 
+    // Frame boundary — call once per frame BEFORE updateAnimation and any
+    // renderEye. Waits for the previous frame's per-view submissions so their
+    // ring slots and the joint-matrix SSBO can be safely rewritten. Skipping
+    // this call would race the GPU; it is what replaces the old per-view
+    // vkQueueWaitIdle.
+    void beginFrame();
+
     // ── Playback control (Phase 4). All no-op without animations. ────────────
     void setActiveAnimation(int index);   // clamps/wraps; resets time + bind pose
     void cycleAnimation();                 // → next clip (wraps); no-op if <2 clips
@@ -193,9 +200,42 @@ private:
     ModelImage colorImageMS_;  // MSAA color target; resolved into colorImage_ at pass end
     ModelImage colorImage_;    // 1-sample resolve target (also sole target when MSAA=1)
     ModelImage depthImage_;
-    VkSampleCountFlagBits msaaSamples_ = VK_SAMPLE_COUNT_8_BIT;
+    // Default 2x, not 8x — the weave already resamples ~2x-supersampled content
+    // down, so extra samples cost iGPU bandwidth for no visible detail. Override
+    // with DXR_AVATAR_MSAA (1|2|4|8); clamped to device support in
+    // createRenderTargets().
+    VkSampleCountFlagBits msaaSamples_ = VK_SAMPLE_COUNT_2_BIT;
     VkRenderPass renderPass_ = VK_NULL_HANDLE;
     VkFramebuffer framebuffer_ = VK_NULL_HANDLE;
+
+    // Target sizing is driven by the largest VIEWPORT any caller has asked for
+    // recently, not by the swapchain — the zone swapchain is pre-sized to the
+    // fullscreen worst case (2·dispW × 2·(0.75·dispH), i.e. 7680×3240 on a 4K
+    // panel) and sizing 8×-MSAA colour+depth to that costs ~1.8 GB of shared
+    // iGPU memory to draw a small window's tile.
+    //
+    // Grow-only, because renderEye has two callers with very different extents
+    // in the same frame (the per-eye tile and the ~1/3-scale silhouette) and
+    // sizing to each exactly would destroy/recreate the targets twice a frame.
+    // peakW_/peakH_ track the high-water viewport over a sliding window of calls
+    // so a maximise→restore still gives the memory back.
+    uint32_t peakW_ = 0, peakH_ = 0;   // high-water viewport this window
+    uint32_t sizeObsCalls_ = 0;        // renderEye calls in the current window
+    static constexpr uint32_t kSizeObsWindow = 256;  // ~2 s at 2 views + silhouette
+
+    // ── GPU timing (DXR_AVATAR_GPUTIME=1) ────────────────────────────────
+    // Timestamp queries bracketing the per-view command buffer, so a change can
+    // be judged on GPU ms/view instead of Task Manager %. Off by default.
+    VkQueryPool tsPool_     = VK_NULL_HANDLE;
+    bool        gpuTimeOn_  = false;
+    double      tsPeriodNs_ = 0.0;      // ns per timestamp tick
+    size_t      targetBytes_ = 0;       // device memory held by the render targets
+
+    // Bucketed by viewport extent, because renderEye serves both the per-eye
+    // tile and the ~1/3-scale silhouette pass — averaging them together would
+    // understate the tile, which is the number that matters.
+    struct GpuTimeBucket { uint32_t w = 0, h = 0; double ms = 0.0; uint32_t n = 0; };
+    GpuTimeBucket gpuBuckets_[4];
 
     // ── Edge-softening post-pass (Step B AA) ──────────────────────────────
     // Reads the MSAA-resolved colorImage_ and applies a 3×3 alpha-weighted
@@ -222,7 +262,18 @@ private:
     VkPipeline fadePipeline_ = VK_NULL_HANDLE;
     VkDescriptorPool descriptorPool_ = VK_NULL_HANDLE;
     VkDescriptorSet descriptorSet_ = VK_NULL_HANDLE;
-    ModelBuffer uniformBuffer_;   // host-visible UniformBlock
+    // Ring of per-view UniformBlocks + matching command buffers and fences, so
+    // renderEye no longer has to drain the queue after every view. kRingSlots
+    // must be >= the most renderEye calls in one frame: max view count (4 for a
+    // 2x2 quad mode) plus the 2 silhouette passes.
+    static constexpr uint32_t kRingSlots = 8;
+    ModelBuffer   uniformBuffer_;                 // host-visible UniformBlock[kRingSlots]
+    VkDeviceSize  uboStride_ = 0;                 // aligned per-slot stride
+    VkCommandBuffer ringCmd_[kRingSlots]   = {};  // pre-allocated, reused
+    VkFence         ringFence_[kRingSlots] = {};
+    bool            ringSubmitted_[kRingSlots] = {};
+    uint32_t        ringSlot_  = 0;               // next slot to use this frame
+    uint32_t        ringInUse_ = 0;               // slots submitted this frame
 
     // ── Material textures (set = 1: 5 combined image samplers) ───────────
     VkSampler sampler_ = VK_NULL_HANDLE;
@@ -261,6 +312,7 @@ private:
     ModelBuffer jointBuffer_;                            // host-visible mat4[] SSBO
     std::vector<ModelSkin> skins_;
     uint32_t jointCount_ = 0;                            // matrices in jointBuffer_
+    float    skinAccum_ = 0.0f;                          // DXR_AVATAR_SKIN_HZ accumulator
 
     // ── Morph targets (Phase 3: CPU blend into a host-visible vertex buffer) ─
     bool hasMorph_ = false;                  // → vertexBuffer_ is host-visible
