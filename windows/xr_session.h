@@ -55,28 +55,26 @@ extern PFN_xrUnregisterMCPToolDXR  g_pfnUnregisterMCPTool;
 extern int32_t g_displayDesktopLeft;
 extern int32_t g_displayDesktopTop;
 
-// Initialize OpenXR instance with Vulkan + win32_window_binding extensions
+// Initialize OpenXR instance with Vulkan (vulkan_enable2) + win32_window_binding extensions
 bool InitializeOpenXR(XrSessionManager& xr);
 
-// Get Vulkan graphics requirements and set up Vulkan instance/device per OpenXR spec
+// Get Vulkan graphics requirements (xrGetVulkanGraphicsRequirements2KHR)
 bool GetVulkanGraphicsRequirements(XrSessionManager& xr);
 
-// Create Vulkan instance with required extensions from the runtime
+// Create Vulkan instance via xrCreateVulkanInstanceKHR — the runtime appends
+// the instance extensions it needs.
 bool CreateVulkanInstance(XrSessionManager& xr, VkInstance& vkInstance);
 
-// Get the physical device selected by the runtime
+// Get the physical device selected by the runtime (xrGetVulkanGraphicsDevice2KHR)
 bool GetVulkanPhysicalDevice(XrSessionManager& xr, VkInstance vkInstance, VkPhysicalDevice& physDevice);
-
-// Get required device extensions from the runtime
-bool GetVulkanDeviceExtensions(XrSessionManager& xr, VkInstance vkInstance, VkPhysicalDevice physDevice,
-    std::vector<const char*>& deviceExtensions, std::vector<std::string>& extensionStorage);
 
 // Find a graphics queue family
 bool FindGraphicsQueueFamily(VkPhysicalDevice physDevice, uint32_t& queueFamilyIndex);
 
-// Create Vulkan logical device with required extensions
-bool CreateVulkanDevice(VkPhysicalDevice physDevice, uint32_t queueFamilyIndex,
-    const std::vector<const char*>& deviceExtensions,
+// Create Vulkan logical device via xrCreateVulkanDeviceKHR — the runtime
+// appends its required device extensions and features (present_id/present_wait,
+// timelineSemaphore); only the app's 3DGS features are passed through.
+bool CreateVulkanDevice(XrSessionManager& xr, VkPhysicalDevice physDevice, uint32_t queueFamilyIndex,
     VkDevice& device, VkQueue& graphicsQueue);
 
 // Create OpenXR session with Vulkan binding + win32_window_binding
