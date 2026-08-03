@@ -277,6 +277,41 @@ static ModelRenderer g_modelRenderer;
 // of the swapchain to a PNG in %USERPROFILE%\Pictures\DisplayXR\. Skipped for
 // 1×1 (mono) layouts. Helper lives in test_apps/common/atlas_capture*.
 static std::atomic<bool> g_captureAtlasRequested{false};
+// ── Decoupled render rate (DXR_AVATAR_RENDER_HZ) ────────────────────────────
+// The avatar is often visually static while the VIEWER moves. Two things track
+// the eyes, with very different staleness tolerance: the weave's interlace phase
+// (stale ⇒ ghosting / view swap — very visible) and the content's baked-in
+// parallax (stale ⇒ slightly wrong perspective — mild). So we keep calling
+// xrEndFrame every frame (weave + present stay at panel rate, fresh eye
+// positions) but only re-render every 1/N s. This is NOT reprojection: nothing
+// warps the pixels, the weaver just re-interlaces them, so it does not
+// reintroduce the translating-eye problem that forces timewarp off on a fixed
+// 3D display.
+// 0 / unset = render every frame (shipped behaviour).
+static bool g_avViewsValid     = false;  // projectionViews describe a released image
+static bool g_avLastZonesFrame = false;  // zones/legacy path they were built for
+
+static bool AvatarShouldRenderThisFrame(bool zonesFrame) {
+    static int s_hz = -1;
+    if (s_hz < 0) {
+        const char* e = std::getenv("DXR_AVATAR_RENDER_HZ");
+        s_hz = (e && *e) ? std::atoi(e) : 0;
+        if (s_hz > 0) {
+            LOG_WARN("DXR_AVATAR_RENDER_HZ=%d — rendering at %d Hz, submitting every "
+                     "frame (weave stays at panel rate; parallax goes stale)", s_hz, s_hz);
+        }
+    }
+    if (s_hz <= 0) return true;                                  // shipped behaviour
+    // Never re-submit views we have not built, or that belong to the other path:
+    // the swapchain they reference would be wrong.
+    if (!g_avViewsValid || zonesFrame != g_avLastZonesFrame) return true;
+    static uint64_t s_lastRenderMs = 0;
+    const uint64_t nowMs  = GetTickCount64();
+    const uint64_t periodMs = (uint64_t)(1000 / s_hz);
+    if (nowMs - s_lastRenderMs >= periodMs) { s_lastRenderMs = nowMs; return true; }
+    return false;
+}
+
 // Transparent background. The avatar app is transparent by DEFAULT — the whole
 // point is a character floating over the desktop. Always-on session-level
 // transparency is wired at xrCreateSession; this flag flips the renderer's
@@ -2481,7 +2516,14 @@ static void RenderThreadFunc(
                 if (s_stageTiming) stM[1] = stNow();
                 // Sized to runtime's max possible view count (sim_display Quad mode = 4).
                 // Active mode's view count drives how many slots are actually filled and submitted.
-                XrCompositionLayerProjectionView projectionViews[8] = {};
+                // STATIC (not per-frame): with DXR_AVATAR_RENDER_HZ the app may skip
+                // rendering on a frame and re-submit the PREVIOUS frame's layer. The
+                // runtime keeps compositing from the last-released swapchain image
+                // (oxr only requires released.yes, cleared solely on re-acquire), so
+                // the weave still runs at panel rate against fresh eye positions —
+                // fresh interlace phase, stale parallax. Render thread is the only
+                // writer, so a function-local static is safe here.
+                static XrCompositionLayerProjectionView projectionViews[8] = {};
                 bool rendered = false;
 
                 // Display zones: the SAME XrDisplayZoneDXR instance chains on the
@@ -2906,9 +2948,15 @@ static void RenderThreadFunc(
                         // atlas with the bottom-75% sub-viewport.
                         static const float s_fadePx = EnvFadePx();
                         uint32_t imageIndex = 0;
-                        const bool imageAcquired = zonesFrame
-                            ? AcquireWindowSpaceImage(g_zoneSwapchain, imageIndex)
-                            : AcquireSwapchainImage(*xr, imageIndex);
+                        // Decoupled render rate (DXR_AVATAR_RENDER_HZ, 0/unset = every
+                        // frame). Skipping the acquire skips render + release + the
+                        // silhouette pass; xrEndFrame below still submits at panel rate.
+                        const bool renderThisFrame = AvatarShouldRenderThisFrame(zonesFrame);
+                        const bool imageAcquired = !renderThisFrame
+                            ? false
+                            : (zonesFrame
+                                ? AcquireWindowSpaceImage(g_zoneSwapchain, imageIndex)
+                                : AcquireSwapchainImage(*xr, imageIndex));
                         if (imageAcquired) {
                             const VkImage targetImage = zonesFrame
                                 ? g_zoneSwapImages[imageIndex] : (*swapchainVkImages)[imageIndex];
@@ -3098,6 +3146,10 @@ static void RenderThreadFunc(
                             }
                             if (zonesFrame) ReleaseWindowSpaceImage(g_zoneSwapchain);
                             else            ReleaseSwapchainImage(*xr);
+                            // projectionViews now describe a released image → a later
+                            // frame may re-submit them without re-rendering.
+                            g_avViewsValid     = true;
+                            g_avLastZonesFrame = zonesFrame;
 
                             // Update the click-through silhouette from the same
                             // per-view matrices we just drew (so the hit mask
@@ -3127,9 +3179,13 @@ static void RenderThreadFunc(
                                     targetW, targetH, windowW, windowH,
                                     viewMat, projMat, clipFar, (uint32_t)eyeCount);
                             if (s_stageTiming) stM[3] = stNow();
-                        } else {
+                        } else if (renderThisFrame) {
+                            // Genuine acquire failure → submit nothing this frame.
                             rendered = false;
                         }
+                        // else: deliberate DXR_AVATAR_RENDER_HZ skip — leave `rendered`
+                        // set so the PREVIOUS frame's projection layer is re-submitted
+                        // and the runtime re-weaves at panel rate with fresh eyes.
 
                         // The developer HUD info-panel was stripped from the avatar
                         // demo — see git history if a frame/mode/eye-tracking readout
