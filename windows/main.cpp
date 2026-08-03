@@ -319,11 +319,20 @@ static bool AvatarShouldRenderThisFrame(bool zonesFrame) {
     // Never re-submit views we have not built, or that belong to the other path:
     // the swapchain they reference would be wrong.
     if (!g_avViewsValid || zonesFrame != g_avLastZonesFrame) return true;
-    static uint64_t s_lastRenderMs = 0;
-    const uint64_t nowMs  = GetTickCount64();
-    const uint64_t periodMs = (uint64_t)(1000 / s_hz);
-    if (nowMs - s_lastRenderMs >= periodMs) { s_lastRenderMs = nowMs; return true; }
-    return false;
+    // FRAME-COUNT based, not wall-clock: GetTickCount64's ~15.6 ms resolution
+    // quantised a 33 ms period onto every THIRD 16.67 ms frame, so RENDER_HZ=30
+    // silently rendered at ~20 Hz and 20/30 were indistinguishable. Dividing the
+    // panel rate gives an exact, predictable cadence instead.
+    static int s_every = 0;   // render 1 frame in s_every
+    if (s_every == 0) {
+        const int panelHz = 60;   // TODO: take from the runtime's refresh when exposed
+        s_every = (s_hz >= panelHz) ? 1 : (panelHz + s_hz / 2) / s_hz;
+        if (s_every < 1) s_every = 1;
+        LOG_WARN("DXR_AVATAR_RENDER_HZ=%d — rendering 1 frame in %d (~%.1f Hz at %d Hz panel)",
+                 s_hz, s_every, (double)panelHz / s_every, panelHz);
+    }
+    static uint64_t s_frame = 0;
+    return (s_frame++ % (uint64_t)s_every) == 0;
 }
 
 // Transparent background. The avatar app is transparent by DEFAULT — the whole
