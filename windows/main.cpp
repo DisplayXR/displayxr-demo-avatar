@@ -1478,106 +1478,134 @@ static void UpdateSilhouette(VkDevice dev, VkPhysicalDevice phys, VkQueue queue,
     // shade at the renderer's MSAA level, twice (first and last view).
     uint32_t w = winW / 3; if (w < 64) w = 64; if (w > 256) w = 256;
     uint32_t h = winH / 3; if (h < 64) h = 64; if (h > 144) h = 144;
-    if (!EnsureSilhouetteTargets(dev, phys, w, h)) return;
 
-    const uint32_t silIdx[2] = {0, numViews - 1};
-    const uint32_t silPasses = (numViews > 1) ? 2u : 1u;
-    std::vector<uint8_t> unionAlpha((size_t)w * h, 0);
+    // #837 pipelined readback: each invocation renders ONE view (alternating
+    // first/last), submits its render + copy with a fence, and does NOT wait —
+    // the NEXT invocation consumes the readback (by which time the fence is
+    // long signaled: the runtime's per-frame commit drains the queue). The
+    // published coverage is the union of the two most-recent per-view slots,
+    // so it lags a couple of frames — irrelevant for a dilated hit mask, and
+    // it removes the ~16 ms synchronous GPU stall this pass used to inject
+    // into every other frame.
+    static VkFence s_silFence = VK_NULL_HANDLE;
+    static bool s_silPending = false;
+    static uint32_t s_silPendingSlot = 0, s_silPendingW = 0, s_silPendingH = 0;
+    static uint32_t s_silPendingWinW = 0, s_silPendingWinH = 0;
+    static std::vector<uint8_t> s_silSlot[2];
+    static uint32_t s_silNextSlot = 0;
 
-    for (uint32_t p = 0; p < silPasses; ++p) {
-        const uint32_t v = silIdx[p];
-        {
-            std::lock_guard<std::mutex> lock(g_sceneMutex);
-            if (!g_modelRenderer.hasModel()) return;
-            // Render the avatar into the bottom 75% of the silhouette image too, so
-            // the hit mask matches the confined on-screen avatar (the zone-framed
-            // views map 1:1 onto this sub-viewport — same NDC mapping). The top 25%
-            // is left as-is (covered by the full-top-25% bubble rect in the click
-            // region).
-            const uint32_t silAvH = (h * 3u) / 4u;
-            const uint32_t silAvY = h - silAvH;
-            g_modelRenderer.renderEye(g_silImage.image, VK_FORMAT_R8G8B8A8_UNORM,
-                imgW, imgH,
-                0, silAvY, w, silAvH, viewMats[v], projMats[v], /*transparentBg=*/true,
-                clipFars[v]);
-        }
-        // renderEye leaves the scratch image in COLOR_ATTACHMENT_OPTIMAL → copy to host.
-        VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-        ai.commandPool = pool; ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; ai.commandBufferCount = 1;
-        VkCommandBuffer cmd = VK_NULL_HANDLE;
-        vkAllocateCommandBuffers(dev, &ai, &cmd);
-        VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-        bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-        vkBeginCommandBuffer(cmd, &bi);
-        VkImageMemoryBarrier toSrc = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-        toSrc.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-        toSrc.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-        toSrc.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-        toSrc.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-        toSrc.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        toSrc.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        toSrc.image = g_silImage.image;
-        toSrc.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-            VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toSrc);
-        VkBufferImageCopy region = {};
-        region.bufferRowLength = w;
-        region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-        region.imageExtent = {w, h, 1};
-        vkCmdCopyImageToBuffer(cmd, g_silImage.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-            g_silReadback.buffer, 1, &region);
-        vkEndCommandBuffer(cmd);
-        VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
-        si.commandBufferCount = 1; si.pCommandBuffers = &cmd;
-
-        // Wait on a fence for THIS submission rather than vkQueueWaitIdle. The
-        // readback genuinely has to land before the CPU reads g_silMapped, so the
-        // wait cannot be removed outright here — but draining the entire queue
-        // also flushed the eye renders and anything else in flight. A fence
-        // scopes the stall to the copy we actually depend on.
-        static VkFence s_silFence = VK_NULL_HANDLE;
-        if (s_silFence == VK_NULL_HANDLE) {
-            VkFenceCreateInfo fci = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-            vkCreateFence(dev, &fci, nullptr, &s_silFence);
-        }
-        if (s_silFence != VK_NULL_HANDLE) {
-            vkResetFences(dev, 1, &s_silFence);
-            vkQueueSubmit(queue, 1, &si, s_silFence);
-            vkWaitForFences(dev, 1, &s_silFence, VK_TRUE, UINT64_MAX);
-        } else {
-            vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE);
-            vkQueueWaitIdle(queue);
-        }
-        vkFreeCommandBuffers(dev, pool, 1, &cmd);
-
+    // 1. Consume the previous invocation's readback BEFORE EnsureSilhouetteTargets
+    //    may recreate the image/buffer under the in-flight copy.
+    if (s_silPending && s_silFence != VK_NULL_HANDLE) {
+        vkWaitForFences(dev, 1, &s_silFence, VK_TRUE, UINT64_MAX);
+        s_silPending = false;
         const uint8_t* px = (const uint8_t*)g_silMapped;
-        if (!px) return;
-        for (uint32_t i = 0; i < w * h; ++i) {
-            const uint8_t a = px[i * 4 + 3];
-            if (a > unionAlpha[i]) unionAlpha[i] = a;
+        const size_t n = (size_t)s_silPendingW * s_silPendingH;
+        if (px != nullptr && n > 0) {
+            auto& slot = s_silSlot[s_silPendingSlot];
+            slot.resize(n);
+            for (size_t i = 0; i < n; ++i) slot[i] = px[i * 4 + 3];
+            // Publish the union of both slots (a missing/mismatched slot
+            // contributes nothing).
+            std::vector<uint8_t> unionAlpha(n, 0);
+            for (auto& s : s_silSlot) {
+                if (s.size() != n) continue;
+                for (size_t i = 0; i < n; ++i)
+                    if (s[i] > unionAlpha[i]) unionAlpha[i] = s[i];
+            }
+            {
+                std::lock_guard<std::mutex> lock(g_silCoverage.mtx);
+                g_silCoverage.bits.resize(n);
+                for (size_t i = 0; i < n; ++i) g_silCoverage.bits[i] = (unionAlpha[i] > 40) ? 1 : 0;
+                g_silCoverage.covW = (int)s_silPendingW; g_silCoverage.covH = (int)s_silPendingH;
+                g_silCoverage.winW = (int)s_silPendingWinW; g_silCoverage.winH = (int)s_silPendingWinH;
+                g_silCoverage.ready = true;
+            }
+
+            // Debug: with DXR_DUMP_SILHOUETTE set, dump the union (~once/sec) to
+            // %TEMP%\avatar_silhouette.png (white = avatar, black = pass-through).
+            static const bool s_dumpSil = (GetEnvironmentVariableA("DXR_DUMP_SILHOUETTE", nullptr, 0) > 0);
+            static int s_dbgCounter = 0;
+            if (s_dumpSil && (s_dbgCounter++ % 60) == 0) {
+                char tmp[MAX_PATH] = {0};
+                GetTempPathA(MAX_PATH, tmp);
+                std::string path = std::string(tmp) + "avatar_silhouette.png";
+                stbi_write_png(path.c_str(), (int)s_silPendingW, (int)s_silPendingH, 1,
+                               unionAlpha.data(), (int)s_silPendingW);
+            }
         }
     }
 
-    {
-        std::lock_guard<std::mutex> lock(g_silCoverage.mtx);
-        g_silCoverage.bits.resize((size_t)w * h);
-        for (uint32_t i = 0; i < w * h; ++i) g_silCoverage.bits[i] = (unionAlpha[i] > 40) ? 1 : 0;
-        g_silCoverage.covW = (int)w; g_silCoverage.covH = (int)h;
-        g_silCoverage.winW = (int)winW; g_silCoverage.winH = (int)winH;
-        g_silCoverage.ready = true;
+    if (!EnsureSilhouetteTargets(dev, phys, w, h)) return;
+    if (s_silFence == VK_NULL_HANDLE) {
+        VkFenceCreateInfo fci = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        if (vkCreateFence(dev, &fci, nullptr, &s_silFence) != VK_SUCCESS) return;
     }
 
-    // Debug: with DXR_DUMP_SILHOUETTE set, dump the silhouette alpha (~once/sec)
-    // to %TEMP%\avatar_silhouette.png so the hit mask can be eyeballed (white =
-    // avatar, black = pass-through). Off by default.
-    static const bool s_dumpSil = (GetEnvironmentVariableA("DXR_DUMP_SILHOUETTE", nullptr, 0) > 0);
-    static int s_dbgCounter = 0;
-    if (s_dumpSil && (s_dbgCounter++ % 60) == 0) {
-        char tmp[MAX_PATH] = {0};
-        GetTempPathA(MAX_PATH, tmp);
-        std::string path = std::string(tmp) + "avatar_silhouette.png";
-        stbi_write_png(path.c_str(), (int)w, (int)h, 1, unionAlpha.data(), (int)w);
+    // 2. Kick this invocation's view (alternating first/last on stereo).
+    const uint32_t slot = (numViews > 1) ? s_silNextSlot : 0u;
+    const uint32_t v = (slot == 0) ? 0u : numViews - 1;
+    {
+        std::lock_guard<std::mutex> lock(g_sceneMutex);
+        if (!g_modelRenderer.hasModel()) return;
+        // Render the avatar into the bottom 75% of the silhouette image, so the
+        // hit mask matches the confined on-screen avatar (the zone-framed views
+        // map 1:1 onto this sub-viewport — same NDC mapping). The top 25% is
+        // left as-is (covered by the full-top-25% bubble rect in the click
+        // region).
+        const uint32_t silAvH = (h * 3u) / 4u;
+        const uint32_t silAvY = h - silAvH;
+        g_modelRenderer.renderEye(g_silImage.image, VK_FORMAT_R8G8B8A8_UNORM,
+            imgW, imgH,
+            0, silAvY, w, silAvH, viewMats[v], projMats[v], /*transparentBg=*/true,
+            clipFars[v]);
     }
+    // renderEye leaves the scratch image in COLOR_ATTACHMENT_OPTIMAL → copy to host.
+    VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    ai.commandPool = pool; ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; ai.commandBufferCount = 1;
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    vkAllocateCommandBuffers(dev, &ai, &cmd);
+    VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cmd, &bi);
+    VkImageMemoryBarrier toSrc = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    toSrc.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    toSrc.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    toSrc.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    toSrc.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    toSrc.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toSrc.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toSrc.image = g_silImage.image;
+    toSrc.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toSrc);
+    VkBufferImageCopy region = {};
+    region.bufferRowLength = w;
+    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.imageExtent = {w, h, 1};
+    vkCmdCopyImageToBuffer(cmd, g_silImage.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        g_silReadback.buffer, 1, &region);
+    vkEndCommandBuffer(cmd);
+    VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.commandBufferCount = 1; si.pCommandBuffers = &cmd;
+
+    vkResetFences(dev, 1, &s_silFence);
+    if (vkQueueSubmit(queue, 1, &si, s_silFence) == VK_SUCCESS) {
+        s_silPending = true;
+        s_silPendingSlot = slot;
+        s_silPendingW = w; s_silPendingH = h;
+        s_silPendingWinW = winW; s_silPendingWinH = winH;
+        s_silNextSlot = (numViews > 1) ? (slot ^ 1u) : 0u;
+    }
+    // NOTE: cmd is consumed on the next invocation's fence wait; freeing it
+    // here while in flight would be invalid. Free it lazily next call.
+    static VkCommandBuffer s_silPrevCmd = VK_NULL_HANDLE;
+    static VkCommandPool s_silPrevPool = VK_NULL_HANDLE;
+    if (s_silPrevCmd != VK_NULL_HANDLE) {
+        vkFreeCommandBuffers(dev, s_silPrevPool, 1, &s_silPrevCmd);
+    }
+    s_silPrevCmd = cmd;
+    s_silPrevPool = pool;
 }
 
 // ── Display-zones path (ADR-027 / XR_DXR_display_zones, P6 migration) ───────
@@ -2192,9 +2220,30 @@ static void RenderThreadFunc(
             s_lastFrameMs = nowMs;
         }
 
+        // ── #837 frame-stage timing (DXR_AVATAR_STAGE_TIMING=1) ─────────────
+        // App-side split of the frame loop: wait (xrWaitFrame+xrBeginFrame),
+        // render (locates + eye renders), sil (silhouette pass), layers
+        // (bubble/toast prep + submit build), end (xrEndFrame = runtime
+        // commit), other (input pump / idle gate / loop, = gap since the
+        // previous frame's end). Accumulated, logged ~1/sec via LOG_INFO.
+        static const bool s_stageTiming = [] {
+            const char* e = std::getenv("DXR_AVATAR_STAGE_TIMING");
+            return e != nullptr && *e != '\0' && *e != '0';
+        }();
+        auto stNow = []() -> uint64_t {
+            return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+        };
+        static double s_stMs[6] = {};
+        static uint32_t s_stFrames = 0;
+        static uint64_t s_stLastLog = 0, s_stPrevEnd = 0;
+        uint64_t stM[6] = {};
+
         if (xr->sessionRunning) {
             XrFrameState frameState;
+            if (s_stageTiming) stM[0] = stNow();
             if (BeginFrame(*xr, frameState)) {
+                if (s_stageTiming) stM[1] = stNow();
                 // Sized to runtime's max possible view count (sim_display Quad mode = 4).
                 // Active mode's view count drives how many slots are actually filled and submitted.
                 XrCompositionLayerProjectionView projectionViews[8] = {};
@@ -2818,11 +2867,13 @@ static void RenderThreadFunc(
                             // timing (no billboard stutter). imgW/imgH = the dims
                             // the eye render used, so the renderer's internal
                             // targets don't churn.
+                            if (s_stageTiming) stM[2] = stNow();
                             static uint32_t s_silFrame = 0;
                             if (hasGsScene && (s_silFrame++ & 1u) == 0u)
                                 UpdateSilhouette(vkDevice, physDevice, graphicsQueue, renderCmdPool,
                                     targetW, targetH, windowW, windowH,
                                     viewMat, projMat, clipFar, (uint32_t)eyeCount);
+                            if (s_stageTiming) stM[3] = stNow();
                         } else {
                             rendered = false;
                         }
@@ -2864,8 +2915,30 @@ static void RenderThreadFunc(
                     if (subW < 2) subW = 2; else if (subW > BTN_BAR_TEX_W) subW = BTN_BAR_TEX_W;
                     if (subH < 2) subH = 2; else if (subH > BTN_BAR_TEX_H) subH = BTN_BAR_TEX_H;
 
+                    // #837: the bubble is STATIC — re-render/re-upload it only when the
+                    // panel sub-rect changes (resize). The per-frame upload's
+                    // vkQueueWaitIdle cost ~8 ms/frame on the iGPU; skipping it, the
+                    // last-released swapchain image keeps serving the layer.
+                    static uint32_t s_bubbleUpW = 0, s_bubbleUpH = 0;
+                    const bool bubbleUpToDate = (s_bubbleUpW == subW && s_bubbleUpH == subH);
+                    if (bubbleUpToDate) {
+                        bubbleLayer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+                        bubbleLayer.subImage.swapchain = g_animBtnSwapchain.swapchain;
+                        bubbleLayer.subImage.imageRect.offset = {0, 0};
+                        bubbleLayer.subImage.imageRect.extent = {(int32_t)subW, (int32_t)subH};
+                        bubbleLayer.subImage.imageArrayIndex = 0;
+                        bubbleLayer.rect.offset = {0, 0};
+                        bubbleLayer.rect.extent = {bandW, bandH};
+                        bubbleReady = true;
+                        std::lock_guard<std::mutex> bl(g_bubbleMtx);
+                        g_bubbleRect = {0, 0, bandW, bandH};
+                        g_bubbleVisible = true;
+                    }
+
                     uint32_t pitch = 0;
-                    const void* px = RenderBubbleToTexture(g_animBtnHud, subW, subH, g_bubbleText, &pitch);
+                    const void* px = bubbleUpToDate
+                        ? nullptr
+                        : RenderBubbleToTexture(g_animBtnHud, subW, subH, g_bubbleText, &pitch);
                     uint32_t idx = 0;
                     if (px && AcquireWindowSpaceImage(g_animBtnSwapchain, idx)) {
                         uint8_t* dst = (uint8_t*)g_animBtnStagingMapped;
@@ -2928,6 +3001,8 @@ static void RenderThreadFunc(
                         bubbleLayer.rect.extent = {bandW, bandH};
 
                         bubbleReady = true;
+                        s_bubbleUpW = subW;       // #837: uploaded — cache until resize
+                        s_bubbleUpH = subH;
                         // Publish the full-band bubble rect so the shaped window keeps it.
                         std::lock_guard<std::mutex> bl(g_bubbleMtx);
                         g_bubbleRect = {0, 0, bandW, bandH};
@@ -3110,7 +3185,31 @@ static void RenderThreadFunc(
                         zonesEnd.wishMask = XR_NULL_HANDLE;  // auto wish either way
                         endInfo.next = &zonesEnd;
                     }
+                    if (s_stageTiming) stM[4] = stNow();
                     xrEndFrame(xr->session, &endInfo);
+                    if (s_stageTiming && stM[1] != 0 && stM[2] != 0 && stM[3] != 0) {
+                        stM[5] = stNow();
+                        s_stMs[0] += (stM[1] - stM[0]) * 1e-6;               // wait
+                        s_stMs[1] += (stM[2] - stM[1]) * 1e-6;               // render
+                        s_stMs[2] += (stM[3] - stM[2]) * 1e-6;               // sil
+                        s_stMs[3] += (stM[4] - stM[3]) * 1e-6;               // layers
+                        s_stMs[4] += (stM[5] - stM[4]) * 1e-6;               // end
+                        if (s_stPrevEnd != 0)
+                            s_stMs[5] += (stM[0] - s_stPrevEnd) * 1e-6;      // other
+                        s_stPrevEnd = stM[5];
+                        s_stFrames++;
+                        if (s_stLastLog == 0) s_stLastLog = stM[5];
+                        if (stM[5] - s_stLastLog >= 1000000000ull && s_stFrames > 0) {
+                            const double inv = 1.0 / s_stFrames;
+                            LOG_INFO("[AV_STAGES] n=%u wait=%.2f render=%.2f sil=%.2f layers=%.2f "
+                                     "end=%.2f other=%.2f (ms/frame)",
+                                     s_stFrames, s_stMs[0] * inv, s_stMs[1] * inv, s_stMs[2] * inv,
+                                     s_stMs[3] * inv, s_stMs[4] * inv, s_stMs[5] * inv);
+                            for (double& v : s_stMs) v = 0.0;
+                            s_stFrames = 0;
+                            s_stLastLog = stM[5];
+                        }
+                    }
                 } else {
                     XrFrameEndInfo endInfo = {XR_TYPE_FRAME_END_INFO};
                     endInfo.displayTime = frameState.predictedDisplayTime;
