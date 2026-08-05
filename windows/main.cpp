@@ -1150,6 +1150,25 @@ static bool _dxr_opaque_session_env() {
     return false;
 }
 
+// MEASUREMENT (local): DXR_AVATAR_REDIRECTED_WINDOW=1 — a normal REDIRECTED
+// window (no WS_EX_NOREDIRECTIONBITMAP, real background brush) while KEEPING the
+// transparent session.
+//
+// WS_EX_NOREDIRECTIONBITMAP exists so the runtime's DComp bridge can show the
+// desktop through the window. But under DXR_PRESENT_OPAQUE (#833) the bridge
+// presents an HWND flip-model swapchain with "no DComp visual" — so the style
+// buys nothing there, and a window with no redirection surface is a poor
+// candidate for Hardware Independent Flip. Measured: dropping it (via the opaque
+// session, which also drops it) halves dwm. This knob isolates the STYLE from
+// the session so the see-through look is retained: the DP's compose-under-bg
+// bakes the captured background into the frame, so per-pixel window alpha is
+// not what makes it see-through.
+static bool _dxr_redirected_window() {
+    if (_dxr_opaque_session_env()) return true;   // opaque never wires the bridge
+    const char *e = getenv("DXR_AVATAR_REDIRECTED_WINDOW");
+    return e && atoi(e) != 0;
+}
+
 static void UpdateClickRegion(HWND hwnd) {
     if (g_decorated) { SetWindowRgn(hwnd, NULL, TRUE); return; }
     // The silhouette region only exists because transparency makes the window
@@ -1446,7 +1465,7 @@ static HWND CreateAppWindow(HINSTANCE hInstance, int width, int height) {
     // by the runtime's transparent-window bridge (DComp + KMT shared texture).
     // Both must be set even when the demo defaults to opaque, because session
     // transparency is wired at xrCreateSession time and cannot be toggled later.
-    wc.hbrBackground = _dxr_opaque_session_env() ? (HBRUSH)GetStockObject(BLACK_BRUSH) : nullptr;
+    wc.hbrBackground = _dxr_redirected_window() ? (HBRUSH)GetStockObject(BLACK_BRUSH) : nullptr;
     wc.lpszClassName = WINDOW_CLASS;
 
     if (!RegisterClassEx(&wc)) {
@@ -1487,7 +1506,8 @@ static HWND CreateAppWindow(HINSTANCE hInstance, int width, int height) {
     // cube_zones_vk parity: opaque => no NOREDIRECTIONBITMAP (that style makes the
     // window presentable ONLY through the DComp bridge, which opaque never wires).
     const DWORD exStyle = _dxr_opaque_session_env() ? 0
-                                                    : (WS_EX_NOREDIRECTIONBITMAP | WS_EX_TOPMOST);
+                          : _dxr_redirected_window() ? WS_EX_TOPMOST
+                                                     : (WS_EX_NOREDIRECTIONBITMAP | WS_EX_TOPMOST);
     HWND hwnd = CreateWindowEx(exStyle, WINDOW_CLASS, WINDOW_TITLE,
         WS_POPUP | WS_VISIBLE,
         posX, posY,
