@@ -255,9 +255,24 @@ static XrSessionManager* g_xr = nullptr;
 // Portrait default: a standing full-body avatar wants a tall window (the
 // bottom 75% is the tiger zone, top 25% the speech bubble). Physical pixels
 // (the app is PerMonitorV2 DPI-aware); B toggles decoration for move/resize.
-// Size = user-tuned on the 3840x2160 Leia panel (measured client area).
-static UINT g_windowWidth = 811;
-static UINT g_windowHeight = 1421;
+// Size = the largest that fits the iGPU GPU budget on the 3840x2160 Leia panel.
+//
+// Sized by measurement, not taste (2026-08-05, Arc iGPU, minimal+text config at
+// 22 presents/s, 4 interleaved reps per size). GPU is linear in window AREA at
+// ~1.86 app points per unit area over a fixed ~6.4, and the aspect is held at
+// 0.571:
+//
+//   487x853  (1.00x area)  app  8.13  system  9.21
+//   600x1051 (1.52x)       app  9.35  system 10.17   <- here
+//   700x1226 (2.07x)       app 10.35  system 11.18
+//   811x1421 (2.77x)       app 11.46  system 12.27   <- the old size
+//
+// 600x1051 is the largest that keeps the APP column under 10 % with margin. Note
+// the growth is NOT the renderer — the pre-DP stage is flat at ~1.0 ms across the
+// whole 2.77x range — it is the region-scaled weave/composite/present. So model
+// detail buys nothing back here; only area does.
+static UINT g_windowWidth = 600;
+static UINT g_windowHeight = 1051;
 // MEASUREMENT (local): DXR_AVATAR_WINDOW=WxH sets the startup window size. The
 // session's view dims are fixed at xrCreateSession, so resizing later does NOT
 // change what the renderer draws — this has to happen before window creation.
