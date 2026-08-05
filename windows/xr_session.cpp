@@ -526,6 +526,16 @@ bool CreateSession(XrSessionManager& xr, VkInstance vkInstance, VkPhysicalDevice
     // a no-op when alpha == 1 throughout, so opaque mode looks identical
     // to a non-transparent session. Requires runtime ≥ v1.3.0.
     sessionTarget.transparentBackgroundEnabled = XR_TRUE;
+    // MEASUREMENT ONLY (local, not for merge): the flag is fixed at
+    // xrCreateSession, so isolating session-transparency cost needs a gate here.
+    const char *_min = getenv("DXR_AVATAR_MINIMAL");
+    const char *_os0 = getenv("DXR_AVATAR_OPAQUE_SESSION");
+    const char *_ft  = getenv("DXR_AVATAR_FORCE_TRANSPARENT");
+    const bool _forceTransparent = _ft && atoi(_ft) != 0;   // must match main.cpp's gate
+    if (!_forceTransparent && ((_os0 && atoi(_os0) != 0) || (_min && atoi(_min) != 0))) {
+        sessionTarget.transparentBackgroundEnabled = XR_FALSE;
+        LOG_INFO("DXR_AVATAR_OPAQUE_SESSION=1 — OPAQUE session");
+    }
 
     if (xr.hasWin32WindowBindingExt && hwnd) {
         vkBinding.next = &sessionTarget;
