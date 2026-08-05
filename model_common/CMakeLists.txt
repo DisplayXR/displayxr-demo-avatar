@@ -46,6 +46,19 @@ FetchContent_Declare(glm
 )
 FetchContent_MakeAvailable(glm)
 
+# ── meshoptimizer (mesh simplification, MIT) ──────────────────────────────
+# Load-time decimation (DXR_AVATAR_DECIMATE): meshopt_simplify emits a SHORTER
+# index buffer over the EXISTING vertices, so skin joints/weights survive
+# untouched — no attribute interpolation, no re-rigging.
+FetchContent_Declare(meshoptimizer
+    GIT_REPOSITORY https://github.com/zeux/meshoptimizer.git
+    GIT_TAG        v0.21
+)
+set(MESHOPT_BUILD_DEMO OFF CACHE INTERNAL "" FORCE)
+set(MESHOPT_BUILD_TOOLS OFF CACHE INTERNAL "" FORCE)
+set(MESHOPT_BUILD_SHARED_LIBS OFF CACHE INTERNAL "" FORCE)
+FetchContent_MakeAvailable(meshoptimizer)
+
 # ── USD / USDZ loading (tinyusdz, Apache-2.0) ─────────────────────────────
 # The one heavy import dependency (vs the vendored single-file OBJ/FBX libs).
 # tydra's RenderScene flattens a USD stage into triangulated meshes +
@@ -179,4 +192,5 @@ target_link_libraries(model_renderer PUBLIC
 target_link_libraries(model_renderer PRIVATE
     tinygltf
     tinyusdz::tinyusdz_static
+    meshoptimizer
 )
