@@ -149,13 +149,26 @@ void main() {
 
     // Ambient = image-based lighting (split-sum): irradiance cube for diffuse,
     // prefiltered cube + BRDF LUT for specular.
-    vec3 Fr = F_SchlickRoughness(ndotv, f0, roughness);
-    vec3 diffuseIBL = texture(irradianceMap, N).rgb * albedo * (1.0 - metallic);
-    float maxLod = float(textureQueryLevels(prefilteredMap) - 1);
-    vec3 prefiltered = textureLod(prefilteredMap, reflect(-V, N), roughness * maxLod).rgb;
-    vec2 ab = texture(brdfLUT, vec2(ndotv, roughness)).rg;
-    vec3 specularIBL = prefiltered * (Fr * ab.x + ab.y);
-    vec3 ambient = (diffuseIBL + specularIBL) * ao;
+    vec3 ambient;
+    if (pc.emissive.w > 0.5) {
+        // MEASUREMENT (DXR_AVATAR_SIMPLE_LIGHT=1): skip image-based lighting —
+        // 3 fetches (2 cubemaps incl. a roughness mip chain + the BRDF LUT) are
+        // replaced by a hemispherical ambient constant. The analytic GGX light
+        // above still runs, so form/shading survive; what is lost is
+        // environment reflection (metal reads dull) and grounded ambient.
+        const vec3 skyAmbient    = vec3(0.34, 0.36, 0.40);
+        const vec3 groundAmbient = vec3(0.16, 0.14, 0.12);
+        vec3 hemi = mix(groundAmbient, skyAmbient, clamp(N.y * 0.5 + 0.5, 0.0, 1.0));
+        ambient = hemi * albedo * ao;
+    } else {
+        vec3 Fr = F_SchlickRoughness(ndotv, f0, roughness);
+        vec3 diffuseIBL = texture(irradianceMap, N).rgb * albedo * (1.0 - metallic);
+        float maxLod = float(textureQueryLevels(prefilteredMap) - 1);
+        vec3 prefiltered = textureLod(prefilteredMap, reflect(-V, N), roughness * maxLod).rgb;
+        vec2 ab = texture(brdfLUT, vec2(ndotv, roughness)).rg;
+        vec3 specularIBL = prefiltered * (Fr * ab.x + ab.y);
+        ambient = (diffuseIBL + specularIBL) * ao;
+    }
 
     vec3 color = direct + ambient + emissive;
     if (ubo.cameraPos.w > 0.5) color = linearToSrgb(color);

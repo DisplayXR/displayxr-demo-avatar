@@ -258,6 +258,18 @@ static XrSessionManager* g_xr = nullptr;
 // Size = user-tuned on the 3840x2160 Leia panel (measured client area).
 static UINT g_windowWidth = 811;
 static UINT g_windowHeight = 1421;
+// MEASUREMENT (local): DXR_AVATAR_WINDOW=WxH sets the startup window size. The
+// session's view dims are fixed at xrCreateSession, so resizing later does NOT
+// change what the renderer draws — this has to happen before window creation.
+static void _dxr_apply_window_env() {
+    const char *e = getenv("DXR_AVATAR_WINDOW");
+    if (!e) return;
+    unsigned w = 0, h = 0;
+    if (sscanf(e, "%ux%u", &w, &h) == 2 && w >= 64 && h >= 64) {
+        g_windowWidth = w;
+        g_windowHeight = h;
+    }
+}
 
 // 3DGS state
 static ModelRenderer g_modelRenderer;
@@ -1107,8 +1119,88 @@ static bool SilhouetteHit(int clientX, int clientY) {
 // whole framed window stays interactive for move/resize.
 static const UINT_PTR kClickThroughTimerId = 0xC17;
 
+// MEASUREMENT ONLY (local, not for merge): DXR_AVATAR_OPAQUE_SESSION=1.
+static bool _dxr_minimal_env() {
+    const char *e = getenv("DXR_AVATAR_MINIMAL");
+    return e && atoi(e) != 0;
+}
+
+// DXR_AVATAR_KEEP_TEXT=1 — keep the Local2D speech bubble in minimal mode.
+static bool _dxr_keep_text_env() {
+    const char *e = getenv("DXR_AVATAR_KEEP_TEXT");
+    return e && atoi(e) != 0;
+}
+
+// The full-window 3D zone is only valid when there is no 2D text: with a
+// full-window zone the implicit mask reads "3D everywhere", which would mask the
+// Local2D bubble out. With text we keep the original bottom-75% zone so the top
+// band stays 2D — and the runtime's identity-composite skip then can't fire.
+static bool _dxr_full_window_zone() {
+    return _dxr_minimal_env() && !_dxr_keep_text_env();
+}
+
+static bool _dxr_opaque_session_env() {
+    // Explicit override wins: DXR_AVATAR_FORCE_TRANSPARENT=1 keeps the shaped
+    // transparent session (and therefore the silhouette pass + window region)
+    // while still allowing the rest of minimal mode's trims.
+    if (const char *t = getenv("DXR_AVATAR_FORCE_TRANSPARENT"); t && atoi(t) != 0) return false;
+    if (const char *e = getenv("DXR_AVATAR_OPAQUE_SESSION"); e && atoi(e) != 0) return true;
+    // DXR_AVATAR_MINIMAL implies opaque unless the override above is set.
+    if (const char *m = getenv("DXR_AVATAR_MINIMAL"); m && atoi(m) != 0) return true;
+    return false;
+}
+
 static void UpdateClickRegion(HWND hwnd) {
     if (g_decorated) { SetWindowRgn(hwnd, NULL, TRUE); return; }
+    // The silhouette region only exists because transparency makes the window
+    // shaped. In an opaque session the coverage never populates, so the region
+    // clips the ENTIRE window away — invisible for rendering, not just input.
+    // This is what pressing B was working around.
+    if (_dxr_opaque_session_env()) { SetWindowRgn(hwnd, NULL, TRUE); return; }
+    // MEASUREMENT (local): DXR_AVATAR_NO_REGION=1 drops the shaped region while
+    // KEEPING the transparent session. Isolates whether the SetWindowRgn clip is
+    // what denies DWM independent flip (the suspected reason DXR_PRESENT_OPAQUE
+    // collapses dwm on the unshaped cube but not on the shaped avatar).
+    static const bool s_noRegion = [] {
+        const char *e = getenv("DXR_AVATAR_NO_REGION");
+        return e && atoi(e) != 0;
+    }();
+    if (s_noRegion) { SetWindowRgn(hwnd, NULL, TRUE); return; }
+
+    // DXR_AVATAR_REGION_ON_HOVER=1 — the shaped region exists ONLY to route input
+    // (clicks outside the silhouette fall through cross-process). It is not what
+    // makes the background see-through; per-pixel alpha does that, so dropping it
+    // is visually identical. But a region-clipped window cannot be granted
+    // Hardware Independent Flip, which costs ~6 points of dwm every refresh —
+    // measured: region+opaque-present 10.5 dwm vs no-region+opaque-present 4.5.
+    //
+    // So carry it lazily: no region while the cursor is away (DWM gets to flip),
+    // region applied as the cursor approaches (input routing correct again). The
+    // margin gives the region time to be in place before a click lands; a click
+    // teleported in with no prior movement is the one case that can misroute.
+    static const bool s_regionOnHover = [] {
+        const char *e = getenv("DXR_AVATAR_REGION_ON_HOVER");
+        return e && atoi(e) != 0;
+    }();
+    if (s_regionOnHover) {
+        POINT cur;
+        RECT wr;
+        if (GetCursorPos(&cur) && GetWindowRect(hwnd, &wr)) {
+            const LONG margin = 48;   // apply slightly before the cursor arrives
+            // NB: not `near` — that's a legacy windef.h macro and won't compile.
+            const bool cursorNear = cur.x >= wr.left - margin && cur.x <= wr.right + margin &&
+                                    cur.y >= wr.top - margin && cur.y <= wr.bottom + margin;
+            static bool s_regionApplied = true;
+            if (!cursorNear) {
+                if (s_regionApplied) {
+                    SetWindowRgn(hwnd, NULL, TRUE);
+                    s_regionApplied = false;
+                }
+                return;
+            }
+            s_regionApplied = true;   // fall through and rebuild the shaped region
+        }
+    }
 
     std::vector<RECT> rects;
     int winW = 0, winH = 0;
@@ -1122,7 +1214,12 @@ static void UpdateClickRegion(HWND hwnd) {
         // Skip the top 25%: the avatar is confined to the bottom 75%, and the
         // top-25% silhouette pixels are stale/untouched (the bubble rect is added
         // to the region separately below).
-        const int yStart = (ch * 1) / 4;
+        // Normally the avatar is confined to the bottom-75% zone and the top-25%
+        // coverage rows are stale, so they're excluded. Minimal mode makes the zone
+        // FULL-WINDOW (no bubble band to protect), so the character can legitimately
+        // draw up there and skipping those rows clips it — which is what pressing B
+        // (region cleared entirely) was hiding.
+        const int yStart = _dxr_full_window_zone() ? 0 : (ch * 1) / 4;
         for (int y = yStart; y < ch; ++y) {
             int x = 0;
             while (x < cw) {
@@ -1349,7 +1446,7 @@ static HWND CreateAppWindow(HINSTANCE hInstance, int width, int height) {
     // by the runtime's transparent-window bridge (DComp + KMT shared texture).
     // Both must be set even when the demo defaults to opaque, because session
     // transparency is wired at xrCreateSession time and cannot be toggled later.
-    wc.hbrBackground = nullptr;
+    wc.hbrBackground = _dxr_opaque_session_env() ? (HBRUSH)GetStockObject(BLACK_BRUSH) : nullptr;
     wc.lpszClassName = WINDOW_CLASS;
 
     if (!RegisterClassEx(&wc)) {
@@ -1387,7 +1484,11 @@ static HWND CreateAppWindow(HINSTANCE hInstance, int width, int height) {
     // WS_EX_TOPMOST: the avatar always floats above other windows — when a
     // click passes through (HTTRANSPARENT) to a window behind, that window
     // activates but stays BELOW the avatar, so the tiger is never covered.
-    HWND hwnd = CreateWindowEx(WS_EX_NOREDIRECTIONBITMAP | WS_EX_TOPMOST, WINDOW_CLASS, WINDOW_TITLE,
+    // cube_zones_vk parity: opaque => no NOREDIRECTIONBITMAP (that style makes the
+    // window presentable ONLY through the DComp bridge, which opaque never wires).
+    const DWORD exStyle = _dxr_opaque_session_env() ? 0
+                                                    : (WS_EX_NOREDIRECTIONBITMAP | WS_EX_TOPMOST);
+    HWND hwnd = CreateWindowEx(exStyle, WINDOW_CLASS, WINDOW_TITLE,
         WS_POPUP | WS_VISIBLE,
         posX, posY,
         width, height,
@@ -1608,7 +1709,11 @@ static void UpdateSilhouette(VkDevice dev, VkPhysicalDevice phys, VkQueue queue,
         // map 1:1 onto this sub-viewport — same NDC mapping). The top 25% is
         // left as-is (covered by the full-top-25% bubble rect in the click
         // region).
-        const uint32_t silAvH = (h * 3u) / 4u;
+        // Minimal mode uses a FULL-WINDOW zone, so the avatar is no longer confined
+        // to the bottom 75% — the silhouette must be rendered over the whole
+        // coverage image or the derived window region clips the character (and
+        // mis-scales it vertically, since the sub-viewport changes the NDC mapping).
+        const uint32_t silAvH = _dxr_full_window_zone() ? h : (h * 3u) / 4u;
         const uint32_t silAvY = h - silAvH;
         g_modelRenderer.renderEye(g_silImage.image, VK_FORMAT_R8G8B8A8_UNORM,
             imgW, imgH,
@@ -2272,6 +2377,25 @@ static void RenderThreadFunc(
                     continue;
                 }
             }
+
+            // MEASUREMENT (local): DXR_AVATAR_PRESENT_HZ=N caps the whole frame
+            // loop unconditionally — not gated on idleness like the block above.
+            // Skipping the iteration means no xrEndFrame, so weave + Local2D
+            // composite + present all drop to N Hz with the render. Those are
+            // charged per PRESENTED frame, which is why this attacks the fixed
+            // floor that window/geometry/shader cuts cannot touch.
+            static const uint32_t s_presentHz = [] {
+                const char* e = std::getenv("DXR_AVATAR_PRESENT_HZ");
+                const int v = e ? std::atoi(e) : 0;
+                return (v >= 1 && v <= 240) ? (uint32_t)v : 0u;
+            }();
+            if (s_presentHz > 0) {
+                const uint64_t capMs = 1000ull / s_presentHz;
+                if ((nowMs - s_lastFrameMs) < capMs) {
+                    Sleep(1);
+                    continue;
+                }
+            }
             s_lastFrameMs = nowMs;
         }
 
@@ -2529,6 +2653,14 @@ static void RenderThreadFunc(
                             tigerZone.rect.offset = {0, (int32_t)(windowH / 4u)};
                             tigerZone.rect.extent = {(int32_t)windowW,
                                                      (int32_t)(windowH - windowH / 4u)};
+                            // MEASUREMENT (local): minimal mode has no bubble/toast, so
+                            // the top 25% no longer needs to stay flat 2D. A full-window
+                            // zone means the mask is 1 everywhere, which lets the runtime
+                            // skip the Local2D composite entirely (~1.45 ms/frame).
+                            if (_dxr_full_window_zone()) {
+                                tigerZone.rect.offset = {0, 0};
+                                tigerZone.rect.extent = {(int32_t)windowW, (int32_t)windowH};
+                            }
 
                             // Per-zone recommended view size; re-query when the rect
                             // dims or the rendering mode change (the app-side
@@ -2960,7 +3092,17 @@ static void RenderThreadFunc(
                             // targets don't churn.
                             if (s_stageTiming) stM[2] = stNow();
                             static uint32_t s_silFrame = 0;
-                            if (hasGsScene && (s_silFrame++ & 1u) == 0u)
+                            // MEASUREMENT (local): the silhouette pass exists ONLY to
+                            // build the click-through window region, which an opaque
+                            // window doesn't use. It is a full PBR+IBL+skinned re-render
+                            // of two views, so skip it entirely in minimal mode.
+                            // Skip it only when the session is OPAQUE. A transparent
+                            // session still needs the coverage: it feeds the
+                            // SetWindowRgn shaped window, and without it the region
+                            // clips the whole window away (invisible, not just
+                            // un-clickable).
+                            const bool s_silSkip = _dxr_opaque_session_env();
+                            if (!s_silSkip && hasGsScene && (s_silFrame++ & 1u) == 0u)
                                 UpdateSilhouette(vkDevice, physDevice, graphicsQueue, renderCmdPool,
                                     targetW, targetH, windowW, windowH,
                                     viewMat, projMat, clipFar, (uint32_t)eyeCount);
@@ -3249,6 +3391,19 @@ static void RenderThreadFunc(
                     const XrCompositionLayerBaseHeader* layers[3];
                     uint32_t layerN = 0;
                     layers[layerN++] = (const XrCompositionLayerBaseHeader*)&proj;
+                    // MEASUREMENT (local): DXR_AVATAR_MINIMAL=1 = character only.
+                    // Drops the Local2D speech bubble + the toast layer, so the frame
+                    // is one projection layer and the runtime does no Local2D composite.
+                    static const bool s_minimalLayers = [] {
+                        const char *e = getenv("DXR_AVATAR_MINIMAL");
+                        return e && atoi(e) != 0;
+                    }();
+                    // Keep the bubble when DXR_AVATAR_KEEP_TEXT=1; the toast is
+                    // transient status chrome and stays dropped either way.
+                    if (s_minimalLayers) {
+                        if (!_dxr_keep_text_env()) bubbleReady = false;
+                        toastLayerReady = false;
+                    }
                     if (bubbleReady) {
                         // Single Local2D bubble in the top 25%. On the zones path the
                         // tiger weaves only inside the bottom-75% zone rect (a local 3D
@@ -3404,6 +3559,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         return 1;
     }
 
+    _dxr_apply_window_env();
     HWND hwnd = CreateAppWindow(hInstance, g_windowWidth, g_windowHeight);
     if (!hwnd) {
         LOG_ERROR("Failed to create window");
