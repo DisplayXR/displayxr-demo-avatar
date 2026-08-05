@@ -248,102 +248,122 @@ like one.
   have read as a regression against a GPU-% target. It has to land with
   throttling or a cap.
 
-## Reaching single digits — and the dwm bistability (2026-08-05)
+## Reaching single digits (2026-08-05) — read this section, not the older ones
 
-Measured on rebuilt binaries (runtime `1721f2d31`, avatar `f65721f`+), Arc iGPU,
-`\GPU Engine(*)\Running Time`, 12 s warmup + 20 s measure, 5 interleaved reps,
-cursor parked (`REGION_ON_HOVER` is cursor-dependent — an unparked cursor
-silently changes the arm).
+Measured on the Arc iGPU with `\GPU Engine(*)\Running Time` deltas, 12 s warmup +
+20 s measure, 5 interleaved reps per arm, cursor parked. Runtime `47e0a5ba2`
+(includes #858 and #866), avatar this branch, **600x1051**.
 
-The single-digit config **does** reproduce, at **app 8.4–9.5 %**. The
-"6.2 % app / 3.7 % dwm / 13.0 % system" in `f65721f`'s commit message does not —
-don't quote it.
+### 🔴 The headline: the win splits in half and one half is FREE
 
-Per-stage at 22 presents/s (`DXR_FRAME_STAGE_TIMING=1`), ms/frame:
-`pre` 1.16 · `weave` 1.31 · `composite` 1.08 · `present` **0.40**. Note `present`
-is 0.40 ms against 6.3–6.5 ms in the shipped config — `DXR_PRESENT_OPAQUE`
-plus the present cap is what moved it, and the four stages sum to 3.95 ms ×
-22/s ≈ 8.7 %, i.e. the app column is fully accounted.
+Same binary, same session, interleaved, all knobs off vs on:
 
-### 🔴 dwm is bistable for the transparent window, and stable for the opaque one
+| arm | presents/s | app | dwm | system | app CPU |
+|---|---|---|---|---|---|
+| defaults, all knobs off | 61 | 27.40 | 21.69 | **49.38** | 32 % |
+| **`DXR_PRESENT_OPAQUE` + `DXR_AVATAR_REGION_ON_HOVER` only** | **61** | 23.97 | **0.68** | **24.77** | 22.5 % |
+| all six knobs | 22 | 9.15 | 0.72 | **10.01** | 8.2 % |
 
-Same config, two runs an hour apart — and *within* the first run it flipped
-between reps 3 and 4:
+- **FREE half — −24.6 system points (−50 %), −10 CPU points, at the FULL 61
+  presents/s, no trims, no rate cap, no visual change.** `dwm` collapses
+  21.69 → 0.68. Two knobs.
+- **PAID half — a further −14.8 system points**, from `DXR_AVATAR_PRESENT_HZ=22`
+  plus the `MINIMAL` trims. This costs 61 → 22 presents/s and the toast. It is a
+  product change, not an optimisation.
 
-| arm | run 1 dwm (per rep) | run 2 dwm (n=5) | run 2 app | run 2 system |
-|---|---|---|---|---|
-| idle desktop, no app | — | 0.08 | 0 | 0.22 |
-| A transparent + `NORB` + `PRESENT_OPAQUE` | 2.96, 2.46, 2.91, **0**, **0** | **9.39** (8.95–9.82) | 10.74 | 20.07 |
-| G transparent + **redirected** window | — | **11.12** | 10.75 | 22.35 |
-| C opaque session (`MINIMAL`) | 1.54, 1.42, 0.96, 0.97, 0.98 | **1.00** (0.96–1.26) | 8.65 | 11.12 |
-| H redirected + no bg capture (chroma-key) | — | 2.04 | 8.19 | 10.88 |
+**Mechanism of the free half:** the shaped `SetWindowRgn` is applied
+*continuously*, and a region-clipped window cannot be granted Hardware Independent
+Flip — so DWM composites it every refresh, forever. The region exists only to route
+clicks (per-pixel alpha is what makes the window see-through), so
+`REGION_ON_HOVER` drops it while the cursor is away and restores it as the cursor
+approaches. This is consistent with dwm being **rate-independent** (60 Hz vs 22 Hz
+measured identical dwm), which is why the frame cap cannot explain it.
 
-**This is the documented "intermittent +8-point state", and it lives in dwm.**
-Run 2 caught it: A's dwm went 2.5 → 9.4 and its system total 13.1 → 20.1, a
-~+7–8 point excursion, with the *renderer* unchanged. **The opaque-session config
-never shows it** — C measured 0.96–1.54 across both runs. So the susceptible
-ingredient is the transparent `WS_EX_NOREDIRECTIONBITMAP` window, not the
-renderer, the capture, or the window geometry.
+**Recommendation: default `DXR_PRESENT_OPAQUE` + `DXR_AVATAR_REGION_ON_HOVER`;
+keep `PRESENT_HZ` / `MINIMAL` opt-in for constrained hardware.** Two caveats:
+`REGION_ON_HOVER` only pays while the cursor is AWAY (interaction restores the
+region and its cost), and `DXR_PRESENT_OPAQUE` is a **runtime** gate (#833,
+default-off) rather than avatar code — so defaulting it is a runtime decision.
 
-Three things this kills:
+### Window size is the other clean lever — GPU is linear in AREA
 
-- **Dropping `WS_EX_NOREDIRECTIONBITMAP` does not help — it hurts.** Arm G
-  (transparent session, redirected window, via `DXR_AVATAR_REDIRECTED_WINDOW`)
-  is the *worst* dwm arm at 11.12. The style is not what denies independent flip.
-- **Don't compare dwm across sessions, or against another app measured in another
-  session.** The cube's "dwm 1–2 with `DXR_PRESENT_OPAQUE`" is not a target the
-  avatar is missing: a `cube_zones_vk_win` reference measured *in the same
-  session* sat at 2.76/2.35 while the avatar sat at 2.96/2.46, then both went to
-  0. Desktop churn from unrelated windows lands in the dwm column and swamps the
-  app's own contribution — an idle desktop is 0.08.
-- **dwm is not charged per app present.** At 60 Hz instead of 22 the app column
-  goes 9.5 → 25.7 while dwm is flat (2.74 vs 2.96). No app-side rate limiting
-  touches it.
+Aspect held at 0.571, all six knobs on, 4 interleaved reps per size:
 
-### What is left, ranked by measured share of the frame
-
-The four stages account for the whole app column (3.95 ms × 22/s ≈ 8.7 %), and a
-per-engine split (3 reps) shows **all of it on the `3d` engine — `copy` is 0.00**:
-
-| stage | ms/frame | share | who owns it |
+| size | area | app | system |
 |---|---|---|---|
-| `weave` | 1.31 | 33 % | vendor weaver — not ours; only lever is rate or region size |
-| `pre` | 1.16 | 29 % | renderer + accum + crops |
-| **`composite`** | **1.08** | **27 %** | **runtime — the best item we control** |
-| `present` | 0.40 | 10 % | already collapsed from 6.3–6.5 ms |
+| 487x853 | 1.00x | 8.13 | 9.21 |
+| **600x1051** | 1.52x | 9.35 | 10.17 |
+| 700x1226 | 2.07x | 10.35 | 11.18 |
+| 811x1421 | 2.77x | 11.46 | 12.27 |
 
-1. **Scissored Local2D composite (runtime).** The composite writes
-   `M*weave + (1-M)*twod`; where `M == 1` the output is just `weave`. Restrict the
-   pass to the union of the Local2D rects and the un-zoned band instead of the
-   whole region — in this config that band is ~the top 25 %, so ~0.75 ms/frame
-   (~1.6 app points) with **no quality cost**. Generalises the identity skip in
-   runtime `1721f2d31`, which is a *null* for the text-on config (a real Local2D
-   layer means the composite is not the identity).
-2. **Renderer, via render-rate decoupling** rather than trims. `DXR_AVATAR_RENDER_HZ`
-   (zero-copy: skip acquire/render/release and let `oxr` re-composite from
-   `released.index`) keeps the weave at full rate while cutting `pre`. `pre` is only
-   1.16 ms here, so the headroom is ~1 point — much less than the −8.1 it bought in
-   the shipped config.
-3. **Not the background capture.** Measured: the whole WGC path — the full-monitor
-   33 MB `CopyResource` *and* compose-under-bg — is worth **≤0.4 app points**
-   (8.37 → 7.97 with capture off entirely), and there is no copy-engine time to
-   reclaim. A proposal to crop the copy to the window rect was measured and
-   dropped. The 3.4–3.6 copy-engine points recorded elsewhere in this file belong
-   to the **shipped** present path, not the capture.
-4. **The biggest single number is dwm, and it is worth 0 app points** — up to ~8
-   *system* points from the bistability above. Needs PresentMon, not counters.
+~**1.86 app points per unit area over a fixed ~6.4** ⇒ the app column crosses 10 %
+at ~1.93x area (~677x1186), the system total at ~1.43x (~582x1019). This branch
+defaults to **600x1051**.
 
-### If you need a predictable number
+Re-measured live on the newest runtime, same six knobs, quiet desktop:
 
-Recommend the **opaque session** (C): app 8.65, dwm 1.00, system 11.12, tight
-across every rep of both runs and immune to the +8 state. The cost is the look —
-`MINIMAL` is opaque, with no bubble/toast and a full-window zone, so it is not
-"the shipped avatar but opaque". The transparent config reaches the same app
-column but its dwm is a coin flip between ~0 and ~9.4.
+| window | app | dwm | system |
+|---|---|---|---|
+| 600x1051 | **8.29** | 2.06 | 10.83 |
+| 811x1421 (the old default) | **10.34** | 1.80 | 12.39 |
 
-Root-causing the flip needs present-mode truth, not GPU counters — three
-counter-based readings gave three different mechanisms. `PresentMon` (admin, ETW)
-is the next step; it is still not installed on this box.
+So the original size costs **+2.05 app points** for an 83 % larger window — worth
+weighing, since unrelated desktop activity moves the system total by more than
+that (see below).
+
+**The growth is NOT the renderer.** The pre-DP stage is flat at ~1.0 ms across the
+whole 2.77x range, so trimming model detail buys nothing toward a bigger window.
+Only area does.
+
+### 🔴 Measurement traps that cost us most of a day
+
+- **`dwm` is the whole desktop, not this app.** The same live instance measured
+  `system` 15.77 with a terminal animating and **10.83** with it quiet — the app
+  column barely moved (8.42 → 8.29). Any "system GPU %" target is therefore only
+  meaningful with a stated desktop state; on a working desktop nobody will see the
+  quiet-desktop number, and that is not a regression.
+- **`[FRAME_STAGES] composite` was never the composite cost.** It spans the
+  composite + HUD record **+ the submit and whole-frame drain**. Both of us sized
+  an optimisation off it and were wrong (#862 predicted large, measured ~0.8
+  points). Now correctly labelled `composite+wait=` by #866.
+- **A/B inside ONE binary, interleaved.** Every cross-build or cross-session
+  comparison we made today was wrong by 2-10x. Cross-session `system` totals are
+  not comparable at all.
+- **`REGION_ON_HOVER` is cursor-position dependent** — an unparked cursor silently
+  changes the arm. Park it (`SetCursorPos`) before measuring.
+- **dwm has a bistable high state.** With the knobs OFF it is a steady ~21.7; with
+  them ON it sits near 0 but occasionally jumps ~5-8 points (1 rep in 5 today).
+  Root-causing it needs PresentMon present-mode data, not GPU counters — three
+  counter-based readings gave three different mechanisms. Still not installed here.
+
+### What is NOT worth doing (measured, not guessed)
+
+- **Cropping the WGC background copy.** The whole capture path — the full-monitor
+  33 MB `CopyResource` *and* compose-under-bg — is worth **≤0.4 app points**, and
+  the `copy` engine measures **0.00**; it is all on `3d`. Proposed and dropped.
+- **Dropping `WS_EX_NOREDIRECTIONBITMAP`** while keeping the transparent session
+  (`DXR_AVATAR_REDIRECTED_WINDOW`). Measured the **worst** dwm arm of any tested.
+  The style is not what denies independent flip — the region is.
+- **`DXR_AVATAR_RENDER_HZ`** is unresolved and default-off: 6 Hz is visibly jumpy
+  (the character's own animation runs at that rate too), and 30 Hz is **inert**
+  because it sits above the 22 Hz present cap — it only does anything *below* the
+  present rate. 15 Hz is untried.
+- **`SIMPLE_LIGHT` / `DECIMATE`** — the app is not render-bound (see the flat `pre`
+  above), and both cost visible quality.
+
+### Still open
+
+- **The zone mask rasters are re-rastered every frame.** The composite runs a
+  full-region binary mask raster *and* (whenever a zone feathers, which this app
+  does by default) a second full-region feather raster, every frame — and neither
+  #858 nor #866 touches them, since both clip only the draw and the weave copy.
+  Their content is a pure function of (zone rects, feather widths, region dims),
+  which for this app never change. A `wish_dirty`-style change-detector already
+  exists next door for the publish path. Untried, and worth an A/B rather than an
+  estimate.
+- **Which number is "10 %"** — app column, or system total? Open since 2026-07-30
+  and it decides everything above. At 600x1051 this branch is app 8.3 / system
+  10.8 quiet; at 811x1421 it is app 10.3 / system 12.4.
 
 ## Not done
 
@@ -371,15 +391,23 @@ is the next step; it is still not installed on this box.
 - **Root cause of the intermittent +8-point state.** Ruled out: adapter switch,
   window geometry, viewer presence, background capture, renderer config, GPU
   clocks (the renderer's own ms/view does not rise with it). Worth a GPUView or
-  PresentMon trace next. **Narrowed 2026-08-05: the excursion is in `dwm`, and
-  only the transparent `WS_EX_NOREDIRECTIONBITMAP` window is susceptible — the
-  opaque session is immune.** See *the dwm bistability* above.
+  PresentMon trace next. **Narrowed 2026-08-05: the excursion is in `dwm`.** With
+  the knobs OFF dwm is a steady ~21.7; with them ON it sits near 0 and jumps
+  ~5-8 points about 1 rep in 5. Needs PresentMon present-mode data — GPU counters
+  gave three different mechanisms across the day. See *Reaching single digits*.
 
 ## Open question for whoever picks this up
 
-"Single-digit iGPU" is met only with the clip paused and no viewer tracked. With
-the clip playing the app sits at ~15 %, and ~12 of those points are present +
-weave + blits, not render. Below that means the weave and dwm (~12 %), neither of
-which is in this repo. Worth settling which reading the 33 % refers to — the
-avatar process's Task Manager column, or the system total. On this box those are
-~15 % and ~30 %.
+**Which number is "10 %"** — the app process's column, or the system total? Open
+since 2026-07-30, and it decides what is left to do. On this branch at 600x1051
+with the six knobs, on a quiet desktop: **app 8.3 / system 10.8**. At 811x1421:
+**app 10.3 / system 12.4**.
+
+And the system total needs a stated desktop state to mean anything: the *same*
+live instance measured system 15.8 with a terminal animating and 10.8 with it
+quiet, while the app column moved 0.13. So a system-wide reading on a working
+desktop will always be higher than ours, without anything having regressed.
+
+*(The older "~15 % playing / single digits only when paused" framing above this
+section predates the `PRESENT_OPAQUE` + `REGION_ON_HOVER` result and the 600x1051
+default — treat this section and* Reaching single digits *as current.)*
