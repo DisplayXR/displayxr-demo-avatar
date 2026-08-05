@@ -115,7 +115,26 @@ reachable from one binary.
 | `DXR_AVATAR_CAPTURE_AFTER_MS` | off | fire one atlas capture N ms in |
 | `DXR_AVATAR_DUMP_VIEWMATS` | off | sample per-view matrices periodically |
 
-The last four are test hooks. They earned their keep and are all inert unless
+### Single-digit experiment knobs (2026-08-04/05)
+
+Added while chasing the ≤10 % target. All default off; none changes a shipped
+path. See *Reaching single digits* below for what they measure.
+
+| Env | Effect |
+|---|---|
+| `DXR_AVATAR_MINIMAL` | character only: no bubble/toast, no silhouette pass, full-window zone; implies opaque |
+| `DXR_AVATAR_KEEP_TEXT` | keep the Local2D bubble in minimal mode (keeps the bottom-75 % zone, since a full-window zone masks 2D out) |
+| `DXR_AVATAR_FORCE_TRANSPARENT` | keep the shaped transparent session while retaining minimal mode's other trims |
+| `DXR_AVATAR_OPAQUE_SESSION` | opaque session + redirected window |
+| `DXR_AVATAR_REDIRECTED_WINDOW` | drop `WS_EX_NOREDIRECTIONBITMAP` **while keeping the transparent session** — isolates the window style from the session |
+| `DXR_AVATAR_REGION_ON_HOVER` | apply the shaped region only when the cursor is near (the region is for hit-testing only; per-pixel alpha does the see-through) |
+| `DXR_AVATAR_NO_REGION` | never apply the shaped region (isolation arm) |
+| `DXR_AVATAR_PRESENT_HZ=N` | cap the whole frame loop, weave and present included |
+| `DXR_AVATAR_DECIMATE=r` | weld + `meshopt_simplify` to ratio r |
+| `DXR_AVATAR_SIMPLE_LIGHT` | skip the 3 IBL fetches, hemispherical ambient instead (−11 % renderer) |
+| `DXR_AVATAR_WINDOW=WxH` | startup window size. View dims are fixed at `xrCreateSession`, so a later resize changes **nothing** |
+
+The last four of the original table are test hooks. They earned their keep and are all inert unless
 set, but they are test surface in a shipping demo and want a keep/strip call.
 
 Not ours, but load-bearing for any measurement here: the Leia DP env `LEIA_DP_DISABLE_BG_CAPTURE`
@@ -229,6 +248,103 @@ like one.
   have read as a regression against a GPU-% target. It has to land with
   throttling or a cap.
 
+## Reaching single digits — and the dwm bistability (2026-08-05)
+
+Measured on rebuilt binaries (runtime `1721f2d31`, avatar `f65721f`+), Arc iGPU,
+`\GPU Engine(*)\Running Time`, 12 s warmup + 20 s measure, 5 interleaved reps,
+cursor parked (`REGION_ON_HOVER` is cursor-dependent — an unparked cursor
+silently changes the arm).
+
+The single-digit config **does** reproduce, at **app 8.4–9.5 %**. The
+"6.2 % app / 3.7 % dwm / 13.0 % system" in `f65721f`'s commit message does not —
+don't quote it.
+
+Per-stage at 22 presents/s (`DXR_FRAME_STAGE_TIMING=1`), ms/frame:
+`pre` 1.16 · `weave` 1.31 · `composite` 1.08 · `present` **0.40**. Note `present`
+is 0.40 ms against 6.3–6.5 ms in the shipped config — `DXR_PRESENT_OPAQUE`
+plus the present cap is what moved it, and the four stages sum to 3.95 ms ×
+22/s ≈ 8.7 %, i.e. the app column is fully accounted.
+
+### 🔴 dwm is bistable for the transparent window, and stable for the opaque one
+
+Same config, two runs an hour apart — and *within* the first run it flipped
+between reps 3 and 4:
+
+| arm | run 1 dwm (per rep) | run 2 dwm (n=5) | run 2 app | run 2 system |
+|---|---|---|---|---|
+| idle desktop, no app | — | 0.08 | 0 | 0.22 |
+| A transparent + `NORB` + `PRESENT_OPAQUE` | 2.96, 2.46, 2.91, **0**, **0** | **9.39** (8.95–9.82) | 10.74 | 20.07 |
+| G transparent + **redirected** window | — | **11.12** | 10.75 | 22.35 |
+| C opaque session (`MINIMAL`) | 1.54, 1.42, 0.96, 0.97, 0.98 | **1.00** (0.96–1.26) | 8.65 | 11.12 |
+| H redirected + no bg capture (chroma-key) | — | 2.04 | 8.19 | 10.88 |
+
+**This is the documented "intermittent +8-point state", and it lives in dwm.**
+Run 2 caught it: A's dwm went 2.5 → 9.4 and its system total 13.1 → 20.1, a
+~+7–8 point excursion, with the *renderer* unchanged. **The opaque-session config
+never shows it** — C measured 0.96–1.54 across both runs. So the susceptible
+ingredient is the transparent `WS_EX_NOREDIRECTIONBITMAP` window, not the
+renderer, the capture, or the window geometry.
+
+Three things this kills:
+
+- **Dropping `WS_EX_NOREDIRECTIONBITMAP` does not help — it hurts.** Arm G
+  (transparent session, redirected window, via `DXR_AVATAR_REDIRECTED_WINDOW`)
+  is the *worst* dwm arm at 11.12. The style is not what denies independent flip.
+- **Don't compare dwm across sessions, or against another app measured in another
+  session.** The cube's "dwm 1–2 with `DXR_PRESENT_OPAQUE`" is not a target the
+  avatar is missing: a `cube_zones_vk_win` reference measured *in the same
+  session* sat at 2.76/2.35 while the avatar sat at 2.96/2.46, then both went to
+  0. Desktop churn from unrelated windows lands in the dwm column and swamps the
+  app's own contribution — an idle desktop is 0.08.
+- **dwm is not charged per app present.** At 60 Hz instead of 22 the app column
+  goes 9.5 → 25.7 while dwm is flat (2.74 vs 2.96). No app-side rate limiting
+  touches it.
+
+### What is left, ranked by measured share of the frame
+
+The four stages account for the whole app column (3.95 ms × 22/s ≈ 8.7 %), and a
+per-engine split (3 reps) shows **all of it on the `3d` engine — `copy` is 0.00**:
+
+| stage | ms/frame | share | who owns it |
+|---|---|---|---|
+| `weave` | 1.31 | 33 % | vendor weaver — not ours; only lever is rate or region size |
+| `pre` | 1.16 | 29 % | renderer + accum + crops |
+| **`composite`** | **1.08** | **27 %** | **runtime — the best item we control** |
+| `present` | 0.40 | 10 % | already collapsed from 6.3–6.5 ms |
+
+1. **Scissored Local2D composite (runtime).** The composite writes
+   `M*weave + (1-M)*twod`; where `M == 1` the output is just `weave`. Restrict the
+   pass to the union of the Local2D rects and the un-zoned band instead of the
+   whole region — in this config that band is ~the top 25 %, so ~0.75 ms/frame
+   (~1.6 app points) with **no quality cost**. Generalises the identity skip in
+   runtime `1721f2d31`, which is a *null* for the text-on config (a real Local2D
+   layer means the composite is not the identity).
+2. **Renderer, via render-rate decoupling** rather than trims. `DXR_AVATAR_RENDER_HZ`
+   (zero-copy: skip acquire/render/release and let `oxr` re-composite from
+   `released.index`) keeps the weave at full rate while cutting `pre`. `pre` is only
+   1.16 ms here, so the headroom is ~1 point — much less than the −8.1 it bought in
+   the shipped config.
+3. **Not the background capture.** Measured: the whole WGC path — the full-monitor
+   33 MB `CopyResource` *and* compose-under-bg — is worth **≤0.4 app points**
+   (8.37 → 7.97 with capture off entirely), and there is no copy-engine time to
+   reclaim. A proposal to crop the copy to the window rect was measured and
+   dropped. The 3.4–3.6 copy-engine points recorded elsewhere in this file belong
+   to the **shipped** present path, not the capture.
+4. **The biggest single number is dwm, and it is worth 0 app points** — up to ~8
+   *system* points from the bistability above. Needs PresentMon, not counters.
+
+### If you need a predictable number
+
+Recommend the **opaque session** (C): app 8.65, dwm 1.00, system 11.12, tight
+across every rep of both runs and immune to the +8 state. The cost is the look —
+`MINIMAL` is opaque, with no bubble/toast and a full-window zone, so it is not
+"the shipped avatar but opaque". The transparent config reaches the same app
+column but its dwm is a coin flip between ~0 and ~9.4.
+
+Root-causing the flip needs present-mode truth, not GPU counters — three
+counter-based readings gave three different mechanisms. `PresentMon` (admin, ETW)
+is the next step; it is still not installed on this box.
+
 ## Not done
 
 - **Item 6 — render directly into the runtime swapchain image.** Ceiling is **well
@@ -255,7 +371,9 @@ like one.
 - **Root cause of the intermittent +8-point state.** Ruled out: adapter switch,
   window geometry, viewer presence, background capture, renderer config, GPU
   clocks (the renderer's own ms/view does not rise with it). Worth a GPUView or
-  PresentMon trace next.
+  PresentMon trace next. **Narrowed 2026-08-05: the excursion is in `dwm`, and
+  only the transparent `WS_EX_NOREDIRECTIONBITMAP` window is susceptible — the
+  opaque session is immune.** See *the dwm bistability* above.
 
 ## Open question for whoever picks this up
 
