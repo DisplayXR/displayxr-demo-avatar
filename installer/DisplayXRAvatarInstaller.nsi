@@ -83,6 +83,27 @@ ShowUninstDetails show
 !include "WordFunc.nsh"
 !insertmacro VersionCompare
 
+;--------------------------------
+; Abort a pre-flight check without ever showing a modal in silent mode.
+;
+; NSIS does NOT suppress MessageBox under /S — it shows and blocks forever.
+; The DisplayXR meta-bundle runs every child installer as
+; `ExecWait '<child> /S'` and aborts the chain on a non-zero exit, so a modal
+; here would hang the ENTIRE bundle against a window nobody can see. In silent
+; mode set a distinct exit code instead; the bundle already surfaces that as
+; "<component> installer exited with code $0. Aborting bundle."
+;
+; Codes: 3 = not 64-bit, 4 = runtime absent, 5 = runtime below the floor.
+; (2 is reserved — the INNER uninstaller-emitting pass exits 2 by design.)
+!macro AbortWithReason CODE MSG
+    ${If} ${Silent}
+        SetErrorLevel ${CODE}
+    ${Else}
+        MessageBox MB_ICONSTOP "${MSG}"
+    ${EndIf}
+    Abort
+!macroend
+
 ; Minimum runtime version. The avatar floats transparent over the desktop: it
 ; creates the HWND with WS_EX_NOREDIRECTIONBITMAP and the session with
 ; transparentBackgroundEnabled=XR_TRUE unconditionally, which only render
@@ -126,8 +147,7 @@ Function .onInit
     Quit
 !endif
     ${IfNot} ${RunningX64}
-        MessageBox MB_ICONSTOP "DisplayXR requires 64-bit Windows."
-        Abort
+        !insertmacro AbortWithReason 3 "DisplayXR requires 64-bit Windows."
     ${EndIf}
 
     ; HKLM\Software\DisplayXR\Runtime\InstallPath is set by the runtime
@@ -139,8 +159,7 @@ Function .onInit
     ReadRegStr $1 HKLM "Software\DisplayXR\Runtime" "Version"
     SetRegView 32
     ${If} $0 == ""
-        MessageBox MB_ICONSTOP "DisplayXR runtime is not installed.$\r$\n$\r$\nInstall the DisplayXR runtime first, then re-run this installer.$\r$\n$\r$\nGet it from:$\r$\nhttps://github.com/DisplayXR/displayxr-runtime/releases"
-        Abort
+        !insertmacro AbortWithReason 4 "DisplayXR runtime is not installed.$\r$\n$\r$\nInstall the DisplayXR runtime first, then re-run this installer.$\r$\n$\r$\nGet it from:$\r$\nhttps://github.com/DisplayXR/displayxr-runtime/releases"
     ${EndIf}
 
     ; Enforce the minimum runtime version for the Vulkan transparent-window
@@ -149,8 +168,7 @@ Function .onInit
     ; — the demo neither bundles nor depends on it being on PATH.
     ${VersionCompare} "$1" "${MIN_RUNTIME_VERSION}" $2
     ${If} $2 == 2
-        MessageBox MB_ICONSTOP "DisplayXR runtime $1 is too old.$\r$\n$\r$\nThis demo requires runtime ${MIN_RUNTIME_VERSION} or later.$\r$\n$\r$\nUpdate from:$\r$\nhttps://github.com/DisplayXR/displayxr-runtime/releases"
-        Abort
+        !insertmacro AbortWithReason 5 "DisplayXR runtime $1 is too old.$\r$\n$\r$\nThis demo requires runtime ${MIN_RUNTIME_VERSION} or later.$\r$\n$\r$\nUpdate from:$\r$\nhttps://github.com/DisplayXR/displayxr-runtime/releases"
     ${EndIf}
 FunctionEnd
 
