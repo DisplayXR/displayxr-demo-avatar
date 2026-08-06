@@ -1219,13 +1219,61 @@ static bool _dxr_redirected_window() {
     return e && atoi(e) != 0;
 }
 
+// What is currently ON the window, so we can avoid redundant SetWindowRgn calls.
+// Every call re-enters DWM's shape evaluation for the window; at the 16 ms tick
+// rate that is 60 shape changes a second, whether or not anything moved. The
+// silhouette does change most frames while the character animates, but the
+// clear-and-stay-cleared paths below (decorated, opaque session, cursor away)
+// were re-issuing the same NULL region every tick for nothing.
+enum class AppliedRegion { Cleared, Empty, Rects };
+static AppliedRegion g_appliedRegion = AppliedRegion::Cleared;
+static std::vector<RECT> g_appliedRects;
+
+// DXR_AVATAR_REGION_STATS=1 — count the SetWindowRgn calls actually issued and
+// report once a second. The point of the hover gate and the dedupe is to make
+// this number small; without the counter it can only be inferred from GPU
+// totals, which is how the earlier reading of this code went wrong.
+static unsigned g_regionCalls = 0;
+static unsigned g_regionTicks = 0;
+static unsigned g_regionRectCount = 0;   // rects in the region currently applied
+
+static void NoteRegionCall() { ++g_regionCalls; }
+
+// Called once per tick, so it reports even when the answer is "zero calls" —
+// which is the state the hover gate is supposed to produce.
+static void ReportRegionStats() {
+    ++g_regionTicks;
+    static const bool s_stats = [] {
+        const char *e = getenv("DXR_AVATAR_REGION_STATS");
+        return e && atoi(e) != 0;
+    }();
+    if (!s_stats) return;
+    static ULONGLONG s_last = 0;
+    const ULONGLONG now = GetTickCount64();
+    if (s_last == 0) { s_last = now; return; }
+    if (now - s_last < 1000) return;
+    LOG_INFO("[REGION] %u SetWindowRgn calls / %u ticks in %llu ms, %u rects applied",
+             g_regionCalls, g_regionTicks, (unsigned long long)(now - s_last), g_regionRectCount);
+    g_regionCalls = 0;
+    g_regionTicks = 0;
+    s_last = now;
+}
+
+static void ClearClickRegion(HWND hwnd) {
+    if (g_appliedRegion == AppliedRegion::Cleared) return;
+    SetWindowRgn(hwnd, NULL, TRUE);
+    NoteRegionCall();
+    g_appliedRegion = AppliedRegion::Cleared;
+    g_appliedRects.clear();
+}
+
 static void UpdateClickRegion(HWND hwnd) {
-    if (g_decorated) { SetWindowRgn(hwnd, NULL, TRUE); return; }
+    if (g_decorated) { ClearClickRegion(hwnd); return; }
     // The silhouette region only exists because transparency makes the window
     // shaped. In an opaque session the coverage never populates, so the region
     // clips the ENTIRE window away — invisible for rendering, not just input.
     // This is what pressing B was working around.
-    if (_dxr_opaque_session_env()) { SetWindowRgn(hwnd, NULL, TRUE); return; }
+    if (_dxr_opaque_session_env()) { ClearClickRegion(hwnd); return; }
     // MEASUREMENT (local): DXR_AVATAR_NO_REGION=1 drops the shaped region while
     // KEEPING the transparent session. Isolates whether the SetWindowRgn clip is
     // what denies DWM independent flip (the suspected reason DXR_PRESENT_OPAQUE
@@ -1234,19 +1282,32 @@ static void UpdateClickRegion(HWND hwnd) {
         const char *e = getenv("DXR_AVATAR_NO_REGION");
         return e && atoi(e) != 0;
     }();
-    if (s_noRegion) { SetWindowRgn(hwnd, NULL, TRUE); return; }
+    if (s_noRegion) { ClearClickRegion(hwnd); return; }
 
     // DXR_AVATAR_REGION_ON_HOVER=1 — the shaped region exists ONLY to route input
     // (clicks outside the silhouette fall through cross-process). It is not what
     // makes the background see-through; per-pixel alpha does that, so dropping it
     // is visually identical. But a region-clipped window cannot be granted
-    // Hardware Independent Flip, which costs ~6 points of dwm every refresh —
-    // measured: region+opaque-present 10.5 dwm vs no-region+opaque-present 4.5.
+    // Hardware Independent Flip. MEASURED 2026-08-06 with the cursor parked and
+    // only the region varying (5 interleaved reps, system GPU %): region applied
+    // 18.30 vs no region 8.87 — the shaped window roughly DOUBLES the system
+    // total, and cursor position on its own costs nothing (cursor parked inside
+    // with no region measured 8.87, same as cursor far away at 8.98).
     //
-    // So carry it lazily: no region while the cursor is away (DWM gets to flip),
-    // region applied as the cursor approaches (input routing correct again). The
-    // margin gives the region time to be in place before a click lands; a click
-    // teleported in with no prior movement is the one case that can misroute.
+    // So carry it lazily: no region while the cursor is outside the window (DWM
+    // gets to flip), region applied while it is inside (input routing correct
+    // again). The window only needs to be shaped where the cursor can actually
+    // hit it, and outside its rect the cursor cannot — so an unshaped window
+    // there costs nothing in correctness.
+    //
+    // Entry is EVENT-DRIVEN, not polled: with the region cleared the window owns
+    // its whole rect for hit-testing, so it receives WM_MOUSEMOVE the moment the
+    // cursor crosses in, and WindowProc calls straight back here. That reapplies
+    // the region ahead of any click, which is what the old 48 px approach margin
+    // was buying — except the margin also meant the 60 Hz SetWindowRgn storm
+    // resumed while the cursor was merely NEAR the window, not on it. A click
+    // teleported in with no prior movement remains the one case that can
+    // misroute.
     static const bool s_regionOnHover = [] {
         const char *e = getenv("DXR_AVATAR_REGION_ON_HOVER");
         return e && atoi(e) != 0;
@@ -1255,21 +1316,36 @@ static void UpdateClickRegion(HWND hwnd) {
         POINT cur;
         RECT wr;
         if (GetCursorPos(&cur) && GetWindowRect(hwnd, &wr)) {
-            const LONG margin = 48;   // apply slightly before the cursor arrives
-            // NB: not `near` — that's a legacy windef.h macro and won't compile.
-            const bool cursorNear = cur.x >= wr.left - margin && cur.x <= wr.right + margin &&
-                                    cur.y >= wr.top - margin && cur.y <= wr.bottom + margin;
-            static bool s_regionApplied = true;
-            if (!cursorNear) {
-                if (s_regionApplied) {
-                    SetWindowRgn(hwnd, NULL, TRUE);
-                    s_regionApplied = false;
-                }
-                return;
-            }
-            s_regionApplied = true;   // fall through and rebuild the shaped region
+            // Hysteresis only on the way out, so a cursor resting exactly on the
+            // border doesn't toggle the shape every tick.
+            const LONG exitSlop = (g_appliedRegion == AppliedRegion::Cleared) ? 0 : 4;
+            const bool cursorInside =
+                cur.x >= wr.left - exitSlop && cur.x < wr.right + exitSlop &&
+                cur.y >= wr.top - exitSlop && cur.y < wr.bottom + exitSlop;
+            if (!cursorInside) { ClearClickRegion(hwnd); return; }
         }
     }
+
+    // MEASUREMENT (local): DXR_AVATAR_REGION_STATIC=1 — once a shaped region is
+    // on the window, never rebuild it. Separates the two ways a region can cost
+    // GPU time: the per-call cost of re-shaping at 60 Hz, versus the standing
+    // cost of the window merely HAVING a non-rectangular region (which is what
+    // denies DWM independent flip).
+    //
+    // MEASURED 2026-08-06, cursor parked inside the window, 4 interleaved reps,
+    // knob engagement verified via DXR_AVATAR_REGION_STATS (system GPU %):
+    //     dynamic (~11 calls/s, ~145 rects)  17.11
+    //     static  ( 0 calls/s, 149 rects)    16.54
+    //     coarse8 (~11 calls/s,   7 rects)   17.03
+    //     no region at all                    7.62
+    // So it is the PRESENCE of the region, not the calls (worth ~0.6) and not
+    // its complexity (worth nothing). The only lever is not carrying one — which
+    // is what the hover gate above does. Don't re-derive this.
+    static const bool s_regionStatic = [] {
+        const char *e = getenv("DXR_AVATAR_REGION_STATIC");
+        return e && atoi(e) != 0;
+    }();
+    if (s_regionStatic && g_appliedRegion == AppliedRegion::Rects) return;
 
     std::vector<RECT> rects;
     int winW = 0, winH = 0;
@@ -1305,6 +1381,40 @@ static void UpdateClickRegion(HWND hwnd) {
         }
     }
 
+    // MEASUREMENT (local): DXR_AVATAR_REGION_COARSE=N — collapse the silhouette
+    // to at most N horizontal bands (min-left..max-right per band) instead of one
+    // rect per coverage run, which is normally a few hundred. Tests whether the
+    // region's cost scales with its COMPLEXITY.
+    //
+    // MEASURED: it does not — 7 rects cost the same as 145 (see the table on
+    // DXR_AVATAR_REGION_STATIC above). Kept only so the null stays recorded;
+    // there is no reason to trade click-through accuracy at the character's
+    // concave edges for it.
+    static const int s_regionCoarse = [] {
+        const char *e = getenv("DXR_AVATAR_REGION_COARSE");
+        return e ? atoi(e) : 0;
+    }();
+    if (s_regionCoarse > 0 && !rects.empty() && winH > 0) {
+        std::vector<RECT> bands((size_t)s_regionCoarse, RECT{LONG_MAX, 0, LONG_MIN, 0});
+        for (const RECT& r : rects) {
+            int b = (int)((long long)r.top * s_regionCoarse / winH);
+            if (b < 0) b = 0;
+            if (b >= s_regionCoarse) b = s_regionCoarse - 1;
+            RECT& d = bands[(size_t)b];
+            if (r.left < d.left)   d.left = r.left;
+            if (r.right > d.right) d.right = r.right;
+        }
+        std::vector<RECT> collapsed;
+        for (int b = 0; b < s_regionCoarse; ++b) {
+            RECT& d = bands[(size_t)b];
+            if (d.left >= d.right) continue;   // no coverage in this band
+            d.top    = (LONG)((long long)b * winH / s_regionCoarse);
+            d.bottom = (LONG)((long long)(b + 1) * winH / s_regionCoarse);
+            collapsed.push_back(d);
+        }
+        rects.swap(collapsed);
+    }
+
     // Add the speech-bubble rect so it stays visible (and clickable) even though
     // it lies outside the tiger silhouette that otherwise shapes the window.
     {
@@ -1317,7 +1427,19 @@ static void UpdateClickRegion(HWND hwnd) {
 
     if (rects.empty()) {
         // Nothing drawn → empty region = the whole window is click-through.
+        if (g_appliedRegion == AppliedRegion::Empty) return;
         SetWindowRgn(hwnd, CreateRectRgn(0, 0, 0, 0), TRUE);
+        NoteRegionCall();
+        g_appliedRegion = AppliedRegion::Empty;
+        g_appliedRects.clear();
+        return;
+    }
+
+    // Unchanged silhouette → the window already has exactly this shape. Skipping
+    // the call is what keeps a paused or idle-throttled avatar from re-shaping
+    // its window 60 times a second for no reason.
+    if (g_appliedRegion == AppliedRegion::Rects && g_appliedRects.size() == rects.size() &&
+        memcmp(g_appliedRects.data(), rects.data(), rects.size() * sizeof(RECT)) == 0) {
         return;
     }
 
@@ -1341,6 +1463,10 @@ static void UpdateClickRegion(HWND hwnd) {
     memcpy(rd->Buffer, rects.data(), rects.size() * sizeof(RECT));
     HRGN rgn = ExtCreateRegion(NULL, (DWORD)bytes, rd);
     SetWindowRgn(hwnd, rgn, TRUE);  // OS takes ownership of rgn
+    NoteRegionCall();
+    g_appliedRegion = AppliedRegion::Rects;
+    g_regionRectCount = (unsigned)rects.size();
+    g_appliedRects = std::move(rects);
 }
 
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -1357,10 +1483,21 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     }
 
     switch (msg) {
+    case WM_MOUSEMOVE:
+        // Entry hook for DXR_AVATAR_REGION_ON_HOVER: while the region is cleared
+        // the window owns its whole rect for hit-testing, so this is the first
+        // signal that the cursor has arrived — reshape now rather than waiting up
+        // to a 16 ms tick, so the region is in place before any click. Only on
+        // the entry transition: once shaped, the 60 Hz timer keeps it current,
+        // and rebuilding the rect list per mouse message would just burn CPU.
+        if (g_appliedRegion == AppliedRegion::Cleared) UpdateClickRegion(hwnd);
+        break;
     case WM_NCHITTEST: {
-        // Borderless: the OS only delivers this when the cursor is INSIDE the
-        // SetWindowRgn silhouette region (outside it the window is skipped
-        // entirely and the event reaches the desktop), so just claim it.
+        // Borderless: with the silhouette region applied the OS only delivers
+        // this when the cursor is INSIDE it (outside, the window is skipped
+        // entirely and the event reaches the desktop), so just claim it. Under
+        // REGION_ON_HOVER the region may not be applied yet on the first crossing
+        // — claiming it is still right, and WM_MOUSEMOVE reshapes immediately.
         if (!g_decorated) return HTCLIENT;
         break;
     }
@@ -1381,6 +1518,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
     case WM_TIMER:
         if (wParam == kClickThroughTimerId) {
+            ReportRegionStats();
             UpdateClickRegion(hwnd);
             return 0;
         }
