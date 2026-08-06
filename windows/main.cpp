@@ -1264,6 +1264,7 @@ static void ClearClickRegion(HWND hwnd) {
     SetWindowRgn(hwnd, NULL, TRUE);
     NoteRegionCall();
     g_appliedRegion = AppliedRegion::Cleared;
+    g_regionRectCount = 0;
     g_appliedRects.clear();
 }
 
@@ -1431,6 +1432,7 @@ static void UpdateClickRegion(HWND hwnd) {
         SetWindowRgn(hwnd, CreateRectRgn(0, 0, 0, 0), TRUE);
         NoteRegionCall();
         g_appliedRegion = AppliedRegion::Empty;
+        g_regionRectCount = 0;
         g_appliedRects.clear();
         return;
     }
