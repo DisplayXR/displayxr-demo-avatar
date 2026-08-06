@@ -37,6 +37,7 @@
 #include "atlas_capture.h"
 #include "recenter_control.h"  // dynamic-recenter per-axis pins (P then X/Y/Z; DXR_RECENTER_PIN)
 #include "toast.h"             // dxr::ToastState — transient on-screen confirmation
+#include "win_window_drag.h"   // dxr::RmbWindowDrag — move the borderless avatar without decorating it
 #include <dwrite.h>
 #pragma comment(lib, "dwrite.lib")
 
@@ -464,6 +465,14 @@ static void ToggleFullscreen(HWND hwnd) {
 // toggle (AdjustWindowRect compensates for the added/removed non-client frame)
 // so the avatar doesn't jump or rescale.
 static bool g_decorated = false;  // false = borderless (default)
+
+// Borderless mode has no title bar, so RMB-drag moves the window — the
+// desktop-avatar convention, matching modelviewer and gaussiansplat. Window
+// -thread owned (touched only from WindowProc). The drag is inherently gated
+// on the opaque element: while shaped, the OS delivers mouse messages only
+// inside the SetWindowRgn silhouette, so the transparent area keeps clicking
+// through to the desktop.
+static dxr::RmbWindowDrag g_windowDrag;
 
 static void ToggleDecoration(HWND hwnd) {
     if (g_fullscreen) return;  // decoration is meaningless in fullscreen
@@ -1161,6 +1170,13 @@ static void UpdateClickRegion(HWND hwnd) {
 }
 
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    // RMB-drag move, before the scene input pump so a drag never doubles as a
+    // scene gesture. Only starts while borderless (decorated mode has a title
+    // bar); an in-flight drag always completes. Synthesises the modal-move
+    // brackets so windowed-weaving phase-snap behaves as it does for an OS drag.
+    if (g_windowDrag.handleMessage(hwnd, msg, wParam, lParam, !g_decorated)) {
+        return 0;
+    }
     {
         std::lock_guard<std::mutex> lock(g_inputMutex);
         UpdateInputState(g_inputState, msg, wParam, lParam);
