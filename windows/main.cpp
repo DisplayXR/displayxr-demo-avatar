@@ -2609,11 +2609,44 @@ static void RenderThreadFunc(
                 return (v >= 1 && v <= 240) ? (uint32_t)v : 0u;
             }();
             if (s_presentHz > 0) {
-                const uint64_t capMs = 1000ull / s_presentHz;
-                if ((nowMs - s_lastFrameMs) < capMs) {
+                // Exact panel-rate division, same defect RENDER_HZ had. The cap
+                // used to be 1000/N ms compared against GetTickCount64, whose
+                // ~15.6 ms resolution beats against the 16.67 ms vblank grid: at
+                // PRESENT_HZ=22 the 45 ms cap alternated between skipping 2 and 3
+                // vblanks, so the cadence was uneven — judder ON TOP OF the lower
+                // rate, and it beat against RENDER_HZ, which is already exact.
+                //
+                // Snap the request to a whole number of panel frames and time it
+                // on a high-resolution clock. A frame COUNT (what RENDER_HZ uses)
+                // is not available here: this gate skips the iteration before
+                // xrWaitFrame, so skipped iterations are not vblank-paced and a
+                // counter would tick at the Sleep(1) rate instead of the panel's.
+                static int s_every = 0;        // present 1 frame in s_every
+                static double s_periodNs = 0;
+                if (s_every == 0) {
+                    const int panelHz = 60;    // TODO: runtime refresh query, as RENDER_HZ
+                    s_every = (s_presentHz >= (uint32_t)panelHz)
+                                  ? 1
+                                  : (panelHz + (int)s_presentHz / 2) / (int)s_presentHz;
+                    if (s_every < 1) s_every = 1;
+                    // Open the gate slightly BEFORE the target vblank; xrWaitFrame
+                    // then blocks to the vblank itself, so every presented frame
+                    // lands on the same phase instead of drifting across it.
+                    s_periodNs = (1e9 / panelHz) * s_every - 4.0e6;
+                    LOG_WARN("DXR_AVATAR_PRESENT_HZ=%u — presenting 1 frame in %d "
+                             "(~%.1f Hz at %d Hz panel)",
+                             s_presentHz, s_every, (double)panelHz / s_every, panelHz);
+                }
+                static uint64_t s_lastPresentNs = 0;
+                const uint64_t nowNs = (uint64_t)std::chrono::duration_cast<
+                    std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch()).count();
+                if (s_lastPresentNs != 0 &&
+                    (double)(nowNs - s_lastPresentNs) < s_periodNs) {
                     Sleep(1);
                     continue;
                 }
+                s_lastPresentNs = nowNs;
             }
             s_lastFrameMs = nowMs;
         }
