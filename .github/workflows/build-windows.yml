@@ -218,6 +218,14 @@ jobs:
           fail_on_unmatched_files: true
           draft: false
           prerelease: false
+          # ONLY this workflow may set generate_release_notes in this repo. The
+          # action folds the flag into `body` before calling the API, and on
+          # update does `body = existing + "\n\n" + notes` — so flagging the
+          # macOS/Linux/Android workflows too would repeat the notes once per
+          # job. Gives every release a "## What's Changed" floor; /dxr-release
+          # PHASE 3.6 prepends curated "## Highlights" above it, which is what
+          # the website's "What's New" feed parses.
+          generate_release_notes: true
 
   # On v* tag push, after BuildInstaller succeeds, tell
   # displayxr-runtime to bump versions.json[avatar_demo] to
