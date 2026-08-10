@@ -1349,38 +1349,30 @@ bool ModelRenderer::finalizeModel(ModelData& md) {
     return true;
 }
 
-// Load-time mesh decimation. DXR_AVATAR_DECIMATE=<ratio 0..1> keeps that
-// fraction of each primitive's triangles. meshopt_simplify rewrites only the
-// INDEX buffer over the existing vertices, so joints0/weights0 (and every other
-// per-vertex attribute) are carried through untouched — the vertex buffer is
-// left as-is and the unreferenced vertices simply stop being drawn, which is
-// what removes the vertex/skinning work.
+// Vertex welding. UNCONDITIONAL — this is not a tuning knob.
 //
-// Reduction is bounded by attribute seams: a vertex split for a UV/normal seam
-// cannot collapse across the split, so a heavily-seamed mesh will land short of
-// the requested ratio. The achieved ratio is logged per model.
-static void DecimateModel(ModelData& md) {
-    const char* e = std::getenv("DXR_AVATAR_DECIMATE");
-    if (!e) return;
-    const float ratio = (float)std::atof(e);
-    if (!(ratio > 0.0f) || ratio >= 1.0f) return;
+// The FBX path emits triangle soup (3 unique verts per triangle, verified:
+// 16392 tris / 49176 verts), so nothing is shared. Deduplicating removes
+// vertex/skinning invocations outright: 49176 -> 13332 here, 73 % of them.
+//
+// It is LOSSLESS: meshopt_generateVertexRemap merges only vertices that compare
+// equal across the whole ModelVertex (position, normal, uv, joints, weights), so
+// the drawn geometry is identical. Quality signed off by eye 2026-08-10 anyway.
+//
+// This used to live inside DecimateModel() behind DXR_AVATAR_DECIMATE, which
+// meant the default build shipped the unwelded soup and nobody noticed —
+// the weld only ran if you asked for decimation you didn't want.
+//
+// Only safe when a single primitive owns the whole buffer and there are no morph
+// targets: welding renumbers vertices globally, which would invalidate
+// per-primitive firstVertex/vertexCount ranges (morph loops index by those).
+static void WeldModel(ModelData& md) {
     if (md.indices.empty() || md.vertices.empty()) return;
-
-    const size_t triesBefore = md.indices.size() / 3;
-    const size_t vertsBefore = md.vertices.size();
-
-    // WELD FIRST. The FBX path emits triangle soup (3 unique verts per triangle,
-    // verified: 16392 tris / 49176 verts), and a simplifier cannot collapse an
-    // edge whose vertices aren't shared — every edge reads as a seam, so
-    // meshopt_simplify returns the input unchanged. Deduplicating the vertex
-    // buffer both enables simplification AND removes vertex/skinning invocations
-    // on its own.
-    //
-    // Only safe when a single primitive owns the whole buffer and there are no
-    // morph targets: welding renumbers vertices globally, which would invalidate
-    // per-primitive firstVertex/vertexCount ranges (morph loops index by those).
     const bool can_weld = md.primitives.size() == 1 && md.morphs.empty();
-    if (can_weld) {
+    if (!can_weld) return;
+
+    const size_t vertsBefore = md.vertices.size();
+    {
         std::vector<unsigned int> remap(md.vertices.size());
         const size_t uniq = meshopt_generateVertexRemap(
             remap.data(), md.indices.data(), md.indices.size(),
@@ -1397,7 +1389,36 @@ static void DecimateModel(ModelData& md) {
         md.primitives[0].vertexCount = (uint32_t)uniq;
         // Vertex-cache + fetch locality on the welded buffer (free wins).
         meshopt_optimizeVertexCache(md.indices.data(), md.indices.data(), md.indices.size(), uniq);
+        perfLogf("ModelRenderer: weld — verts %zu -> %zu, %u prims\n",
+                 vertsBefore, md.vertices.size(), (unsigned)md.primitives.size());
     }
+}
+
+// Load-time mesh decimation. DXR_AVATAR_DECIMATE=<ratio 0..1> keeps that
+// fraction of each primitive's triangles. Still env-gated: unlike the weld it is
+// LOSSY. meshopt_simplify rewrites only the INDEX buffer over the existing
+// vertices, so joints0/weights0 (and every other per-vertex attribute) are
+// carried through untouched — the vertex buffer is left as-is and the
+// unreferenced vertices simply stop being drawn.
+//
+// Runs AFTER WeldModel, which is a hard prerequisite: a simplifier cannot
+// collapse an edge whose vertices aren't shared, so on unwelded soup every edge
+// reads as a seam and meshopt_simplify returns the input unchanged.
+//
+// Reduction is bounded by attribute seams: a vertex split for a UV/normal seam
+// cannot collapse across the split, so a heavily-seamed mesh will land short of
+// the requested ratio. The achieved ratio is logged per model.
+//
+// Measured 2026-08-10: the ladder SATURATES at ratio 0.6 — 0.4 removed 60 % more
+// triangles for no further GPU win (app 9.92 vs 9.93). Don't go below 0.6.
+static void DecimateModel(ModelData& md) {
+    const char* e = std::getenv("DXR_AVATAR_DECIMATE");
+    if (!e) return;
+    const float ratio = (float)std::atof(e);
+    if (!(ratio > 0.0f) || ratio >= 1.0f) return;
+    if (md.indices.empty() || md.vertices.empty()) return;
+
+    const size_t triesBefore = md.indices.size() / 3;
 
     std::vector<uint32_t> out;
     out.reserve(md.indices.size());
@@ -1430,18 +1451,18 @@ static void DecimateModel(ModelData& md) {
     md.indices.swap(out);
     const size_t triesAfter = md.indices.size() / 3;
     perfLogf("ModelRenderer: decimate %.2f — tris %zu -> %zu (%.1f%% kept), "
-             "verts %zu -> %zu (weld=%s), %u prims\n",
+             "verts %zu (welded), %u prims\n",
              ratio, triesBefore, triesAfter,
              triesBefore ? 100.0 * (double)triesAfter / (double)triesBefore : 0.0,
-             vertsBefore, md.vertices.size(), can_weld ? "yes" : "SKIPPED",
-             (unsigned)md.primitives.size());
+             md.vertices.size(), (unsigned)md.primitives.size());
 }
 
 bool ModelRenderer::loadModel(const char* gltfPath) {
     if (!initialized_ || !gltfPath) return false;
     ModelData md;
     if (!model_loader_load(gltfPath, md)) return false;
-    DecimateModel(md);
+    WeldModel(md);      // always: lossless, and the prerequisite for simplifying
+    DecimateModel(md);  // opt-in, lossy
     if (!finalizeModel(md)) return false;
     loadedModelPath_ = gltfPath;
     return true;
