@@ -60,8 +60,14 @@ windows/main.cpp                 — platform entry + avatar shell: borderless
                                     view/projection (bottom-70% Kooima sub-canvas),
                                     billboard, click-through silhouette + window
                                     region, speech-bubble Local2D xrEndFrame, atlas
-                                    capture ('I'). NO model-load UI (auto-loads the
-                                    bundled tiger; optional CLI model-path arg).
+                                    capture ('I'). Auto-loads the bundled tiger;
+                                    swap the character via Ctrl+O, drag-drop, a
+                                    CLI model-path arg, or the load_model MCP
+                                    tool. All four funnel through LoadAvatarModel
+                                    (validate → g_sceneMutex swap → auto-fit).
+                                    A drop only registers where the click-through
+                                    region exists — the silhouette + bubble when
+                                    undecorated, the whole window after B.
 windows/xr_session.cpp/.h        — OpenXR instance/session/Vulkan setup; enables
                                     XR_DXR_local_3d_zone (g_hasLocal3DZone gates
                                     the bubble).

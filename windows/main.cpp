@@ -16,6 +16,7 @@
 #include <windows.h>
 #include <windowsx.h>   // GET_X_LPARAM / GET_Y_LPARAM for WM_NCHITTEST
 #include <commdlg.h>
+#include <shellapi.h>   // DragAcceptFiles / DragQueryFileA / DragFinish (WM_DROPFILES)
 #include <shlwapi.h>
 #include <shlobj.h>
 #pragma comment(lib, "shlwapi.lib")
@@ -544,6 +545,25 @@ static void TryAutoLoadBundledScene(const std::string& overridePath = std::strin
     }
 }
 
+// Validate + swap in a model from any source (file dialog, drag-drop). Factored
+// out of OpenModelDialog so the WM_DROPFILES path cannot drift from the Ctrl+O
+// path: same validation, same g_sceneMutex swap, same auto-fit.
+static void LoadAvatarModel(const char* filePath) {
+    if (!model_validate_file(filePath)) {
+        LOG_WARN("Open: unsupported file '%s'", filePath);
+        return;
+    }
+    LOG_INFO("Loading model: %s", filePath);
+    std::lock_guard<std::mutex> lock(g_sceneMutex);
+    if (g_modelRenderer.loadModel(filePath)) {
+        g_loadedFileName = model_basename(filePath);
+        LOG_INFO("Loaded %s (%s)", g_loadedFileName.c_str(), model_filesize_str(filePath).c_str());
+        ApplyAutoFitForLoadedScene_locked();
+    } else {
+        LOG_WARN("Open: load failed for %s", filePath);
+    }
+}
+
 // O / Ctrl+O — native GetOpenFileNameA picker → load the chosen model. Windows
 // parity for the Linux zenity dialog + the load_model MCP tool. Runs modally on
 // the message thread; the swap takes g_sceneMutex like every other load path.
@@ -558,19 +578,7 @@ static void OpenModelDialog(HWND hwnd) {
     ofn.lpstrTitle = "Open avatar model";
     ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
     if (!GetOpenFileNameA(&ofn)) return; // cancelled
-    if (!model_validate_file(filePath)) {
-        LOG_WARN("Open: unsupported file '%s'", filePath);
-        return;
-    }
-    LOG_INFO("Loading model: %s", filePath);
-    std::lock_guard<std::mutex> lock(g_sceneMutex);
-    if (g_modelRenderer.loadModel(filePath)) {
-        g_loadedFileName = model_basename(filePath);
-        LOG_INFO("Loaded %s (%s)", g_loadedFileName.c_str(), model_filesize_str(filePath).c_str());
-        ApplyAutoFitForLoadedScene_locked();
-    } else {
-        LOG_WARN("Open: load failed for %s", filePath);
-    }
+    LoadAvatarModel(filePath);
 }
 
 // ============================================================================
@@ -1281,6 +1289,32 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         break;
 
+    case WM_DROPFILES: {
+        // Drop a model onto the avatar to swap the character. Routed through the
+        // same LoadAvatarModel the Ctrl+O picker uses, so validation, the
+        // g_sceneMutex swap and the auto-fit cannot drift between the two.
+        //
+        // Where the drop lands is governed by the click-through region, not by
+        // this handler: UpdateClickRegion shapes the window to the silhouette
+        // (plus the speech bubble) whenever g_decorated is false, so a drop
+        // registers over the character and falls through to whatever is behind
+        // elsewhere — exactly how clicks already behave here. Pressing B to
+        // decorate clears the region (SetWindowRgn NULL) and the whole window
+        // accepts drops.
+        HDROP drop = (HDROP)wParam;
+        const UINT count = DragQueryFileA(drop, 0xFFFFFFFF, nullptr, 0);
+        if (count > 0) {
+            char path[MAX_PATH] = {};
+            if (DragQueryFileA(drop, 0, path, MAX_PATH) > 0) {
+                if (count > 1)
+                    LOG_INFO("Drop: %u files, loading the first (%s)", count, path);
+                LoadAvatarModel(path);
+            }
+        }
+        DragFinish(drop);
+        return 0;
+    }
+
     case WM_SIZE:
         if (wParam != SIZE_MINIMIZED) {
             std::lock_guard<std::mutex> lock(g_inputMutex);
@@ -1363,6 +1397,11 @@ static HWND CreateAppWindow(HINSTANCE hInstance, int width, int height) {
         LOG_ERROR("Failed to create window, error: %lu", GetLastError());
         return nullptr;
     }
+
+    // Accept dropped models (WM_DROPFILES). WS_EX_ACCEPTFILES is an EXTENDED
+    // style, so it survives ToggleDecoration's GWL_STYLE rewrite; where a drop
+    // actually lands is governed by the click-through region — see WM_DROPFILES.
+    DragAcceptFiles(hwnd, TRUE);
 
     LOG_INFO("Window created: 0x%p", hwnd);
     return hwnd;
