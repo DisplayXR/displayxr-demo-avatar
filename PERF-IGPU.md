@@ -248,7 +248,93 @@ like one.
   have read as a regression against a GPU-% target. It has to land with
   throttling or a cap.
 
-## Reaching single digits (2026-08-05) — read this section, not the older ones
+## 2026-08-11 — re-based on the live-path default; the repaint is now a COST
+
+Read this section first. It supersedes two claims in the 2026-08-05 section
+below: the "free half" and the region's dwm cost were both measured under
+**baked** composition and do **not** carry over to the live path, which is now
+the shipped default for overlay apps.
+
+Stack: runtime `v2.5.1-17-g39fe992d3`, leia-plugin `2593ee1`, avatar this branch
+rebased onto `v0.10.1`. 600x1051, cursor parked far, `IDLE_THROTTLE=0`,
+UNinstrumented, 12 s warmup + 20 s measure, **4 interleaved reps**, dev-build +
+panel-adapter gated on every run.
+
+What changed upstream, and why the arms are not yesterday's:
+- **`DXR_PRESENT_OPAQUE` is demoted** for overlay apps (runtime
+  `docs/architecture/transparency-modes.md` § *The default*, #906) — the bake
+  smears a window dragged behind us (rule 5, corrected upstream). So the
+  *recommendable* config must reach the target on the **live** path.
+- **The WGC capture throttle is upstream and default 66 ms** — no local plug-in
+  branch needed.
+- 🔴 **The #868 VK repaint is no longer dormant on this box.**
+  `VK_LAYER_DXR_queue_lock` (#902/#903) resolves here, so the runtime re-weaves
+  the last atlas at **panel rate (60 Hz)** even when the app deliberately
+  presents at 22. `DXR_WEAVE_REPAINT=0` was a null arm on 2026-08-10; it is now
+  a real lever.
+
+| arm | app | dwm | system | app CPU | system per-rep |
+|---|---|---|---|---|---|
+| `default` (no levers) | 22.38 | 7.44 | **32.20** | 30.4 | 30.2–32.4 |
+| `levers` (five, live) | 11.42 | 6.28 | **18.97** | 12.8 | 18.4–19.9 |
+| `levers` + `WEAVE_REPAINT=0` | 9.36 | 5.71 | **16.39** | 13.8 | 15.5–16.7 |
+| `levers` + `PRESENT_OPAQUE` | 11.35 | 0.61 | **13.26** | 15.6 | 12.4–15.2 |
+| **`levers` + `PRESENT_OPAQUE` + `WEAVE_REPAINT=0`** | **7.69** | 0.60 | **9.47** | 10.5 | 9.3–9.5 |
+| `REGION_ON_HOVER` only (full rate) | 21.33 | 6.69 | 29.39 | 26 | 28.6–29.9 |
+| `default` + `WEAVE_REPAINT=0` | 22.24 | 7.46 | 30.94 | 27.4 | 30.0–32.6 |
+| `levers` + `VK_BRIDGE_PACING=0` | 13.91 | 6.97 | 22.11 | 15.4 | 21.3–22.3 |
+
+"five levers" = `MINIMAL` + `KEEP_TEXT` + `FORCE_TRANSPARENT` + `PRESENT_HZ=22`
++ `REGION_ON_HOVER`, i.e. the old six **minus** `DXR_PRESENT_OPAQUE`.
+
+### 🔴 The repaint costs 2.6–3.8 system points against a rate-throttled app
+
+`levers` 18.97 → 16.39 with the repaint off (**−2.58 system, −2.06 app**), and
+on the baked config 13.26 → 9.47 (**−3.79 system, −3.66 app**). Per-rep ranges
+do **not** overlap in either pair.
+
+**But it is a NULL at full app rate**: `default` 30.20–32.38 vs
+`default-norepaint` 30.02–32.64 — fully overlapping. That is the mechanism,
+cleanly: the repaint only adds work when the app presents *slower* than the
+panel, which is exactly what `PRESENT_HZ` makes it do. Anything that caps app
+rate should also set `DXR_WEAVE_REPAINT=0`.
+
+(Not a contradiction of the runtime's own "39.7 % → 17.7 % GPU busy with the app
+idle-throttled" — that is `IDLE_THROTTLE`, a different mechanism, and these arms
+run with `IDLE_THROTTLE=0` to hold the playing state.)
+
+### ✅ ≤10 % is still reachable — but only baked
+
+`levers` + `PRESENT_OPAQUE` + `WEAVE_REPAINT=0` = **app 7.69 / dwm 0.60 /
+system 9.47**, per-rep 9.30–9.54. That *beats* the 2026-08-10 best (8.54 app /
+10.05 system) — not from new work, but by switching off a default that arrived
+since.
+
+### 🔴 On the live path the target is out of reach: +6.9 system points
+
+Best live (16.39) vs best baked (9.47) = **+6.92 system**. Split: **5.11 dwm +
+1.67 app** — so ~74 % dwm, ~24 % app, not "essentially all dwm" as the upstream
+doc's +4.90 figure has it (same family, but ours is larger and not purely dwm).
+⇒ **dynamic bake/live switching is now the only route to ≤10 % with a correct
+background.**
+
+### 🔴 `REGION_ON_HOVER` is a baked-only win — it barely moves live dwm
+
+`hover-only` 29.39 vs `default` 32.20 is only −2.81 system, and **dwm is
+unchanged** (6.69 vs 7.44). Under baked composition the same knob took dwm
+7.20 → 0.73. So the 2026-08-05 "free half" was almost entirely
+`DXR_PRESENT_OPAQUE`'s Independent Flip, **not** the region — and the separate
+"a region costs ~9.5 system points just by being on the window" result is
+**scoped to baked composition only**.
+
+### Bridge pacing (#912) is a win here, not free
+
+`levers` 18.97 vs `VK_BRIDGE_PACING=0` 22.11 — pacing on **saves 3.14 system /
+2.49 app** points, ranges non-overlapping. Upstream measured it free
+(39.7 % vs 39.3 % GPU busy) at full app rate; with a rate-throttled app on this
+box it pays. Leave the governor alone.
+
+## Reaching single digits (2026-08-05) — superseded on two points by the section above
 
 Measured on the Arc iGPU with `\GPU Engine(*)\Running Time` deltas, 12 s warmup +
 20 s measure, 5 interleaved reps per arm, cursor parked. Runtime `47e0a5ba2`
