@@ -327,6 +327,44 @@ unchanged** (6.69 vs 7.44). Under baked composition the same knob took dwm
 "a region costs ~9.5 system points just by being on the window" result is
 **scoped to baked composition only**.
 
+### 🔴 The bake only pays on a QUIET desktop — live is free once dwm is busy
+
+Both configs (five levers + `WEAVE_REPAINT=0`), 3 interleaved reps, priced in
+three desktop states. `SysNet` = system GPU minus the animator's own process, so
+the stand-in's cost cancels; its dwm contribution does not, so treat the
+`animated` **absolutes** as inflated and only its live-vs-baked **delta** as
+meaningful.
+
+| state | config | app | dwm | SysNet | per-rep |
+|---|---|---|---|---|---|
+| parked (nothing moving) | baked | 7.87 | **0.74** | **9.97** | 9.17–9.97 |
+| parked | live | 9.06 | **5.98** | **17.61** | 15.5–17.6 |
+| moving (cursor churn, far away) | baked | 9.25 | 6.29 | **17.04** | 16.68–17.04 |
+| moving | live | 9.13 | 6.83 | **17.39** | 16.64–17.39 |
+| animated (repainting window behind) | baked | 6.37 | 0.40 | 35.35 | 34.28–35.35 |
+| animated | live | 7.68 | 4.88 | 39.01 | 38.04–39.01 |
+
+**What the bake is worth, by state: parked 7.64 · moving 0.35 · animated 3.66
+system points.**
+
+**Mechanism: live's dwm penalty is not a constant — it exists only while dwm is
+otherwise idle.** Parked, transparency costs 5.24 dwm points (0.74 → 5.98).
+Under cursor churn it costs 0.54 (6.29 → 6.83) and the two configs' ranges
+**fully overlap** (16.68–17.04 vs 16.64–17.39) — i.e. once DWM is composing for
+the desktop anyway, our transparent present rides along for free.
+
+Three consequences for dynamic bake/live switching:
+- **The switch's entire value sits in the quiet state**, which is exactly where
+  the ≤10 % goal is defined. Good fit, not a coincidence.
+- **Going live during interaction is nearly free (0.35)**, so an over-eager
+  trigger costs almost nothing while the user is active. What matters is
+  returning to baked promptly once the desktop goes quiet again — that window
+  is worth 7.64.
+- **A mouse-motion trigger is the wrong signal, but for a correctness reason,
+  not a cost one.** It costs little either way; it simply *misses* the
+  `animated` case — a video or scroll behind us changes pixels without moving
+  the cursor, and that is the case where the bake is visibly wrong.
+
 ### Bridge pacing (#912) is a win here, not free
 
 `levers` 18.97 vs `VK_BRIDGE_PACING=0` 22.11 — pacing on **saves 3.14 system /
