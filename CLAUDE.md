@@ -214,11 +214,15 @@ app against the authoring rules with
 `python3 scripts/check_displayxr_app.py windows/` (from the runtime repo).
 
 ## Releasing
-Not yet wired as a `/dxr-release` component (no `avatar_demo` field in the
-runtime's `versions.json` yet — see PORTING.md). When wired, the pattern mirrors
-the sibling demos: tag `vX.Y.Z` → CI builds the installer, attaches it to the GH
-Release, and dispatches `versions-bump` to displayxr-runtime, which mirrors
-`versions.json` to `displayxr-installer`. Independent cadence from the runtime.
+Wired as a `/dxr-release` component — run **`/dxr-release avatar vX.Y.Z`** from
+the `displayxr-runtime` hub (not from here; the skill clones this repo itself).
+It pushes an empty `Release vX.Y.Z` marker to `main`, tags it, and watches CI,
+which builds the installers, attaches them to the GH Release, and dispatches
+`versions-bump` to displayxr-runtime — bumping the `avatar_demo` field and
+mirroring `versions.json` to `displayxr-installer`. The skill then signs the
+Windows installer on the signing runner and re-uploads it over the CI asset; the
+macOS `.pkg` stays unsigned (separate Apple track). Independent cadence from the
+runtime. Verified end to end on v0.10.2.
 
 ## Coding conventions
 - C++17/20, Vulkan 1.0+, Objective-C++ on macOS.
