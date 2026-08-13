@@ -672,6 +672,36 @@ bool ModelRenderer::createPipeline() {
     gpci.subpass = 0;
     VkResult pr = vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &gpci, nullptr, &pipeline_);
 
+    // A second, CLOCKWISE-winding twin of the same pipeline, for the plain view
+    // convention (issue #58).
+    //
+    // Vulkan decides front/back facing from the signed area in FRAMEBUFFER
+    // space, so the NEGATIVE-HEIGHT viewport that plainViewConvention_ selects
+    // reverses it: glTF's counter-clockwise front faces arrive clockwise, every
+    // visible fragment reports gl_FrontFacing == false, and pbr.frag's two-sided
+    // flip then inverts the normal on ALL of them. dot(N,V) goes negative
+    // everywhere, ndotv sits on its 1e-4 clamp, and every view-dependent term is
+    // evaluated as if seen at perfect grazing incidence — materials render as
+    // environment-coloured mirrors rather than as themselves. Diagnosed and
+    // measured in the parent demo (displayxr-demo-modelviewer#87).
+    //
+    // TWO pipelines rather than one corrected constant, because this renderer
+    // toggles the convention PER FRAME (windows/main.cpp binds it to zonesFrame),
+    // so the winding cannot be baked once. The alternatives were worse: dynamic
+    // front-face state needs Vulkan 1.3 or an extension this demo does not
+    // require, and passing the convention to the shader would mean growing the
+    // uniform block — which is precisely the layout-drift hazard that produced
+    // modelviewer#81.
+    //
+    // cullMode is NONE in both, so the winding affects gl_FrontFacing ONLY:
+    // nothing is culled either way, and genuine back faces still get their
+    // normal flipped, which is what the two-sided path is for.
+    if (pr == VK_SUCCESS) {
+        rs.frontFace = VK_FRONT_FACE_CLOCKWISE;
+        pr = vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &gpci, nullptr, &pipelineCW_);
+        rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;   // leave rs as we found it
+    }
+
     vkDestroyShaderModule(device_, vs, nullptr);
     vkDestroyShaderModule(device_, fs, nullptr);
     if (pr != VK_SUCCESS) {
@@ -2105,7 +2135,10 @@ void ModelRenderer::renderEye(VkImage swapchainImage,
         vkCmdDraw(cmd, 3, 1, 0, 0);
     }
 
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_);
+    // Winding must match the viewport sign chosen above, or every normal inverts
+    // (issue #58 — see createPipeline()).
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                      plainViewConvention_ ? pipelineCW_ : pipeline_);
     VkDeviceSize voff = 0;
     vkCmdBindVertexBuffers(cmd, 0, 1, &vertexBuffer_.buffer, &voff);
     vkCmdBindIndexBuffer(cmd, indexBuffer_.buffer, 0, VK_INDEX_TYPE_UINT32);
@@ -2415,6 +2448,7 @@ void ModelRenderer::cleanup() {
     }
     if (descriptorPool_ != VK_NULL_HANDLE) { vkDestroyDescriptorPool(device_, descriptorPool_, nullptr); descriptorPool_ = VK_NULL_HANDLE; }
     if (pipeline_ != VK_NULL_HANDLE) { vkDestroyPipeline(device_, pipeline_, nullptr); pipeline_ = VK_NULL_HANDLE; }
+    if (pipelineCW_ != VK_NULL_HANDLE) { vkDestroyPipeline(device_, pipelineCW_, nullptr); pipelineCW_ = VK_NULL_HANDLE; }
     if (skyboxPipeline_ != VK_NULL_HANDLE) { vkDestroyPipeline(device_, skyboxPipeline_, nullptr); skyboxPipeline_ = VK_NULL_HANDLE; }
     if (fadePipeline_ != VK_NULL_HANDLE) { vkDestroyPipeline(device_, fadePipeline_, nullptr); fadePipeline_ = VK_NULL_HANDLE; }
     if (fadePipelineLayout_ != VK_NULL_HANDLE) { vkDestroyPipelineLayout(device_, fadePipelineLayout_, nullptr); fadePipelineLayout_ = VK_NULL_HANDLE; }
