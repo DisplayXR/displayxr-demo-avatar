@@ -114,9 +114,15 @@ void main() {
     // NONE) using the rasterizer's winding, NOT dot(N,V). The view test wrongly
     // flips large flat *front* faces seen near edge-on, sending their normal to
     // the dark lower hemisphere of the IBL irradiance cube (the dark-torso
-    // artifact on low-poly skinned meshes like Fox). gl_FrontFacing stays
-    // geometric under the renderer's Y-flipped projection, so flip only true
-    // back-faces — visible front faces keep their authored outward normal.
+    // artifact on low-poly skinned meshes like Fox), so do NOT "simplify" this
+    // to a view test — that regression has already been paid for once.
+    //
+    // gl_FrontFacing is only geometric if the pipeline's winding matches the
+    // viewport's sign. It did not under the plain view convention, whose
+    // negative-height viewport reverses facing in framebuffer space — so this
+    // line inverted the normal on every VISIBLE fragment instead of on back
+    // faces. Fixed in the renderer by binding a clockwise-winding pipeline for
+    // that convention (issue #58); see ModelRenderer::createPipeline().
     if (!gl_FrontFacing) Ng = -Ng;
     vec3 N = perturbNormal(Ng, inUV);
 
