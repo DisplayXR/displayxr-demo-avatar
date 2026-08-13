@@ -110,13 +110,24 @@ void main() {
 
     vec3 V = normalize(ubo.cameraPos.xyz - inWorldPos);
     vec3 Ng = normalize(inNormal);
-    // Two-sided: flip the normal for genuinely back-facing triangles (cull is
-    // NONE) using the rasterizer's winding, NOT dot(N,V). The view test wrongly
-    // flips large flat *front* faces seen near edge-on, sending their normal to
-    // the dark lower hemisphere of the IBL irradiance cube (the dark-torso
-    // artifact on low-poly skinned meshes like Fox). gl_FrontFacing stays
-    // geometric under the renderer's Y-flipped projection, so flip only true
-    // back-faces — visible front faces keep their authored outward normal.
+    // Two-sided flip driven by the rasterizer's winding — and, DELIBERATELY,
+    // through a pipeline whose front-face constant does NOT account for the
+    // one orientation-reversing step each view convention contains (plain: the
+    // negative-height viewport; legacy: the world-Y view mirror). Every visible
+    // fragment therefore reports gl_FrontFacing == false and shades with the
+    // INVERTED normal: grazing-pinned Fresnel adds an environment sheen, the
+    // irradiance cube is sampled at -N (the warm ground hemisphere), and the
+    // key light wraps the silhouette. That view-dependent wrap-lit look IS the
+    // avatar's shipped, calibrated appearance.
+    //
+    // This is not an oversight. v0.10.2 (#58/#59) "corrected" the winding on
+    // the plain path and the result was rejected on hardware as washed out —
+    // geometrically correct shading regressed the product look, and no scalar
+    // re-tune of the light rig recovered it (measured: three calibrated
+    // attempts, v0.10.3 notes). Do NOT switch the pipeline to clockwise or
+    // "fix" this flip without re-authoring the entire light rig against the
+    // panel. The parent modelviewer demo keeps the geometrically correct path
+    // (modelviewer#87) — the two renderers diverge here BY DECISION.
     if (!gl_FrontFacing) Ng = -Ng;
     vec3 N = perturbNormal(Ng, inUV);
 

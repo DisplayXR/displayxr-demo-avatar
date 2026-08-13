@@ -632,6 +632,14 @@ bool ModelRenderer::createPipeline() {
     VkPipelineRasterizationStateCreateInfo rs = {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
     rs.polygonMode = VK_POLYGON_MODE_FILL;
     rs.cullMode = VK_CULL_MODE_NONE;       // two-sided shading handles back faces
+    // COUNTER_CLOCKWISE is geometrically "wrong" here ON PURPOSE — combined
+    // with the one orientation-reversing step in each view convention it makes
+    // gl_FrontFacing report false on visible front faces, and pbr.frag's
+    // two-sided flip then shades with the inverted normal. That wrap-lit
+    // rendering is the avatar's shipped look; the clockwise "fix" (#58/#59,
+    // v0.10.2) was reverted in v0.10.3 after hardware eyeball rejected it.
+    // See the block comment at the gl_FrontFacing flip in pbr.frag before
+    // touching this constant.
     rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
     rs.lineWidth = 1.0f;
 
