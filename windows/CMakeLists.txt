@@ -124,17 +124,29 @@ endif()
 # NOT bundled — they ship with the vendor plug-in installer and must not
 # appear in a vendor-neutral DisplayXR demo.
 
-# Copy the bundled default avatar (FBX + its flattened texture) next to the exe.
-# The FBX references its texture by a stale relative path; model_loader_fbx's
-# basename fallback resolves rgb.jpg from the model's own directory, so both
-# files must sit side-by-side next to the exe.
-set(AVATAR_DIR "${CMAKE_SOURCE_DIR}/assets/tiger")
+# Copy the bundled default avatar next to the exe.
+#
+# Texture handling differs per asset, so the sidecar copy is CONDITIONAL:
+#   assets/lenovo — texture is EMBEDDED in the FBX (model_loader_fbx tries the
+#                   embedded blob first, model_loader_fbx.cpp:70), so the .fbx is
+#                   self-contained and there is no sidecar to copy.
+#   assets/tiger  — the FBX references its texture by a stale authored path and
+#                   relies on the basename fallback, so rgb.jpg MUST sit beside
+#                   the model.
+# Copying an absent rgb.jpg unconditionally fails the build, hence the EXISTS
+# guard rather than a second unconditional COMMAND.
+set(AVATAR_DIR "${CMAKE_SOURCE_DIR}/assets/lenovo")
 if(EXISTS "${AVATAR_DIR}/avatar.fbx")
     add_custom_command(TARGET avatar_handle_vk_win POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different "${AVATAR_DIR}/avatar.fbx" "$<TARGET_FILE_DIR:avatar_handle_vk_win>/avatar.fbx"
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${AVATAR_DIR}/rgb.jpg"   "$<TARGET_FILE_DIR:avatar_handle_vk_win>/rgb.jpg"
-        COMMENT "Copying bundled avatar.fbx + texture next to exe"
+        COMMENT "Copying bundled avatar.fbx next to exe"
     )
+    if(EXISTS "${AVATAR_DIR}/rgb.jpg")
+        add_custom_command(TARGET avatar_handle_vk_win POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different "${AVATAR_DIR}/rgb.jpg" "$<TARGET_FILE_DIR:avatar_handle_vk_win>/rgb.jpg"
+            COMMENT "Copying bundled avatar texture next to exe"
+        )
+    endif()
 endif()
 
 # Copy the DisplayXR shell sidecar (.displayxr.json + icons) next to the exe

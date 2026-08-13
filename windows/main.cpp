@@ -441,6 +441,33 @@ static void ApplyAutoFitForLoadedScene_locked() {
         g_fitCenter[1] = center[1];
         g_fitCenter[2] = center[2];
         float vh = extent[1] * kAutoFitVerticalComfort;
+        // Fit the WIDTH too, not just the height. The window is portrait
+        // (600x1051, aspect 0.571) while a T-pose humanoid is nearly square
+        // (measured extent X/Y = 0.944 for the Lenovo asset vs 0.618 for the
+        // tiger), so a height-only fit put its arms ~65% outside the frustum and
+        // they clipped at the canvas edge.
+        //
+        // vHeight is the VIRTUAL DISPLAY height, so a LARGER value renders the
+        // model smaller; taking the max of the two constraints is therefore the
+        // one that crops nothing. Same comfort margin on both axes.
+        //
+        // Two reasons a little overflow can still survive, both deliberate:
+        //  - these are 5th–95th-PERCENTILE bounds, so the real fingertips sit
+        //    slightly outside extent[0]. Widening the percentile would regress
+        //    the splat assets the trim exists for, so it stays.
+        //  - the idle auto-orbit yaws the model, and the projected half-width at
+        //    intermediate yaws is bounded by hypot(extentX, extentZ) (2.02 here),
+        //    not extentX (1.79). Fitting that circumscribed radius instead would
+        //    guarantee no clipping at any yaw, but it also shrinks a compact
+        //    asset hard — the tiger would drop to ~62% instead of ~92% — so we
+        //    fit the dominant axis and accept a sliver mid-orbit.
+        const float winAspect = (g_windowHeight > 0)
+                                    ? (float)g_windowWidth / (float)g_windowHeight
+                                    : 1.0f;
+        if (winAspect > 1e-3f) {
+            const float vhForWidth = (extent[0] * kAutoFitVerticalComfort) / winAspect;
+            if (vhForWidth > vh) vh = vhForWidth;
+        }
         // Degenerate scene (all splats in a thin slice) — fall back to a
         // sensible vHeight rather than failing the fit. Mirrors macOS:1399.
         if (!(vh > 1e-3f)) vh = kFallbackVirtualDisplayHeightM;
@@ -451,9 +478,15 @@ static void ApplyAutoFitForLoadedScene_locked() {
         // macOS:1407 — the user can drag with LMB if a particular asset's
         // authored orientation is off.
         g_fitYaw = 0.0f;
-        LOG_INFO("Auto-fit: center=(%.3f, %.3f, %.3f) extent=(%.3f, %.3f, %.3f) vHeight=%.3f yaw=%.0fdeg",
+        // Log which axis won the fit: a surprise "width" on an asset you expected
+        // to be height-bound is the tell that its silhouette is wider than the
+        // window can show at all.
+        LOG_INFO("Auto-fit: center=(%.3f, %.3f, %.3f) extent=(%.3f, %.3f, %.3f) "
+                 "vHeight=%.3f (%s-bound, winAspect=%.3f) yaw=%.0fdeg",
                  center[0], center[1], center[2],
-                 extent[0], extent[1], extent[2], vh, g_fitYaw * 57.2957795f);
+                 extent[0], extent[1], extent[2], vh,
+                 (vh > extent[1] * kAutoFitVerticalComfort * 1.0001f) ? "width" : "height",
+                 winAspect, g_fitYaw * 57.2957795f);
     }
     g_fitValid.store(ok);
 
