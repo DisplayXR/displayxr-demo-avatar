@@ -441,11 +441,11 @@ static void ApplyAutoFitForLoadedScene_locked() {
         g_fitCenter[1] = center[1];
         g_fitCenter[2] = center[2];
         float vh = extent[1] * kAutoFitVerticalComfort;
-        // Fit the WIDTH too, not just the height. The window is portrait
-        // (600x1051, aspect 0.571) while a T-pose humanoid is nearly square
+        // Fit the WIDTH too, not just the height. The 3D zone is portrait
+        // (600x789, aspect 0.760) while a T-pose humanoid is nearly square
         // (measured extent X/Y = 0.944 for the Lenovo asset vs 0.618 for the
-        // tiger), so a height-only fit put its arms ~65% outside the frustum and
-        // they clipped at the canvas edge.
+        // tiger), so a height-only fit left its arms ~12% wider than the zone and
+        // they clipped at its edge.
         //
         // vHeight is the VIRTUAL DISPLAY height, so a LARGER value renders the
         // model smaller; taking the max of the two constraints is therefore the
@@ -458,14 +458,19 @@ static void ApplyAutoFitForLoadedScene_locked() {
         //  - the idle auto-orbit yaws the model, and the projected half-width at
         //    intermediate yaws is bounded by hypot(extentX, extentZ) (2.02 here),
         //    not extentX (1.79). Fitting that circumscribed radius instead would
-        //    guarantee no clipping at any yaw, but it also shrinks a compact
-        //    asset hard — the tiger would drop to ~62% instead of ~92% — so we
-        //    fit the dominant axis and accept a sliver mid-orbit.
-        const float winAspect = (g_windowHeight > 0)
-                                    ? (float)g_windowWidth / (float)g_windowHeight
-                                    : 1.0f;
-        if (winAspect > 1e-3f) {
-            const float vhForWidth = (extent[0] * kAutoFitVerticalComfort) / winAspect;
+        //    guarantee no clipping at any yaw, at the cost of a further ~11%
+        //    shrink, so we fit the dominant axis and accept a sliver mid-orbit.
+        // Fit against the 3D ZONE, not the whole client window. The model renders
+        // into the zone swapchain at full tile size and the zone rect IS the
+        // bottom (1 - TOAST_BAND_BOTTOM) of the window (see the zones path around
+        // line 3140) — the top band is the Local2D speech bubble and never holds
+        // model pixels. Using the window aspect here instead over-shrinks by
+        // exactly 1/(1 - TOAST_BAND_BOTTOM): 0.571 vs the true 0.760, which put
+        // the character at 60% of height-fit when 80% is correct.
+        const float zoneH = (float)g_windowHeight * (1.0f - TOAST_BAND_BOTTOM);
+        const float zoneAspect = (zoneH > 0.0f) ? (float)g_windowWidth / zoneH : 1.0f;
+        if (zoneAspect > 1e-3f) {
+            const float vhForWidth = (extent[0] * kAutoFitVerticalComfort) / zoneAspect;
             if (vhForWidth > vh) vh = vhForWidth;
         }
         // Degenerate scene (all splats in a thin slice) — fall back to a
@@ -482,11 +487,11 @@ static void ApplyAutoFitForLoadedScene_locked() {
         // to be height-bound is the tell that its silhouette is wider than the
         // window can show at all.
         LOG_INFO("Auto-fit: center=(%.3f, %.3f, %.3f) extent=(%.3f, %.3f, %.3f) "
-                 "vHeight=%.3f (%s-bound, winAspect=%.3f) yaw=%.0fdeg",
+                 "vHeight=%.3f (%s-bound, zoneAspect=%.3f) yaw=%.0fdeg",
                  center[0], center[1], center[2],
                  extent[0], extent[1], extent[2], vh,
                  (vh > extent[1] * kAutoFitVerticalComfort * 1.0001f) ? "width" : "height",
-                 winAspect, g_fitYaw * 57.2957795f);
+                 zoneAspect, g_fitYaw * 57.2957795f);
     }
     g_fitValid.store(ok);
 
