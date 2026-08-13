@@ -255,9 +255,6 @@ private:
     VkDescriptorSetLayout dsLayout_ = VK_NULL_HANDLE;
     VkPipelineLayout pipelineLayout_ = VK_NULL_HANDLE;
     VkPipeline pipeline_ = VK_NULL_HANDLE;
-    // Same pipeline with CLOCKWISE winding, bound when plainViewConvention_ is on
-    // — its negative-height viewport reverses facing. See createPipeline() (#58).
-    VkPipeline pipelineCW_ = VK_NULL_HANDLE;
     VkPipeline skyboxPipeline_ = VK_NULL_HANDLE;   // analytic-sky background (opaque mode)
     // Edge-fade post-pass (ADR-027 rule 4): multiplicative dst *= f over the
     // last draw of the render pass. Own layout (push constants only, no sets).
