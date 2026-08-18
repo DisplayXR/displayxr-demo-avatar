@@ -91,7 +91,28 @@ jobs:
         # under $VULKAN_SDK\Bin.
         uses: humbletim/install-vulkan-sdk@v1.2
         with:
-          version: 1.3.283.0
+          # PIN WILL ROT. LunarG serves only the ~16 newest SDK releases and
+          # deletes the installers for older ones. 1.3.283.0 started returning a
+          # hard 404 on 2026-08-17 and broke this workflow with
+          # "curl failed with error code: 22"; re-running cannot help.
+          # See DisplayXR/displayxr-runtime#1029.
+          #
+          # Do NOT "fix" this with `version: latest`. From SDK 1.4.313.0 onward
+          # LunarG repackaged the Windows installer, and this action's naive
+          # `7z x vulkan_sdk.exe` then yields only Bin/ - no Include/, no Lib/.
+          # The action still reports GREEN (it only runs glslangValidator
+          # --version), and the build fails later at find_package(Vulkan) /
+          # Vulkan::Vulkan. 1.4.309.0 is the NEWEST version that still unpacks a
+          # complete SDK (verified by download + 7z).
+          #
+          # When this 404s, pick a newer version from
+          #   https://vulkan.lunarg.com/sdk/versions/windows.json
+          # and verify BOTH that it downloads AND that it unpacks Include/+Lib/:
+          #   curl -I https://sdk.lunarg.com/sdk/download/<ver>/windows/vulkan_sdk.exe
+          # Better: drop the LunarG SDK for vcpkg, as displayxr-runtime already
+          # has (vulkan-headers + vulkan-loader + glslang[tools]) - immutable
+          # pins, cannot rot. Tracked in displayxr-runtime#1029.
+          version: 1.4.309.0
           cache: true
 
       - if: needs.DetectChanges.outputs.docs_only != 'true'
