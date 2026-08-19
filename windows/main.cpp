@@ -2275,6 +2275,42 @@ static void RenderThreadFunc(
             s_lastFrameMs = nowMs;
         }
 
+        // ── DXR_AVATAR_MAX_HZ: unconditional frame ceiling ──────────────────
+        // Deliberately NOT part of the idle throttle above. That one lifts the
+        // moment the head moves, which is right for power and wrong for a
+        // measurement arm: any run with head motion in it would silently return
+        // to full rate mid-sample. This ceiling never lifts, tracked or not,
+        // moving or not.
+        // Same Sleep+continue shape as the idle gate so a capped frame is one
+        // the app never begins — no half-submitted frames reach the harness —
+        // and events keep pumping while capped. steady_clock (QPC-backed), not
+        // GetTickCount64, because the ~15 ms tick granularity cannot express a
+        // 60 Hz ceiling; the cube_handle_* caps pace the same way, which is
+        // what makes avatar-vs-cube numbers comparable.
+        static const int s_maxHz = [] {
+            int v = 0;
+            if (const char* e = std::getenv("DXR_AVATAR_MAX_HZ")) v = std::atoi(e);
+            if (v < 0) v = 0;
+            if (v > 240) v = 240;
+            if (v > 0) std::printf("DXR_AVATAR_MAX_HZ: %d Hz ceiling (unconditional)\n", v);
+            else       std::printf("DXR_AVATAR_MAX_HZ: off\n");
+            std::fflush(stdout);
+            return v;
+        }();
+        if (s_maxHz > 0) {
+            static auto s_capNext = std::chrono::steady_clock::now();
+            const auto capNow = std::chrono::steady_clock::now();
+            if (capNow < s_capNext) {
+                Sleep(1);
+                continue;
+            }
+            const std::chrono::nanoseconds capInterval(1000000000LL / s_maxHz);
+            // Resync rather than burst if we fell behind, so a hitch cannot
+            // produce a fake above-cap spike in the measured app cadence.
+            s_capNext = (s_capNext + capInterval > capNow) ? s_capNext + capInterval
+                                                          : capNow + capInterval;
+        }
+
         // ── #837 frame-stage timing (DXR_AVATAR_STAGE_TIMING=1) ─────────────
         // App-side split of the frame loop: wait (xrWaitFrame+xrBeginFrame),
         // render (locates + eye renders), sil (silhouette pass), layers
