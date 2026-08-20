@@ -4,13 +4,19 @@
     SPDX-License-Identifier: Apache-2.0
 
     Android leg of displayxr-demo-avatar. A vendor-neutral OpenXR client:
-    no CNSDK, no SR SDK — it binds to whatever DisplayXR runtime is installed
-    via the Khronos OpenXR loader broker. Per ADR-025 the runtime + vendor DP
-    run OUT-OF-PROCESS; the <queries> block lets the loader discover + bind it.
+    no CNSDK classes, no vendor .so — it binds to whatever DisplayXR runtime is
+    installed via the Khronos OpenXR loader broker.
 
-    Transparency (#568): the Activity uses Theme.Avatar.Transparent so its
-    window is translucent and the live home screen shows through (the runtime
-    renders the weaved avatar into its translucent overlay surface on top).
+    ARCHITECTURE A (in-process, ADR-036 D2, runtime#1063): this app owns its
+    own window and hands it to the runtime via XR_DXR_android_surface_binding;
+    the runtime's native Vulkan compositor + the vendor display processor run
+    IN THIS PROCESS and weave straight into our Surface. There is no
+    runtime-spawned SurfaceView and no service overlay.
+
+    Transparency: Theme.Avatar.Transparent + a TRANSLUCENT surface format make
+    OUR OWN window translucent, and the session opts in formally with
+    transparentBackgroundEnabled (#1082). The live launcher shows through around
+    the tiger — with no alpha clamp, which the old service-overlay path imposed.
 -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
@@ -33,35 +39,47 @@
         <intent>
             <action android:name="org.freedesktop.monado.ipc.CONNECT" />
         </intent>
+
+        <!--
+            ARCHITECTURE A (in-process, ADR-036 D2) requirement — runtime#1079.
+            In-process the vendor display processor runs in THIS process, and its
+            core loader calls PackageManager.getPackageInfo() on the on-device
+            vendor services to bind them for display config + face tracking.
+            Package visibility is enforced per CALLING UID, so declaring them in
+            the runtime APK is not enough: without these two lines the loader
+            gets a NameNotFoundException it never clears and the next JNI call
+            trips CheckJNI, aborting the app inside xrCreateSession.
+
+            This is the LAST vendor-specific thing in a DisplayXR client APK —
+            this APK still carries zero com.leia.* classes and zero vendor .so.
+            They go away entirely once the vendor services advertise a neutral
+            intent action (ADR-036 D5, org.displayxr.action.VENDOR_DISPLAY_SERVICE):
+            an <intent> query on that action grants the same visibility with no
+            vendor package name in any client manifest.
+        -->
+        <package android:name="com.leialoft.display.config" />
+        <package android:name="com.leia.headtrackingservice" />
     </queries>
 
     <uses-feature
         android:glEsVersion="0x00030002"
         android:required="false" />
 
+    <!--
+        Architecture A: the vendor face tracker runs IN THIS PROCESS (it used to
+        live in the out-of-process runtime service), so the front-camera grant is
+        ours to hold. Without it the camera open silently fails, CNSDK never
+        reports a face, and every xrLocateViews falls back to the nominal viewer
+        — head tracking is simply absent, with no error. required="false" so the
+        same APK still installs on hardware with no front camera.
+    -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
+    <uses-feature android:name="android.hardware.camera.front" android:required="false" />
+
     <!-- Long XR sessions generate no input events; without WAKE_LOCK the screen
-         dims and the session pauses. The OOP runtime owns eye tracking/camera. -->
+         dims and the session pauses. -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
-
-    <!-- #558 overlay mode: a keep-alive foreground service holds the process
-         foreground (off the freezer) while the Activity steps to the background,
-         so the render loop keeps weaving the tiger into the runtime's overlay
-         over the live launcher. specialUse: it's a process-keep-alive for an
-         OpenXR client, not one of the predefined FGS categories. -->
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
-
-    <!-- #558 overlay mode: ZTE/MyOS's CpuFreezerManagerServiceV2 freezes a
-         backgrounded process even with a foreground service, suspending the
-         render + head-tracking loop. The battery-optimization (doze) allowlist
-         lifts that freeze; MainActivity requests it on entering overlay mode. -->
-    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
-
-    <!-- #13 tiger touch-control: OverlayKeepAliveService hosts a small
-         TYPE_APPLICATION_OVERLAY input window over the tiger's bbox (the runtime's
-         visual overlay is FLAG_NOT_TOUCHABLE, so the tiger itself gets no touch).
-         MainActivity requests the grant on entering overlay mode. -->
-    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
 
     <application
         android:allowBackup="false"
@@ -69,20 +87,31 @@
         android:roundIcon="@mipmap/ic_launcher_round"
         android:label="DisplayXR Avatar">
 
-        <!-- #558 per-app overlay mode: this app weaves a see-through avatar over the
-             live desktop, so the DisplayXR runtime gives it a service overlay (and
-             this app backgrounds itself) instead of an opaque own-window. The runtime
-             reads this flag (application-level metadata) from the connecting client;
-             normal apps omit it and render in their own window — no global toggle. -->
-        <meta-data
-            android:name="com.displayxr.overlay_mode"
-            android:value="true" />
+        <!--
+            ADR-036 D6 / runtime#1033: the app samples this window's on-screen
+            origin (View.getLocationOnScreen) every frame and feeds it to the
+            runtime so the weave's interlace phase is anchored where the window
+            physically sits on the panel. An OEM that applies the
+            OVERRIDE_SANDBOX_VIEW_BOUNDS_APIS compat change makes that call
+            return WINDOW-relative coordinates — every window would report (0,0)
+            and weave at the same (wrong) phase, with no error anywhere. Opting
+            out is per-APP, so it has to live here.
+        -->
+        <property
+            android:name="android.window.PROPERTY_COMPAT_ALLOW_SANDBOXING_VIEW_BOUNDS_APIS"
+            android:value="false" />
 
+        <!--
+            configChanges keeps the NativeActivity (and its Surface) alive across
+            rotation + freeform resize instead of recreating it; resizeableActivity
+            is what lets the task enter a freeform container at all.
+        -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
             android:theme="@style/Theme.Avatar.Transparent"
-            android:configChanges="orientation|keyboardHidden|screenSize"
+            android:configChanges="orientation|keyboardHidden|screenSize|screenLayout|smallestScreenSize|density|uiMode|navigation|keyboard|layoutDirection"
+            android:resizeableActivity="true"
             android:launchMode="singleTask">
             <meta-data
                 android:name="android.app.lib_name"
@@ -94,14 +123,5 @@
             </intent-filter>
         </activity>
 
-        <!-- #558 overlay mode keep-alive (see OverlayKeepAliveService.kt). -->
-        <service
-            android:name=".OverlayKeepAliveService"
-            android:exported="false"
-            android:foregroundServiceType="specialUse">
-            <property
-                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
-                android:value="displayxr_avatar_overlay_keepalive" />
-        </service>
     </application>
 </manifest>
