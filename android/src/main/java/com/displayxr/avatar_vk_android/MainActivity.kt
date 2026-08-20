@@ -1,22 +1,28 @@
 // Copyright 2026, The DisplayXR Project and its contributors
 // SPDX-License-Identifier: Apache-2.0
 //
-// Thin NativeActivity wrapper for the avatar demo. Three jobs:
-//   1. Push the authoritative 4-way display rotation to native on launch and on
+// Thin NativeActivity wrapper for the avatar demo. Architecture A (in-process,
+// ADR-036 D2 / runtime#1063): this app owns the window the runtime weaves into.
+// Four jobs:
+//   1. Make our OWN window translucent — window.setFormat(PixelFormat.TRANSLUCENT)
+//      on top of Theme.Avatar.Transparent. A NativeActivity's Surface otherwise
+//      comes up opaque RGBX and SurfaceFlinger discards our alpha whatever the
+//      theme says, so this one line is what makes the launcher show through.
+//   2. Publish this window's on-screen rect to native every frame (Choreographer)
+//      so the runtime can anchor the weave phase + the per-window Kooima canvas
+//      where the window physically sits on the panel (ADR-036 D6).
+//   3. Push the authoritative 4-way display rotation to native on launch and on
 //      every rotation (incl. 180° flips, via a DisplayListener) — the renderer
 //      can't derive true rotation from its own surface, and
 //      Configuration.orientation only distinguishes portrait/landscape.
-//   2. Forward touch from the runtime's MonadoView overlay (which covers our
-//      window and is the only view that receives touch) to native via
-//      dispatchTouchEvent (runtime#499) — a NativeActivity's native input queue
-//      is NOT fed by dispatchTouchEvent. One finger = camera controls (depth
-//      dolly + lateral strafe), two fingers = pinch-zoom, double-tap = recenter.
-//   3. Wake the DisplayXR runtime out of Android's "stopped" state before
-//      xrCreateInstance and, if it can't be reached, prompt the user.
+//   4. Forward touch to native via dispatchTouchEvent — a NativeActivity's
+//      native input queue is NOT fed by dispatchTouchEvent. One finger = camera
+//      controls (depth dolly + lateral strafe), two fingers = pinch-zoom,
+//      double-tap = recenter. Plus: wake the DisplayXR runtime out of Android's
+//      "stopped" state before xrCreateInstance, and prompt if unreachable.
 //
-// Vendor-neutral + out-of-process (ADR-025): no CNSDK, no CAMERA — the OOP
-// runtime service owns eye tracking. Binds to whichever runtime flavor is
-// installed (out_of_process preferred, in_process dev fallback).
+// Vendor-neutral: this APK carries zero CNSDK classes and zero vendor .so. It
+// does hold CAMERA, because in-process the vendor face tracker runs here.
 
 package com.displayxr.avatar_vk_android
 
@@ -25,10 +31,13 @@ import android.app.NativeActivity
 import android.content.Context
 import android.content.Intent
 import android.content.res.Configuration
+import android.graphics.PixelFormat
+import android.graphics.Point
 import android.hardware.display.DisplayManager
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.view.Choreographer
 import android.view.GestureDetector
 import android.view.MotionEvent
 import android.widget.Toast
@@ -60,17 +69,16 @@ class MainActivity : NativeActivity() {
     // True once the OpenXR instance is up (runtime reached).
     private external fun nativeXrReady(): Boolean
 
-    // True when debug.dxr.overlay=1: the runtime weaves the tiger into a
-    // service-owned overlay over the live launcher, so this Activity should step
-    // to the background (keep-alive foreground service keeps the render loop off
-    // the freezer) instead of sitting on top and pausing the launcher.
-    private external fun nativeOverlayMode(): Boolean
-
-    private var overlayEntered = false
+    // ADR-036 D6 / runtime#1033: this window's on-screen rect (origin + size),
+    // the raw panel extent, and the display id. The runtime needs all of it to
+    // anchor the weave phase and the per-window Kooima canvas.
+    private external fun nativeSetWindowRect(
+        x: Int, y: Int, w: Int, h: Int, panelW: Int, panelH: Int, displayId: Int,
+    )
 
     // Touch bridge: one finger = camera controls (depth dolly + lateral strafe),
-    // two-finger pinch = zoom (all handled native-side). The MonadoView overlay
-    // forwards events here.
+    // two-finger pinch = zoom (all handled native-side). We own the window now,
+    // so touch lands here directly.
     private external fun nativeOnTouch(
         action: Int, count: Int, x0: Float, y0: Float, x1: Float, y1: Float,
     )
@@ -133,10 +141,7 @@ class MainActivity : NativeActivity() {
                         return
                     }
                     val ready = try { nativeXrReady() } catch (_: Throwable) { false }
-                    if (ready) {
-                        maybeEnterOverlay()
-                        return
-                    }
+                    if (ready) return
                     if (tries++ < 15) handler.postDelayed(this, 1000)
                 }
             },
@@ -144,105 +149,20 @@ class MainActivity : NativeActivity() {
         )
     }
 
-    // #558 overlay mode: once the session is up, start a keep-alive foreground
-    // service (exempts the process from the freezer) and step to the background
-    // so the launcher resumes + stays interactive while the runtime weaves the
-    // tiger into its service overlay on top. One-shot.
-    private fun maybeEnterOverlay() {
-        if (overlayEntered) return
-        // #558 per-app: this app declares com.displayxr.overlay_mode=true in its
-        // manifest (the same flag the runtime reads to give us a service overlay),
-        // so background ourselves based on that. nativeOverlayMode() (debug.dxr.overlay)
-        // stays as a dev force override.
-        val overlay = isOverlayApp() || try { nativeOverlayMode() } catch (_: Throwable) { false }
-        if (!overlay) return
-        overlayEntered = true
-        // ZTE/MyOS aggressively FREEZES backgrounded processes
-        // (CpuFreezerManagerServiceV2) even with a foreground service — which
-        // suspends our render + eye-tracking loop, so the tiger stops following
-        // the viewer. The battery-optimization (doze) allowlist exempts us from
-        // the freeze; request it once on entering overlay mode.
-        requestPermissionsOnce()
+    // In-process (Architecture A) the vendor face tracker opens the front camera
+    // in THIS process, so the CAMERA grant is ours to request. Without it the
+    // camera open fails silently and every xrLocateViews falls back to the
+    // nominal viewer — the tiger simply stops following you, with no error.
+    private fun requestCameraOnce() {
         try {
-            OverlayKeepAliveService.start(this)
-        } catch (t: Throwable) {
-            android.util.Log.e("avatar", "keep-alive service start failed", t)
-        }
-        // Brief beat so the runtime's overlay surface is live before we vacate the
-        // foreground; the native render loop keeps drawing with no window.
-        Handler(Looper.getMainLooper()).postDelayed({
-            if (!isFinishing) {
-                android.util.Log.i("avatar", "overlay mode: moveTaskToBack — launcher resumes")
-                moveTaskToBack(true)
+            if (checkSelfPermission(android.Manifest.permission.CAMERA) ==
+                android.content.pm.PackageManager.PERMISSION_GRANTED
+            ) {
+                return
             }
-        }, 600)
-    }
-
-    // #558 per-app: true if this app declares com.displayxr.overlay_mode=true in its
-    // manifest — the single source of truth shared with the runtime's per-client
-    // overlay decision. No global sysprop needed.
-    private fun isOverlayApp(): Boolean {
-        return try {
-            val ai =
-                packageManager.getApplicationInfo(
-                    packageName,
-                    android.content.pm.PackageManager.GET_META_DATA,
-                )
-            ai.metaData?.getBoolean("com.displayxr.overlay_mode", false) ?: false
-        } catch (_: Throwable) {
-            false
-        }
-    }
-
-    // Request the two overlay-mode permissions (battery-optimization exemption +
-    // draw-over-other-apps) AT MOST ONCE, ever — persisted in SharedPreferences.
-    // Re-prompting every launch was both annoying and actively harmful: the system
-    // dialog pops up under our touchable input overlay, which ate the "Allow" tap.
-    // Asking once means a granted user is never bothered again; a user who declined
-    // can still enable both in Settings. If already granted, the inner checks no-op.
-    private fun requestPermissionsOnce() {
-        val prefs = getSharedPreferences("avatar_overlay", Context.MODE_PRIVATE)
-        if (prefs.getBoolean("perms_requested", false)) return
-        prefs.edit().putBoolean("perms_requested", true).apply()
-        requestBatteryExemption()
-        requestDrawOverlays()
-    }
-
-    // Ask the system to exempt us from battery optimization / doze (the allowlist
-    // that also lifts ZTE's CpuFreezerManagerServiceV2 background freeze). One-shot
-    // system prompt; no-op if already exempt. Without this the overlay tiger keeps
-    // weaving but stops head-tracking once the OS freezes us a minute in.
-    private fun requestBatteryExemption() {
-        try {
-            val pm = getSystemService(Context.POWER_SERVICE) as android.os.PowerManager
-            if (pm.isIgnoringBatteryOptimizations(packageName)) return
-            startActivity(
-                Intent(
-                    android.provider.Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
-                    android.net.Uri.parse("package:$packageName"),
-                ),
-            )
+            requestPermissions(arrayOf(android.Manifest.permission.CAMERA), 1)
         } catch (t: Throwable) {
-            android.util.Log.w("avatar", "battery-optimization exemption request failed", t)
-        }
-    }
-
-    // #13 tiger touch-control: the keep-alive service hosts a TYPE_APPLICATION_OVERLAY
-    // input window over the tiger, which needs the draw-overlays grant. Ask for it
-    // once on entering overlay mode (no-op if already granted; the test recipe also
-    // pre-grants via `appops set <pkg> SYSTEM_ALERT_WINDOW allow`). Without it the
-    // service just skips the input window — the visual overlay still works.
-    private fun requestDrawOverlays() {
-        try {
-            if (android.provider.Settings.canDrawOverlays(this)) return
-            startActivity(
-                Intent(
-                    android.provider.Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-                    android.net.Uri.parse("package:$packageName"),
-                ),
-            )
-        } catch (t: Throwable) {
-            android.util.Log.w("avatar", "draw-overlays permission request failed", t)
+            android.util.Log.w("avatar", "camera permission request failed", t)
         }
     }
 
@@ -264,6 +184,56 @@ class MainActivity : NativeActivity() {
                 .setNegativeButton("Close") { _, _ -> finish() }
                 .show()
         } catch (_: Throwable) {
+        }
+    }
+
+    // ---------------------------------------------------------------- window rect
+    //
+    // Choreographer rather than a layout / position listener, because a pure
+    // window MOVE produces neither: WindowFrames.didFrameSizeChange compares w/h
+    // only, so the move goes out as a `oneway IWindow.moved` that updates
+    // mAttachInfo.mWindowLeft/Top and nothing else — no layout, no invalidate, no
+    // callback. Meanwhile SurfaceFlinger has already repositioned the layer with
+    // the OLD buffer, so an un-updated weave keeps a stale interlace phase for the
+    // whole drag and the per-window Kooima frustum stays anchored to the old
+    // position. Cost is one getLocationOnScreen per frame plus seven int compares;
+    // the native push only happens on an actual change.
+    //
+    // TRAP: an OEM applying OVERRIDE_SANDBOX_VIEW_BOUNDS_APIS makes
+    // getLocationOnScreen return WINDOW-relative coords — every window would report
+    // (0,0), silently. The opt-out is the
+    // PROPERTY_COMPAT_ALLOW_SANDBOXING_VIEW_BOUNDS_APIS property in our manifest.
+    private val locationOnScreen = IntArray(2)
+    private var lastRect = intArrayOf(Int.MIN_VALUE, Int.MIN_VALUE, -1, -1, -1, -1, -1)
+    private var rectPollRunning = false
+
+    private val rectCallback = object : Choreographer.FrameCallback {
+        override fun doFrame(frameTimeNanos: Long) {
+            if (!rectPollRunning) return
+            sampleWindowRect()
+            Choreographer.getInstance().postFrameCallback(this)
+        }
+    }
+
+    private fun sampleWindowRect() {
+        val view = window?.decorView ?: return
+        val w = view.width
+        val h = view.height
+        if (w <= 0 || h <= 0) return // not laid out yet
+        view.getLocationOnScreen(locationOnScreen)
+        val display = view.display ?: return
+        val real = Point()
+        @Suppress("DEPRECATION")
+        display.getRealSize(real) // the raw panel extent, not the app bounds
+        val next = intArrayOf(
+            locationOnScreen[0], locationOnScreen[1], w, h, real.x, real.y, display.displayId,
+        )
+        if (next.contentEquals(lastRect)) return
+        lastRect = next
+        try {
+            nativeSetWindowRect(next[0], next[1], next[2], next[3], next[4], next[5], next[6])
+        } catch (_: Throwable) {
+            // Native lib not bound yet — the next frame retries.
         }
     }
 
@@ -304,6 +274,13 @@ class MainActivity : NativeActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         wakeRuntime()
         super.onCreate(savedInstanceState)
+        // Architecture A: OUR window is the one the runtime weaves into, so it is
+        // the one that has to carry alpha. Theme.Avatar.Transparent alone is not
+        // enough — a NativeActivity's Surface comes up in an opaque format and
+        // SurfaceFlinger then ignores the alpha the compositor writes. Setting
+        // TRANSLUCENT here is what actually lets the launcher show through.
+        window.setFormat(PixelFormat.TRANSLUCENT)
+        requestCameraOnce()
         pushRotation()
         (getSystemService(Context.DISPLAY_SERVICE) as DisplayManager)
             .registerDisplayListener(displayListener, null)
@@ -312,7 +289,7 @@ class MainActivity : NativeActivity() {
     }
 
     // Brief on-screen legend of the touch controls (gesture-driven, no on-screen
-    // buttons). A Toast sits above the weave overlay, so no Vulkan HUD needed.
+    // buttons). A Toast sits above our window, so no Vulkan HUD needed.
     private fun showControlsHint() {
         Handler(Looper.getMainLooper()).postDelayed({
             if (!isFinishing) {
@@ -333,16 +310,27 @@ class MainActivity : NativeActivity() {
     override fun onResume() {
         super.onResume()
         pushRotation()
+        if (!rectPollRunning) {
+            // Forget the last sample so the first frame after a resume always
+            // re-pushes: the surface was destroyed and rebuilt underneath us and
+            // the runtime has to be told the rect again, even when it is
+            // byte-identical to the one before we went away.
+            lastRect = intArrayOf(Int.MIN_VALUE, Int.MIN_VALUE, -1, -1, -1, -1, -1)
+            rectPollRunning = true
+            Choreographer.getInstance().postFrameCallback(rectCallback)
+        }
+    }
+
+    override fun onPause() {
+        rectPollRunning = false
+        Choreographer.getInstance().removeFrameCallback(rectCallback)
+        super.onPause()
     }
 
     override fun onDestroy() {
         try {
             (getSystemService(Context.DISPLAY_SERVICE) as DisplayManager)
                 .unregisterDisplayListener(displayListener)
-        } catch (_: Throwable) {
-        }
-        try {
-            OverlayKeepAliveService.stop(this)
         } catch (_: Throwable) {
         }
         super.onDestroy()

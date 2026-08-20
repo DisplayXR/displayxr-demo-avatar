@@ -3,20 +3,34 @@
     Copyright 2026, The DisplayXR Project and its contributors
     SPDX-License-Identifier: Apache-2.0
 
-    Transparency (#568): the avatar Activity hosts the OpenXR session + the
-    runtime's MonadoView overlay (which the OOP service renders the weaved
-    avatar into). The Activity itself renders nothing, so its window is made
-    fully translucent — this is the Android analog of the Windows
-    WS_EX_NOREDIRECTIONBITMAP + null brush. Combined with the runtime's
-    translucent overlay surface, the live home screen shows through everything
-    around the avatar.
+    Architecture A (in-process, runtime#1063): the avatar owns the window the
+    runtime weaves into, so THIS window is the one that has to be translucent —
+    there is no runtime-owned overlay surface behind it any more. Three things
+    have to line up or the result is an opaque black box:
+
+      1. windowIsTranslucent      — tells WindowManager not to occlude what is
+                                    behind us, so the launcher keeps drawing.
+      2. windowBackground=@null   — no opaque backdrop painted under the Surface
+                                    (transparent would also work; @null skips the
+                                    draw entirely, which is what we want since the
+                                    NativeActivity's Surface covers the window).
+      3. a TRANSLUCENT pixel format on the Surface itself — set in code
+         (MainActivity.onCreate → window.setFormat(PixelFormat.TRANSLUCENT)),
+         because a NativeActivity's surface otherwise comes up opaque RGBX and
+         SurfaceFlinger ignores our alpha no matter what the theme says.
+
+    This is the Android analog of the Windows WS_EX_NOREDIRECTIONBITMAP + null
+    brush the desktop build uses.
 -->
 <resources>
     <style name="Theme.Avatar.Transparent" parent="@android:style/Theme.NoTitleBar.Fullscreen">
-        <item name="android:windowBackground">@android:color/transparent</item>
+        <item name="android:windowBackground">@null</item>
         <item name="android:windowIsTranslucent">true</item>
         <item name="android:windowShowWallpaper">false</item>
         <item name="android:colorBackgroundCacheHint">@null</item>
         <item name="android:windowContentOverlay">@null</item>
+        <!-- Keep the window from being treated as an opaque fullscreen layer,
+             which is what lets SurfaceFlinger composite the launcher under us. -->
+        <item name="android:windowDisablePreview">true</item>
     </style>
 </resources>

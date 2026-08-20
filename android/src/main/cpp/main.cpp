@@ -22,6 +22,18 @@
 #include <openxr/XR_DXR_display_info.h>  // display rendering-mode enumerate/request
 #include <openxr/XR_DXR_view_rig.h>      // runtime-owned Kooima views (#396 W7)
 #include <openxr/XR_DXR_display_zones.h> // bottom-75% tiger zone framing (ADR-027, #568)
+
+// XR_DXR_android_surface_binding (#1063, ADR-036 D2/D6). Architecture A: this
+// app owns its OWN Surface and hands it to the runtime at xrCreateSession, so
+// the runtime never spawns a SurfaceView of its own and never needs a
+// SYSTEM_ALERT_WINDOW service overlay. transparentBackgroundEnabled makes the
+// runtime's swapchain + the DP alpha-gate treat our window as translucent, so
+// the live launcher shows through around the tiger -- with no 0.80 alpha clamp
+// (that clamp was a property of the OOP overlay path, #1082).
+#if __has_include(<openxr/XR_DXR_android_surface_binding.h>)
+#define AVATAR_HAVE_ANDROID_SURFACE_BINDING 1
+#include <openxr/XR_DXR_android_surface_binding.h>
+#endif
 // XrCompositionLayerWindowSpaceDXR — the shared window-space layer struct is
 // declared (ifndef-guarded) in the window-binding headers; the cocoa one is
 // plain C with no platform deps, so it serves as the decl source on Android.
@@ -104,15 +116,6 @@ XrSessionState g_session_state = XR_SESSION_STATE_UNKNOWN;
 bool g_session_running = false;
 bool g_exit_requested = false;
 XrSpace g_app_space = XR_NULL_HANDLE;
-
-// Overlay mode (#558): the runtime weaves the tiger into a service-owned
-// TYPE_APPLICATION_OVERLAY above the LIVE launcher. The avatar then relinquishes
-// the foreground (MainActivity.moveTaskToBack) so the launcher resumes + stays
-// interactive, and a keep-alive foreground service keeps this process off the
-// Android freezer. In that state the NativeActivity has no window, but in OOP we
-// render to the IPC swapchain (not our own window) — so keep rendering anyway.
-// Gated on `setprop debug.dxr.overlay 1`. Read once at android_main start.
-bool g_overlay_mode = false;
 
 // ── Display rendering-mode switching (XR_DXR_display_info) ─────────────────
 // The runtime advertises a set of display rendering modes (e.g. 3D-stereo,
@@ -207,24 +210,6 @@ sil_hit(float cx, float cy)
 	return false;
 }
 
-// #13 tiger touch-control: the tiger's current bounding box in CANVAS px (the
-// frame the service input overlay window is sized/positioned to). Returns false
-// until a non-empty silhouette is published, so the window stays collapsed during
-// warmup (captures nothing) instead of eating a default-sized rect of launcher
-// touches. Called from OverlayKeepAliveService's bbox follower.
-bool
-get_tiger_bbox(int *x, int *y, int *w, int *h)
-{
-	std::lock_guard<std::mutex> lock(g_sil.mtx);
-	if (!g_sil.ready || !g_sil.bbox_valid || g_sil.bboxW <= 0 || g_sil.bboxH <= 0)
-		return false;
-	*x = g_sil.bboxX;
-	*y = g_sil.bboxY;
-	*w = g_sil.bboxW;
-	*h = g_sil.bboxH;
-	return true;
-}
-
 // ── XR_DXR_view_rig (#396 W7) ───────────────────────────────────────────────
 // When the runtime advertises XR_DXR_view_rig, chain an XrDisplayRigDXR on
 // xrLocateViews and consume the render-ready off-axis XrView{pose,fov} the
@@ -242,6 +227,32 @@ bool g_has_view_rig = false;
 // the rect), the runtime owns the framing — no app-side Kooima.
 bool g_has_display_zones = false;
 bool g_has_local_3d_zone = false;   // XR_DXR_display_zones requires it (>= v4)
+
+#ifdef AVATAR_HAVE_ANDROID_SURFACE_BINDING
+// XR_DXR_android_surface_binding (#1063). Advertised -> we hand the runtime our
+// OWN ANativeWindow at xrCreateSession and republish it across the surface's
+// destroy/recreate cycle. No runtime-spawned SurfaceView, no overlay service.
+bool g_has_surface_binding = false;
+PFN_xrSetAndroidSurfaceDXR g_pfnSetAndroidSurface = nullptr;
+PFN_xrSetAndroidWindowGeometryDXR g_pfnSetAndroidWindowGeometry = nullptr;
+// The window this app currently owns; the android_main thread publishes it and
+// the frame loop consumes it, hence the atomic.
+std::atomic<ANativeWindow *> g_app_window{nullptr};
+
+// Live window geometry, sampled on the UI thread by MainActivity's Choreographer
+// callback (Android reports a pure window MOVE to nobody else) and consumed once
+// per frame by the render loop. Packed into one seq-guarded snapshot so the
+// reader never mixes halves of two samples.
+struct WindowRectSample
+{
+	int32_t x = 0, y = 0;
+	int32_t w = 0, h = 0;
+	int32_t panel_w = 0, panel_h = 0;
+	int32_t display_id = 0;
+};
+std::atomic<uint64_t> g_win_rect_seq{0};   // bumped by the UI thread on any change
+WindowRectSample g_win_rect;                // guarded by the seq above (single writer)
+#endif
 PFN_xrGetDisplayZoneCapabilitiesDXR g_pfnGetDisplayZoneCaps = nullptr;
 PFN_xrGetDisplayZoneRecommendedViewSizeDXR g_pfnGetDisplayZoneViewSize = nullptr;
 bool g_zones_active = false;          // caps query passed; zone framing live
@@ -709,6 +720,12 @@ create_instance(struct android_app *app)
 					if (std::strcmp(props[i].extensionName, XR_DXR_LOCAL_3D_ZONE_EXTENSION_NAME) == 0) {
 						g_has_local_3d_zone = true;
 					}
+#ifdef AVATAR_HAVE_ANDROID_SURFACE_BINDING
+					if (std::strcmp(props[i].extensionName,
+					                XR_DXR_ANDROID_SURFACE_BINDING_EXTENSION_NAME) == 0) {
+						g_has_surface_binding = true;
+					}
+#endif
 				}
 			}
 		}
@@ -716,7 +733,7 @@ create_instance(struct android_app *app)
 		     g_has_view_rig ? "yes" : "no", g_has_display_zones ? "yes" : "no");
 	}
 
-	const char *extensions[6] = {
+	const char *extensions[7] = {
 	    XR_KHR_ANDROID_CREATE_INSTANCE_EXTENSION_NAME,
 	    XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME,
 	    XR_DXR_DISPLAY_INFO_EXTENSION_NAME,  // display rendering-mode switching
@@ -734,6 +751,15 @@ create_instance(struct android_app *app)
 	} else {
 		g_has_display_zones = false;
 	}
+#ifdef AVATAR_HAVE_ANDROID_SURFACE_BINDING
+	// Architecture A (#1063): our own window, our own translucency. Without this
+	// the runtime falls back to spawning a SurfaceView (fullscreen-only, and it
+	// has no ViewParent so it dies in a freeform container).
+	if (g_has_surface_binding) {
+		extensions[extension_count++] = XR_DXR_ANDROID_SURFACE_BINDING_EXTENSION_NAME;
+	}
+	LOGI("XR_DXR_android_surface_binding advertised: %s", g_has_surface_binding ? "yes" : "no");
+#endif
 	XrInstanceCreateInfoAndroidKHR android_info = {};
 	android_info.type = XR_TYPE_INSTANCE_CREATE_INFO_ANDROID_KHR;
 	android_info.applicationVM = app->activity->vm;
@@ -969,11 +995,49 @@ create_session()
 	ci.type = XR_TYPE_SESSION_CREATE_INFO;
 	ci.next = &binding;
 	ci.systemId = g_system_id;
+
+#ifdef AVATAR_HAVE_ANDROID_SURFACE_BINDING
+	// Hand the runtime OUR window (#1063). NativeActivity gives it to us directly
+	// as android_app::window. transparentBackgroundEnabled is the FORMAL opt-in
+	// (#1082 wired it through comp_multi): the compositor picks an alpha-capable
+	// swapchain format + composite-alpha mode and the DP's alpha-gate engages, so
+	// the launcher shows through our translucent window around the tiger. This is
+	// the in-process twin of what the OOP service overlay used to do -- minus the
+	// 0.80 alpha clamp that overlay path imposed.
+	XrAndroidSurfaceBindingCreateInfoDXR surface_binding = {};
+	if (g_has_surface_binding) {
+		ANativeWindow *win = g_app_window.load(std::memory_order_acquire);
+		surface_binding.type = XR_TYPE_ANDROID_SURFACE_BINDING_CREATE_INFO_DXR;
+		surface_binding.next = &binding;
+		surface_binding.nativeWindow = win;
+		// Seed only; MainActivity's Choreographer poll takes over immediately via
+		// xrSetAndroidWindowGeometryDXR.
+		surface_binding.screenOffsetX = g_win_rect.x;
+		surface_binding.screenOffsetY = g_win_rect.y;
+		surface_binding.transparentBackgroundEnabled = XR_TRUE;
+		ci.next = &surface_binding;
+		LOGI("xrCreateSession: chaining XR_DXR_android_surface_binding "
+		     "(window=%p offset=%d,%d transparent=1)",
+		     (void *)win, (int)g_win_rect.x, (int)g_win_rect.y);
+	}
+#endif
+
 	XrResult res = xrCreateSession(g_instance, &ci, &g_session);
 	log_xr_result("xrCreateSession", res);
 	if (res != XR_SUCCESS) {
 		return false;
 	}
+
+#ifdef AVATAR_HAVE_ANDROID_SURFACE_BINDING
+	if (g_has_surface_binding) {
+		xrGetInstanceProcAddr(g_instance, "xrSetAndroidSurfaceDXR",
+		                      (PFN_xrVoidFunction *)&g_pfnSetAndroidSurface);
+		xrGetInstanceProcAddr(g_instance, "xrSetAndroidWindowGeometryDXR",
+		                      (PFN_xrVoidFunction *)&g_pfnSetAndroidWindowGeometry);
+		LOGI("surface-binding entry points: set_surface=%p set_geometry=%p",
+		     (void *)g_pfnSetAndroidSurface, (void *)g_pfnSetAndroidWindowGeometry);
+	}
+#endif
 
 	// ── Display-zones bring-up (ADR-027, #568): resolve the entry points and
 	// query caps. On success the render loop chains a bottom-75% tiger zone so
@@ -996,6 +1060,59 @@ create_session()
 	}
 	return true;
 }
+
+#ifdef AVATAR_HAVE_ANDROID_SURFACE_BINDING
+// Republish (win != nullptr) or drop (nullptr) our Surface. Called from the
+// android_main thread on APP_CMD_INIT_WINDOW / APP_CMD_TERM_WINDOW, which is
+// exactly where native_app_glue learns of surfaceCreated/surfaceDestroyed.
+void
+publish_app_surface(ANativeWindow *win)
+{
+	g_app_window.store(win, std::memory_order_release);
+	if (g_pfnSetAndroidSurface == nullptr || g_session == XR_NULL_HANDLE) {
+		return;
+	}
+	XrAndroidSurfaceBindingCreateInfoDXR b = {};
+	b.type = XR_TYPE_ANDROID_SURFACE_BINDING_CREATE_INFO_DXR;
+	b.nativeWindow = win;
+	b.screenOffsetX = g_win_rect.x;
+	b.screenOffsetY = g_win_rect.y;
+	b.transparentBackgroundEnabled = XR_TRUE;
+	XrResult res = g_pfnSetAndroidSurface(g_session, win != nullptr ? &b : nullptr);
+	LOGI("xrSetAndroidSurfaceDXR(%p) -> %d", (void *)win, (int)res);
+}
+
+// Push the latest UI-thread window-rect sample to the runtime, once per frame
+// and only when it actually changed. The runtime needs it for BOTH the vendor
+// weave phase and the per-window Kooima canvas -- and a pure window MOVE is
+// reported to nobody but this app (ADR-036 D6).
+void
+push_window_geometry()
+{
+	if (g_pfnSetAndroidWindowGeometry == nullptr || g_session == XR_NULL_HANDLE) {
+		return;
+	}
+	static uint64_t last_seq = 0;
+	uint64_t seq = g_win_rect_seq.load(std::memory_order_acquire);
+	if (seq == last_seq || seq == 0) {
+		return;
+	}
+	last_seq = seq;
+	WindowRectSample r = g_win_rect;
+	if (r.w <= 0 || r.h <= 0) {
+		return;
+	}
+	XrAndroidWindowGeometryDXR g = {};
+	g.type = XR_TYPE_ANDROID_WINDOW_GEOMETRY_DXR;
+	g.windowRect = XrRect2Di{{r.x, r.y}, {r.w, r.h}};
+	g.panelExtent = XrExtent2Di{r.panel_w, r.panel_h};
+	g.displayId = r.display_id;
+	XrResult res = g_pfnSetAndroidWindowGeometry(g_session, &g);
+	// Lifecycle only (the rect actually changed), never every frame.
+	LOGI("window screen rect: %d,%d %dx%d panel %dx%d display %d -> %d", r.x, r.y, r.w, r.h,
+	     r.panel_w, r.panel_h, r.display_id, (int)res);
+}
+#endif
 
 // Resolve the rendering-mode entry points and enumerate what the runtime/DP
 // advertises. Best-effort: logs each mode so we can see (on this device) whether
@@ -1393,6 +1510,13 @@ poll_xr_events()
 bool
 render_frame()
 {
+#ifdef AVATAR_HAVE_ANDROID_SURFACE_BINDING
+	// ADR-036 D6: hand the runtime this window's on-panel rect. De-duplicated
+	// against the UI thread's sample sequence, so this is a couple of atomic
+	// loads on an unchanged frame.
+	push_window_geometry();
+#endif
+
 	XrFrameWaitInfo wait_info = {};
 	wait_info.type = XR_TYPE_FRAME_WAIT_INFO;
 	XrFrameState frame_state = {};
@@ -1505,11 +1629,57 @@ render_frame()
 			if (g_has_view_rig) {
 				// Live window px for the button bar (tap → fraction mapping
 				// and bar aspect) — tracks rotation via the raw channel.
-				if (view_raw.canvasRectPx.extent.width > 0 && view_raw.canvasRectPx.extent.height > 0) {
-					g_win_px_w.store((uint32_t)view_raw.canvasRectPx.extent.width,
-					                 std::memory_order_relaxed);
-					g_win_px_h.store((uint32_t)view_raw.canvasRectPx.extent.height,
-					                 std::memory_order_relaxed);
+				//
+				// WHERE THE CANVAS COMES FROM — and why it is NOT the runtime's.
+				//
+				// Architecture A (#1063): we own the window, so its pixel size is
+				// something we KNOW (MainActivity samples it every frame), not
+				// something to ask the runtime for.
+				//
+				// Asking is in fact a trap. We submit a 3D zone that is the bottom
+				// (1 - kBubbleBandFrac) of the canvas, and the runtime then reports
+				// canvasRectPx as that ZONE rect. Re-deriving the next zone from it
+				// multiplies the height by 0.75 EVERY FRAME: 2560 -> 1920 -> 1440
+				// -> ... -> 1, until the zone (and the bubble) collapse to a
+				// zero-height rect. xrEndFrame then rejects the whole frame with
+				// XR_ERROR_VALIDATION_FAILURE, and because the frame is never ended
+				// every later xrBeginFrame returns XR_FRAME_DISCARDED — the app
+				// wedges, black, a couple of seconds after launch.
+				//
+				// Our own window rect is the fixed point of that loop: it is what
+				// the zone is a fraction OF, and it never depends on what we
+				// submitted last frame. Fall back to the runtime's canvas only when
+				// we have no window rect yet (no surface binding, or before the
+				// first Choreographer sample lands).
+				uint32_t canvas_w = 0, canvas_h = 0;
+#ifdef AVATAR_HAVE_ANDROID_SURFACE_BINDING
+				if (g_win_rect_seq.load(std::memory_order_acquire) != 0 && g_win_rect.w > 0 &&
+				    g_win_rect.h > 0) {
+					canvas_w = (uint32_t)g_win_rect.w;
+					canvas_h = (uint32_t)g_win_rect.h;
+				}
+#endif
+				if (canvas_w == 0 || canvas_h == 0) {
+					if (view_raw.canvasRectPx.extent.width > 0 &&
+					    view_raw.canvasRectPx.extent.height > 0) {
+						canvas_w = (uint32_t)view_raw.canvasRectPx.extent.width;
+						canvas_h = (uint32_t)view_raw.canvasRectPx.extent.height;
+					}
+				}
+				if (canvas_w > 0 && canvas_h > 0) {
+					// Lifecycle-only diagnostic: the canvas drives the zone split,
+					// the tile size AND the bubble band, so a bogus one is invisible
+					// until a layer rect collapses. Log on change only.
+					static uint32_t last_cw = 0, last_ch = 0;
+					if (canvas_w != last_cw || canvas_h != last_ch) {
+						last_cw = canvas_w;
+						last_ch = canvas_h;
+						LOGI("canvas: %ux%u (runtime canvasRectPx was %dx%d)", canvas_w, canvas_h,
+						     view_raw.canvasRectPx.extent.width,
+						     view_raw.canvasRectPx.extent.height);
+					}
+					g_win_px_w.store(canvas_w, std::memory_order_relaxed);
+					g_win_px_h.store(canvas_h, std::memory_order_relaxed);
 				}
 			}
 			// Active-mode tile size = display (held orientation, via the live canvas
@@ -1800,7 +1970,21 @@ render_frame()
 			bubble_layer.subImage.imageArrayIndex = 0;
 			bubble_layer.rect.offset = {bx0, by0};
 			bubble_layer.rect.extent = {bw, bh};
-			bubble_active = true;
+			// A composition-layer rect MUST be positive — xrEndFrame rejects the
+			// WHOLE frame with XR_ERROR_VALIDATION_FAILURE otherwise, and since
+			// the frame is then never ended every subsequent xrBeginFrame returns
+			// XR_FRAME_DISCARDED: one degenerate rect wedges the app forever.
+			// The band collapses whenever the canvas rect comes back small, so
+			// drop the bubble for that frame rather than taking the session down.
+			bubble_active = (bw > 0 && bh > 0);
+			if (!bubble_active) {
+				static bool warned = false;
+				if (!warned) {
+					warned = true;
+					LOGW("#568 bubble skipped: degenerate rect %dx%d from canvas %ux%u",
+					     bw, bh, cw, ch);
+				}
+			}
 		}
 	}
 
@@ -1891,6 +2075,13 @@ handle_cmd(struct android_app *app, int32_t cmd)
 	switch (cmd) {
 	case APP_CMD_INIT_WINDOW:
 		LOGI("APP_CMD_INIT_WINDOW (window=%p)", app->window);
+#ifdef AVATAR_HAVE_ANDROID_SURFACE_BINDING
+		// Publish OUR window (#1063). Before the bring-up chain on first launch
+		// (create_session chains it); after it on every resume, where it goes out
+		// as xrSetAndroidSurfaceDXR so the runtime rebuilds its VkSurfaceKHR and
+		// the DP resumes.
+		publish_app_surface(app->window);
+#endif
 		if (g_instance == XR_NULL_HANDLE) {
 			bool ok =
 			    create_instance(app) &&
@@ -1920,6 +2111,15 @@ handle_cmd(struct android_app *app, int32_t cmd)
 			}
 			LOGI(ok ? "Bring-up complete." : "Bring-up failed; see logs.");
 		}
+		break;
+	case APP_CMD_TERM_WINDOW:
+		LOGI("APP_CMD_TERM_WINDOW");
+#ifdef AVATAR_HAVE_ANDROID_SURFACE_BINDING
+		// Surface lost. Tell the runtime BEFORE native_app_glue frees it, so
+		// nothing presents into a dead window and the DP pauses (releasing its
+		// 3D-lens vote, ADR-036 D7) instead of holding the panel.
+		publish_app_surface(nullptr);
+#endif
 		break;
 	case APP_CMD_DESTROY:
 		LOGI("APP_CMD_DESTROY");
@@ -1954,25 +2154,12 @@ Java_com_displayxr_avatar_1vk_1android_MainActivity_nativeXrReady(
 	return (g_instance != XR_NULL_HANDLE) ? JNI_TRUE : JNI_FALSE;
 }
 
-// #558 overlay mode (debug.dxr.overlay): when set, MainActivity starts a
-// keep-alive foreground service + moveTaskToBack so the launcher resumes and the
-// tiger floats on the runtime's service overlay. Reads the prop directly so it
-// doesn't race android_main's read on the render thread.
-extern "C" JNIEXPORT jboolean JNICALL
-Java_com_displayxr_avatar_1vk_1android_MainActivity_nativeOverlayMode(
-    JNIEnv * /*env*/, jobject /*thiz*/)
-{
-	char prop[PROP_VALUE_MAX] = {};
-	return (__system_property_get("debug.dxr.overlay", prop) > 0 && prop[0] == '1') ? JNI_TRUE
-	                                                                                 : JNI_FALSE;
-}
 
-// Touch bridge, fed from Java. The runtime's MonadoView overlay is the only
-// window that receives touch (it covers our NativeActivity); David's #499 design
-// forwards each event to the host Activity via dispatchTouchEvent. But a
-// NativeActivity's native InputQueue (→ app->onInputEvent) is NOT driven by
-// Activity.dispatchTouchEvent — so we capture the forwarded MotionEvent in
-// MainActivity.dispatchTouchEvent and bridge the coordinates down here instead.
+// Touch bridge, fed from Java. Architecture A (#1063): we own our window, so
+// touch lands on our own Activity -- but a NativeActivity's native InputQueue
+// (-> app->onInputEvent) is NOT driven by Activity.dispatchTouchEvent, so we
+// capture the MotionEvent in MainActivity.dispatchTouchEvent and bridge the
+// coordinates down here instead.
 // One finger = camera controls (depth dolly + lateral strafe, Windows parity);
 // two fingers = pinch-to-zoom. action = MotionEvent.getActionMasked(); count =
 // pointerCount.
@@ -2075,133 +2262,39 @@ Java_com_displayxr_avatar_1vk_1android_MainActivity_nativeResetView(
 	g_reset_view_request.store(true, std::memory_order_relaxed);
 }
 
-// ── #558 overlay-mode touch path (service-hosted bbox input overlay) ──
-// The avatar Activity is backgrounded (moveTaskToBack), so its dispatchTouchEvent
-// no longer fires and the service overlay is FLAG_NOT_TOUCHABLE. Instead
-// OverlayKeepAliveService hosts a small TYPE_APPLICATION_OVERLAY input View laid
-// out to the tiger bbox; it offsets window-local coords by the window origin to
-// canvas px before calling these. Same native lib, same process → these resolve.
-
+#ifdef AVATAR_HAVE_ANDROID_SURFACE_BINDING
+// MainActivity's Choreographer poll (#1063 / ADR-036 D6). Android reports a pure
+// window MOVE to nobody: WindowFrames.didFrameSizeChange compares w/h only, so the
+// move goes out as a oneway IWindow.moved with no layout, no invalidate and no
+// callback, while SurfaceFlinger has already repositioned the layer with the OLD
+// buffer. Sampling getLocationOnScreen() per frame is the only way to see it.
 extern "C" JNIEXPORT void JNICALL
-Java_com_displayxr_avatar_1vk_1android_OverlayKeepAliveService_nativeOnTouch(
-    JNIEnv * /*env*/, jobject /*thiz*/, jint action, jint count,
-    jfloat x0, jfloat y0, jfloat x1, jfloat y1)
+Java_com_displayxr_avatar_1vk_1android_MainActivity_nativeSetWindowRect(
+    JNIEnv * /*env*/, jobject /*thiz*/, jint x, jint y, jint w, jint h, jint panelW, jint panelH,
+    jint displayId)
 {
-	handle_touch(action, count, x0, y0, x1, y1);
+	// Single writer (the UI thread); the render thread reads after observing the
+	// bumped sequence, so the release store below publishes the whole sample.
+	g_win_rect.x = x;
+	g_win_rect.y = y;
+	g_win_rect.w = w;
+	g_win_rect.h = h;
+	g_win_rect.panel_w = panelW;
+	g_win_rect.panel_h = panelH;
+	g_win_rect.display_id = displayId;
+	g_win_rect_seq.fetch_add(1, std::memory_order_release);
 }
-
-// True if a canvas-px point lands on the tiger silhouette. The input overlay
-// window is a rectangle (the tiger bbox), but the tiger is not — so the service
-// asks this on the first finger-down and, if it MISSES the tiger, declines the
-// gesture (returns false from onTouch) so the tap can fall through to whatever is
-// under the bbox corner (launcher icon, another app, a system dialog) instead of
-// being silently eaten. (#13 silhouette-gated passthrough)
-extern "C" JNIEXPORT jboolean JNICALL
-Java_com_displayxr_avatar_1vk_1android_OverlayKeepAliveService_nativeHitTiger(
-    JNIEnv * /*env*/, jobject /*thiz*/, jfloat x, jfloat y)
-{
-	return sil_hit(x, y) ? JNI_TRUE : JNI_FALSE;
-}
-
-extern "C" JNIEXPORT void JNICALL
-Java_com_displayxr_avatar_1vk_1android_OverlayKeepAliveService_nativeResetView(
-    JNIEnv * /*env*/, jobject /*thiz*/)
-{
-	g_reset_view_request.store(true, std::memory_order_relaxed);
-}
-
-// Fills out[0..3] = tiger bbox (x,y,w,h) in canvas px, returns true when valid.
-// The service polls this each frame to follow the tiger with the input window.
-extern "C" JNIEXPORT jboolean JNICALL
-Java_com_displayxr_avatar_1vk_1android_OverlayKeepAliveService_nativeGetTigerBounds(
-    JNIEnv *env, jobject /*thiz*/, jintArray out)
-{
-	if (out == nullptr || env->GetArrayLength(out) < 4) return JNI_FALSE;
-	int x = 0, y = 0, w = 0, h = 0;
-	if (!get_tiger_bbox(&x, &y, &w, &h)) return JNI_FALSE;
-	jint vals[4] = {x, y, w, h};
-	env->SetIntArrayRegion(out, 0, 4, vals);
-	return JNI_TRUE;
-}
-
-// #558 per-app: true if this app declares com.displayxr.overlay_mode=true in its
-// manifest. Queried via JNI through the NativeActivity's VM + clazz (the
-// MainActivity, a Context). The android_main thread may not be JNI-attached, so
-// attach/detach around the call.
-static bool
-app_declares_overlay_mode(struct android_app *app)
-{
-	if (app == nullptr || app->activity == nullptr || app->activity->vm == nullptr ||
-	    app->activity->clazz == nullptr) {
-		return false;
-	}
-	JavaVM *vm = app->activity->vm;
-	JNIEnv *env = nullptr;
-	bool attached = false;
-	if (vm->GetEnv((void **)&env, JNI_VERSION_1_6) == JNI_EDETACHED) {
-		if (vm->AttachCurrentThread(&env, nullptr) != JNI_OK) return false;
-		attached = true;
-	}
-	bool result = false;
-	if (env != nullptr) {
-		jobject ctx = app->activity->clazz;
-		jclass ctxCls = env->GetObjectClass(ctx);
-		jmethodID mGetPkg = env->GetMethodID(ctxCls, "getPackageName", "()Ljava/lang/String;");
-		jmethodID mGetPM =
-		    env->GetMethodID(ctxCls, "getPackageManager", "()Landroid/content/pm/PackageManager;");
-		jstring pkg = (jstring)env->CallObjectMethod(ctx, mGetPkg);
-		jobject pm = env->CallObjectMethod(ctx, mGetPM);
-		if (pkg != nullptr && pm != nullptr) {
-			jclass pmCls = env->GetObjectClass(pm);
-			jmethodID mGetAI = env->GetMethodID(
-			    pmCls, "getApplicationInfo",
-			    "(Ljava/lang/String;I)Landroid/content/pm/ApplicationInfo;");
-			jobject ai = env->CallObjectMethod(pm, mGetAI, pkg, 0x00000080 /*GET_META_DATA*/);
-			if (env->ExceptionCheck()) {
-				env->ExceptionClear();
-			} else if (ai != nullptr) {
-				jclass aiCls = env->GetObjectClass(ai);
-				jfieldID fMeta = env->GetFieldID(aiCls, "metaData", "Landroid/os/Bundle;");
-				jobject bundle = env->GetObjectField(ai, fMeta);
-				if (bundle != nullptr) {
-					jclass bCls = env->GetObjectClass(bundle);
-					jmethodID mGetBool =
-					    env->GetMethodID(bCls, "getBoolean", "(Ljava/lang/String;Z)Z");
-					jstring key = env->NewStringUTF("com.displayxr.overlay_mode");
-					result = env->CallBooleanMethod(bundle, mGetBool, key, JNI_FALSE) == JNI_TRUE;
-				}
-			}
-		}
-		if (env->ExceptionCheck()) {
-			env->ExceptionClear();
-		}
-	}
-	if (attached) {
-		vm->DetachCurrentThread();
-	}
-	return result;
-}
+#endif
 
 extern "C" void
 android_main(struct android_app *app)
 {
 	LOGI("avatar_vk_android: android_main entered");
-	{
-		// #558 per-app overlay mode: render while backgrounded so the tiger stays on
-		// the service overlay over the live launcher. Per-app via this app's own
-		// manifest flag (com.displayxr.overlay_mode) — the same flag MainActivity +
-		// the runtime read — with debug.dxr.overlay as a dev force override.
-		char prop[PROP_VALUE_MAX] = {};
-		bool force = __system_property_get("debug.dxr.overlay", prop) > 0 && prop[0] == '1';
-		if (force || app_declares_overlay_mode(app)) {
-			g_overlay_mode = true;
-			LOGI("overlay mode ON: render while backgrounded (foreground-service model)");
-		}
-	}
 	app->onAppCmd = handle_cmd;
-	// Touch is NOT consumed via app->onInputEvent: the runtime's MonadoView
-	// overlay covers our window, so a NativeActivity never sees native input.
-	// Gestures arrive via MainActivity.dispatchTouchEvent → nativeOnTouch JNI.
+	// Touch is NOT consumed via app->onInputEvent: a NativeActivity's native
+	// InputQueue is not driven by Activity.dispatchTouchEvent, and our Kotlin
+	// MainActivity is where the events land. Gestures arrive via
+	// MainActivity.dispatchTouchEvent -> nativeOnTouch JNI.
 
 	if (!initialize_loader(app)) {
 		LOGE("OpenXR loader init failed");
@@ -2254,14 +2347,11 @@ android_main(struct android_app *app)
 			// xrBeginFrame, so gating on SYNCHRONIZED+ deadlocks at READY ->
 			// black (David's #507). render_frame honors shouldRender.
 			//
-			// #558 overlay mode: once bring-up is done (g_instance up), keep
-			// rendering even with no NativeActivity window — the avatar has
-			// stepped to the background so the launcher is live, and in OOP we
-			// render to the IPC swapchain, not our own window. The keep-alive
-			// foreground service prevents the process from being frozen.
-			const bool have_window = (app->window != nullptr);
-			const bool overlay_bg = g_overlay_mode && g_instance != XR_NULL_HANDLE;
-			if (g_session_running && (have_window || overlay_bg)) {
+			// Architecture A (#1063): we own the window we present into, so a
+			// missing window means there is nothing to render into -- full stop.
+			// (The old #558 overlay path kept rendering with no window because the
+			// runtime owned a service overlay surface; that path is gone.)
+			if (g_session_running && app->window != nullptr) {
 				render_frame();
 			}
 		}
