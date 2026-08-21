@@ -1464,16 +1464,43 @@ load_model_path(const char *path)
 		// frames the zone. Pinch zoom still rides g_scene_scale.
 		g_scene_scale.store(1.0f, std::memory_order_relaxed);
 		g_scene_push.store(g_has_view_rig ? 0.0f : 0.45f, std::memory_order_relaxed);
-		// 90% fill: the avatar occupies 90% of the virtual-display (zone) height
-		// at start — vHeight = modelHeight / 0.90 = modelHeight × 1.111 (Windows
-		// kAutoFitVerticalComfort). The model is at WORLD scale (ext[1] m tall),
-		// NOT scaled by g_fit_scale, so vh = ext[1] × 1.111 — the old
-		// ext[1]×g_fit_scale×1.4 conflated an unapplied scale → ~76% + off.
-		const float vh = ext[1] * 1.111f;
-		g_rig_vh = (vh > 1e-3f) ? vh : kTargetSize * 1.111f;
-		LOGI("scene center=(%.2f,%.2f,%.2f) extent=(%.2f,%.2f,%.2f) push=%.2f rig_vh=%.2f",
+		// 80% fill in BOTH axes: vHeight = max(H, W / zoneAspect) / fill. The
+		// model is at WORLD scale (ext[1] m tall), NOT scaled by g_fit_scale.
+		// vHeight is the VIRTUAL DISPLAY height, so a larger value renders the
+		// model smaller and taking the binding axis crops nothing — a T-pose
+		// humanoid is nearly square while the zone is portrait, so a height-only
+		// fit let its arms clip at the zone edge.
+		//
+		// The viewport is the TIGER ZONE (bottom 1 - kBubbleBandFrac of the
+		// canvas — the top band is the Local2D speech bubble and never holds
+		// model pixels), matching the zone rect the render loop submits. The
+		// canvas dims come from the view_rig readback, so they are 0 until the
+		// first frame lands: the startup load degrades to the height-only fit
+		// and any later model switch gets the width rule.
+		//
+		// mirrors displayxr-common auto_fit.h AutoFitVHeight (not reachable from
+		// the Android build — it does not consume displayxr-common).
+		constexpr float kAutoFitFill = 0.8f;
+		const uint32_t canvas_w = g_win_px_w.load(std::memory_order_relaxed);
+		const uint32_t canvas_h = g_win_px_h.load(std::memory_order_relaxed);
+		const float zone_w = (float)canvas_w;
+		const float zone_h = (float)canvas_h * (1.0f - kBubbleBandFrac);
+		float vh = ext[1] / kAutoFitFill;
+		bool width_bound = false;
+		if (ext[0] > 0.0f && zone_w > 0.0f && zone_h > 0.0f) {
+			const float zone_aspect = zone_w / zone_h;
+			const float vh_for_width = ext[0] / (kAutoFitFill * zone_aspect);
+			if (vh_for_width > vh) {
+				vh = vh_for_width;
+				width_bound = true;
+			}
+		}
+		g_rig_vh = (vh > 1e-3f) ? vh : kTargetSize / kAutoFitFill;
+		LOGI("scene center=(%.2f,%.2f,%.2f) extent=(%.2f,%.2f,%.2f) push=%.2f "
+		     "rig_vh=%.2f (%s-bound, zone=%.0fx%.0f fill=%.2f)",
 		     g_scene_center[0], g_scene_center[1], g_scene_center[2],
-		     ext[0], ext[1], ext[2], g_scene_push.load(std::memory_order_relaxed), g_rig_vh);
+		     ext[0], ext[1], ext[2], g_scene_push.load(std::memory_order_relaxed), g_rig_vh,
+		     width_bound ? "width" : "height", zone_w, zone_h, kAutoFitFill);
 	}
 	g_scene_loaded.store(true, std::memory_order_relaxed);
 	return true;
