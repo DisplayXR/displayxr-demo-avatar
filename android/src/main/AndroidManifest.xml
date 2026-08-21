@@ -81,6 +81,33 @@
          dims and the session pauses. -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
 
+    <!--
+        CLICK-THROUGH OVERLAY MODE (runtime#1110).
+
+        Leo floats over the live desktop, so the desktop under him has to stay
+        usable. Measured on stock Android 13: click-through needs a window that is
+        (a) TIGHT — untrusted-touch occlusion is evaluated at the touch point
+        against the FRAMES above it, so a window that does not contain the tap
+        contributes nothing; (b) TOUCHABLE — inside its own frame the overlay is
+        the *touched* window, so the opacity policy is never consulted and alpha
+        stays 1.00 (a FLAG_NOT_TOUCHABLE application overlay is clamped by the
+        platform to 0.80, which is where the old ghost came from); and (c) backed
+        by NO Activity of ours in the foreground task, because an Activity parks a
+        display-wide ActivityRecordInputSink that eats the fall-through.
+
+        That means SYSTEM_ALERT_WINDOW for the window itself and a foreground
+        service, since the Activity has to leave the foreground task. Neither is a
+        platform grant or an OEM change. Without the (user-granted) SAW access the
+        app falls back to the previous full-screen Activity topology: it still
+        renders and weaves, it just swallows taps.
+
+        NOTE (grant hygiene): SYSTEM_ALERT_WINDOW is reset on every reinstall.
+        runtime#1072 re-grants it from build-android.sh; by hand it is
+        `adb shell appops set com.displayxr.avatar_vk_android SYSTEM_ALERT_WINDOW allow`.
+    -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+
     <application
         android:allowBackup="false"
         android:icon="@mipmap/ic_launcher"
@@ -122,6 +149,20 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!--
+            Keep-alive only (runtime#1110) — it owns no window. In overlay mode the
+            Activity deliberately leaves the foreground task, and without a
+            foreground service the process becomes killable AND the in-process
+            vendor face tracker's camera open becomes a *background* camera access,
+            which fails silently (no face, no error). foregroundServiceType=camera
+            is the honest type: in Architecture A the tracker really does open the
+            front camera in this process.
+        -->
+        <service
+            android:name=".AvatarOverlayService"
+            android:exported="false"
+            android:foregroundServiceType="camera" />
 
     </application>
 </manifest>
