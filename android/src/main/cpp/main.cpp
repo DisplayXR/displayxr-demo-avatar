@@ -761,6 +761,19 @@ update_silhouette(uint32_t imgW, uint32_t imgH, int zoneX, int zoneY, int zoneW,
 		g_sil.bbox_valid = false;  // tiger covers nothing this frame
 	}
 	g_sil.ready = true;
+	// #67: the bbox drives the overlay window's WIDTH, so its numbers have to be
+	// readable on device without a rebuild. Log on meaningful change only (the
+	// tick is ~10 Hz — an unconditional line here would be per-frame bloat).
+	{
+		static int last_bx = -99999, last_bw = -1;
+		if (g_sil.bbox_valid &&
+		    (std::abs(g_sil.bboxX - last_bx) > 8 || std::abs(g_sil.bboxW - last_bw) > 8)) {
+			last_bx = g_sil.bboxX;
+			last_bw = g_sil.bboxW;
+			LOGI("silhouette bbox: %d,%d %dx%d canvas px (zone %d,%d %dx%d)", g_sil.bboxX,
+			     g_sil.bboxY, g_sil.bboxW, g_sil.bboxH, zoneX, zoneY, zoneW, zoneH);
+		}
+	}
 }
 
 // ─── OpenXR-Android bring-up (reused verbatim from cube_handle_vk_android) ─
@@ -2484,6 +2497,89 @@ Java_com_displayxr_avatar_1vk_1android_MainActivity_nativeGetTouchRegion(
 	if (n > cap) n = cap;
 	if (n > 0) env->SetIntArrayRegion(out, 0, n * 4, rects.data());
 	return n;
+}
+
+// ── #67 silhouette-shaped input: the overlay's WIDTH follows Leo ─────────────
+//
+// The measured platform walls (runtime#1110 §5) leave exactly one input lever
+// on stock Android 13: the touchable region of a TYPE_APPLICATION_OVERLAY is
+// its FRAME, and TOUCHABLE_INSETS_REGION is blocklisted for overlays too. So
+// "shape the region to the silhouette" reduces to "shrink the frame onto the
+// silhouette" -- and under Architecture A the frame is also the canvas, which
+// is what makes that dangerous.
+//
+// WHY WIDTH ONLY, AND WHY IT IS A FIXED POINT.
+//
+// The runtime frames the zone rect to `virtualDisplayHeight` metres of world
+// height (render_frame chains XrDisplayRigDXR with rig_vh, itself derived from
+// the MODEL's extent, never from the canvas). Metres-per-pixel is therefore
+// rig_vh / zone_h -- a function of the zone's HEIGHT alone. Consequences:
+//
+//   * Shrinking the window's HEIGHT shrinks Leo by the same factor, so his
+//     bbox shrinks, so the next height shrinks... the classic collapse this
+//     file already documents for canvasRectPx (see render_frame). Height is a
+//     feedback axis. We never touch it.
+//   * Shrinking the window's WIDTH at constant height changes only the
+//     horizontal extent of the off-axis frustum. Leo keeps his pixel size and
+//     his position on the PANEL. Width is free.
+//
+// And the driver below is invariant under its own output. The frame is centred
+// (gravity CENTER_HORIZONTAL), so a width change of dw moves the window origin
+// by -dw/2 and grows curW by dw; the half-extent measured from the window
+// CENTRE, |bbox_edge - curW/2|, is unchanged. We converge in one step, not
+// asymptotically, and cannot walk the frame off Leo.
+//
+// The speech bubble is unioned in for correctness (it is ours to tap). Its own
+// width is a fraction (~0.47) of the canvas, so it is a contraction too: it can
+// never demand a frame wider than itself, and the fixed point is Leo-driven.
+//
+// Returns the wanted width in px, or -1 for "no opinion" (pre-warmup, or the
+// knob is off) which leaves the frame exactly as it is today.
+//   adb shell setprop debug.dxr.avatar.overlay.shape 0   # revert to full band
+constexpr float kShapeMarginFrac = 0.05f;  // each side, as a fraction of the (fixed) height
+constexpr float kShapeMinFrac = 0.34f;     // never narrower than this much of the full band
+constexpr int kShapeQuantumPx = 32;        // frame quantum: sub-quantum jitter never resizes
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_displayxr_avatar_1vk_1android_MainActivity_nativeGetOverlayWidthPx(
+    JNIEnv * /*env*/, jobject /*thiz*/, jint refW, jint curW, jint curH)
+{
+	if (refW <= 0 || curW <= 0 || curH <= 0) return -1;
+	{
+		char prop[PROP_VALUE_MAX] = {0};
+		if (__system_property_get("debug.dxr.avatar.overlay.shape", prop) > 0 &&
+		    atoi(prop) == 0)
+			return -1;
+	}
+
+	const int cx = curW / 2;
+	int half = -1;
+	{
+		std::lock_guard<std::mutex> lock(g_sil.mtx);
+		if (!g_sil.ready) return -1;  // fail-OPEN during warmup, like sil_hit
+		if (g_sil.bbox_valid && g_sil.bboxW > 0) {
+			const int dl = std::abs(g_sil.bboxX - cx);
+			const int dr = std::abs(g_sil.bboxX + g_sil.bboxW - cx);
+			half = dl > dr ? dl : dr;
+		}
+	}
+	{
+		std::lock_guard<std::mutex> lock(g_bubble_rect_mtx);
+		if (g_bubble_rect_valid) {
+			const int dl = std::abs(g_bubble_rect[0] - cx);
+			const int dr = std::abs(g_bubble_rect[0] + g_bubble_rect[2] - cx);
+			const int b = dl > dr ? dl : dr;
+			if (b > half) half = b;
+		}
+	}
+	if (half < 0) return -1;  // nothing measured yet
+
+	int want = 2 * (half + (int)((float)curH * kShapeMarginFrac));
+	const int min_w = (int)((float)refW * kShapeMinFrac);
+	if (want < min_w) want = min_w;
+	want = ((want + kShapeQuantumPx - 1) / kShapeQuantumPx) * kShapeQuantumPx;
+	if (want > refW) want = refW;
+	return want;
 }
 
 // #66: how wide the avatar's window should be, as a percentage of the screen's
