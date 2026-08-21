@@ -545,6 +545,7 @@ static void OpenLoadDialog() {
                 std::string pathStr(path);
                 if (model_validate_file(pathStr)) {
                     LOG_INFO("Loading model: %s", path);
+                    g_modelRenderer.setBoundsSweepAllClips(true);   // see TryAutoLoadBundledScene
                     if (g_modelRenderer.loadModel(path)) {
                         g_loadedFileName = model_basename(pathStr);
                         LOG_INFO("Model loaded: %s (%s)", g_loadedFileName.c_str(),
@@ -1707,6 +1708,7 @@ static void HandleMcpToolCall(AppXrSession& xr, const XrEventDataMCPToolCallDXR*
 
     if (strcmp(call->toolName, "load_model") == 0) {
         std::string path;
+        g_modelRenderer.setBoundsSweepAllClips(true);   // see TryAutoLoadBundledScene
         if (!JsonGetString(a, "path", path) || path.empty()) {
             ok = XR_FALSE;
             result = "{\"error\":\"missing required string argument 'path'\"}";
@@ -2077,7 +2079,43 @@ static void ApplyAutoFitForLoadedScene() {
         const float canvasAspect = (canvasH > 0.0f) ? canvasW / canvasH : 0.0f;
         const float heightFit = extent[1] / dxr::kAutoFitDefaultFill;
         float vh = dxr::AutoFitVHeight(extent[0], extent[1], canvasW, canvasH);
-        const bool widthBound = vh > heightFit * 1.0001f;
+        bool widthBound = vh > heightFit * 1.0001f;
+        const char* fitBox = "union";
+
+        // Phase 2 of the 80% rule: when the model was loaded with the all-clips
+        // bounds sweep (every load path sets it), SIZE the rig from the ACTIVE
+        // clip's swept box — the subject as the user actually sees it — and keep
+        // the union box only as the safety envelope. Sizing off the union would
+        // shrink the subject by however far the widest/tallest OTHER clip
+        // reaches (a wave clip's raised arm, a walk clip's root travel), which
+        // reads as "the avatar loaded small and distant". A model with no clips,
+        // or one loaded without the sweep, keeps the union fit above unchanged.
+        float aMin[3], aMax[3];
+        if (g_modelRenderer.getActiveClipBounds(aMin, aMax)) {
+            const float rawW = aMax[0] - aMin[0];
+            const float rawH = aMax[1] - aMin[1];
+            const float subjW = (rawW > 1e-5f) ? rawW : 1e-5f;
+            const float subjH = (rawH > 1e-5f) ? rawH : 1e-5f;
+            const float subjHeightFit = subjH / dxr::kAutoFitDefaultFill;
+            vh = dxr::AutoFitVHeight(subjW, subjH, canvasW, canvasH);
+            widthBound = vh > subjHeightFit * 1.0001f;
+            fitBox = "active-clip";
+            g_fitCenter[0] = 0.5f * (aMin[0] + aMax[0]);
+            g_fitCenter[1] = 0.5f * (aMin[1] + aMax[1]);
+            g_fitCenter[2] = 0.5f * (aMin[2] + aMax[2]);
+            // Clamp the vertical placement so the UNION floor stays in frame:
+            // the feet of whichever clip dips lowest must never truncate at the
+            // canvas edge, even though the active clip decided the size.
+            const float unionFloor = center[1] - 0.5f * extent[1];
+            const float pad = vh * 0.02f;
+            const float maxCy = unionFloor - pad + 0.5f * vh;
+            const bool clamped = g_fitCenter[1] > maxCy;
+            if (clamped) g_fitCenter[1] = maxCy;
+            LOG_INFO("Auto-fit (active clip): subject=%.4fx%.4f centre=(%.3f, %.3f, %.3f) "
+                     "unionFloor=%.4f maxCy=%.4f%s",
+                     subjW, subjH, g_fitCenter[0], g_fitCenter[1], g_fitCenter[2],
+                     unionFloor, maxCy, clamped ? " (clamped)" : "");
+        }
         if (!(vh > 1e-3f)) vh = kDefaultVirtualDisplayHeightM; // degenerate scene
         g_fitVHeight = vh;
 
@@ -2090,10 +2128,11 @@ static void ApplyAutoFitForLoadedScene() {
         // to be height-bound is the tell that its silhouette is wider than the
         // canvas can show at all.
         LOG_INFO("Auto-fit: center=(%.3f, %.3f, %.3f) extent=(%.3f, %.3f, %.3f) "
-                 "vHeight=%.3f (%s-bound, canvas=%.0fx%.0f aspect=%.3f fill=%.2f) yaw=%.0fdeg",
+                 "vHeight=%.3f (%s box, %s-bound, canvas=%.0fx%.0f aspect=%.3f fill=%.2f) "
+                 "yaw=%.0fdeg",
                  center[0], center[1], center[2],
                  extent[0], extent[1], extent[2], vh,
-                 widthBound ? "width" : "height",
+                 fitBox, widthBound ? "width" : "height",
                  canvasW, canvasH, canvasAspect, dxr::kAutoFitDefaultFill,
                  g_fitYaw * 57.2957795f);
     } else {
@@ -2138,6 +2177,11 @@ static void TryAutoLoadBundledScene(const std::string& overridePath = std::strin
         if (!model_validate_file(path)) return;
     }
     LOG_INFO("Auto-loading model: %s", path.c_str());
+    // Sweep every clip's bounds, not just the load-time one: the avatar switches
+    // clips at runtime, so the fit has to know the union envelope (and the
+    // active clip's own box — see ApplyAutoFitForLoadedScene). Sticky on the
+    // renderer, but set at each load site so no path can drift.
+    g_modelRenderer.setBoundsSweepAllClips(true);
     if (g_modelRenderer.loadModel(path.c_str())) {
         g_loadedFileName = model_basename(path);
         LOG_INFO("Loaded %s (%s)", g_loadedFileName.c_str(), model_filesize_str(path).c_str());
@@ -2619,6 +2663,7 @@ int main(int argc, char** argv) {
             g_input.pendingLoadPath.clear();
             if (model_validate_file(p)) {
                 LOG_INFO("Loading dropped model: %s", p.c_str());
+                g_modelRenderer.setBoundsSweepAllClips(true);   // see TryAutoLoadBundledScene
                 if (g_modelRenderer.loadModel(p.c_str())) {
                     g_loadedFileName = model_basename(p);
                     ApplyAutoFitForLoadedScene();
