@@ -1820,9 +1820,21 @@ void ModelRenderer::recomputeAnimatedBounds(const std::vector<ModelVertex>& vert
                                             const std::vector<uint32_t>& indices) {
     if (activeAnim_ < 0 || activeAnim_ >= (int)animations_.size()) return;  // keep static box
     if (verts.empty() || indices.empty() || nodes_.empty()) return;
-    const Animation& anim = animations_[activeAnim_];
 
-    // Sample the clip at N evenly-spaced times and union the skinned bounds.
+    // Which clips to sweep. The template default is the ACTIVE clip only — a
+    // model viewer fits what it is playing. The avatar opts into sweeping EVERY
+    // clip (setBoundsSweepAllClips): it switches clips at runtime, and a box
+    // swept from one clip clips the poses of the others at the zone edge
+    // (observed as truncated feet during idle sway). The sweep runs once, at
+    // load, while the CPU verts still exist.
+    std::vector<int> sweepClips;
+    if (sweepAllClips_) {
+        for (int i = 0; i < (int)animations_.size(); ++i) sweepClips.push_back(i);
+    } else {
+        sweepClips.push_back(activeAnim_);
+    }
+
+    // Sample each clip at N evenly-spaced times and union the skinned bounds.
     // Subsample very dense meshes so load stays snappy (the box is robust to it).
     const int N = 24;
     const uint32_t step = indices.size() > 200000u
@@ -1832,9 +1844,35 @@ void ModelRenderer::recomputeAnimatedBounds(const std::vector<ModelVertex>& vert
 
     bool has = false;
     glm::vec3 mn(0.0f), mx(0.0f);
-    glm::dvec3 centroidSum(0.0);   // mean joint position summed over all samples
+    // Per-clip y-range, logged when sweeping all clips — the union's height is
+    // whatever single clip reaches highest/lowest, and knowing WHICH clip that
+    // is decides fit-policy questions ("why did the avatar shrink?") from the
+    // log instead of a debugger.
+    glm::vec3 clipMn(0.0f), clipMx(0.0f);
+    bool clipHas = false;
+    int lastClip = -1;
+    // Anchor correction inputs — ACTIVE clip only, even when sweeping all
+    // clips. anchorOffset_ is a per-pose "visual centre vs joint centroid"
+    // correction; deriving it from a union box that includes other clips' root
+    // travel would bake half that travel into every frame's anchor and push the
+    // subject off-centre.
+    bool activeHas = false;
+    glm::vec3 activeMn(0.0f), activeMx(0.0f);
+    glm::dvec3 centroidSum(0.0);   // mean joint position over the ACTIVE clip's samples
     uint32_t centroidCount = 0;    // (for the anchor visual-centre correction)
-    for (int si = 0; si < N; ++si) {
+    for (int gi = 0; gi < N * (int)sweepClips.size(); ++gi) {
+        const int si = gi % N;
+        const int clipIndex = sweepClips[gi / N];
+        const bool isActiveClip = (clipIndex == activeAnim_);
+        const Animation& anim = animations_[clipIndex];
+        if (clipIndex != lastClip) {
+            if (sweepAllClips_ && lastClip >= 0 && clipHas) {
+                std::printf("ModelRenderer: bounds sweep clip %d \"%s\": y [%.4f, %.4f]\n",
+                            lastClip, animations_[lastClip].name.c_str(), clipMn.y, clipMx.y);
+            }
+            lastClip = clipIndex;
+            clipHas = false;
+        }
         const float t = (anim.duration > 0.0f && N > 1)
             ? anim.duration * (float)si / (float)(N - 1) : 0.0f;
 
@@ -1879,7 +1917,7 @@ void ModelRenderer::recomputeAnimatedBounds(const std::vector<ModelVertex>& vert
                     ? glm::make_mat4(&world[node * 16]) : glm::mat4(1.0f);
                 glm::mat4 jm = nw * glm::make_mat4(&sk.inverseBind[j * 16]);
                 std::memcpy(&jmats[(base + j) * 16], glm::value_ptr(jm), 16 * sizeof(float));
-                centroidSum += glm::dvec3(nw[3]); ++centroidCount;   // joint world pos
+                if (isActiveClip) { centroidSum += glm::dvec3(nw[3]); ++centroidCount; }  // joint world pos
             }
             base += (uint32_t)sk.joints.size();
         }
@@ -1919,8 +1957,24 @@ void ModelRenderer::recomputeAnimatedBounds(const std::vector<ModelVertex>& vert
                 }
                 if (!has) { mn = mx = glm::vec3(wp); has = true; }
                 else { mn = glm::min(mn, glm::vec3(wp)); mx = glm::max(mx, glm::vec3(wp)); }
+                if (!clipHas) { clipMn = clipMx = glm::vec3(wp); clipHas = true; }
+                else {
+                    clipMn = glm::min(clipMn, glm::vec3(wp));
+                    clipMx = glm::max(clipMx, glm::vec3(wp));
+                }
+                if (isActiveClip) {
+                    if (!activeHas) { activeMn = activeMx = glm::vec3(wp); activeHas = true; }
+                    else {
+                        activeMn = glm::min(activeMn, glm::vec3(wp));
+                        activeMx = glm::max(activeMx, glm::vec3(wp));
+                    }
+                }
             }
         }
+    }
+    if (sweepAllClips_ && lastClip >= 0 && clipHas) {
+        std::printf("ModelRenderer: bounds sweep clip %d \"%s\": y [%.4f, %.4f]\n",
+                    lastClip, animations_[lastClip].name.c_str(), clipMn.y, clipMx.y);
     }
     if (has) {
         bboxMin_[0]=mn.x; bboxMin_[1]=mn.y; bboxMin_[2]=mn.z;
@@ -1929,15 +1983,30 @@ void ModelRenderer::recomputeAnimatedBounds(const std::vector<ModelVertex>& vert
         // Offset that lifts the per-frame skeleton-centroid anchor onto the
         // model's visual centre (the AABB centre), so joint-free geometry like a
         // hat doesn't make the subject ride off-centre. ~0 for rigs whose joints
-        // already span the mesh; applied in updateAnimation.
-        if (centroidCount > 0) {
+        // already span the mesh; applied in updateAnimation. Both terms come
+        // from the ACTIVE clip's sweep (see activeMn/activeMx above) — the
+        // all-clips union box is for the FIT only.
+        if (centroidCount > 0 && activeHas) {
             const glm::vec3 c = glm::vec3(centroidSum / (double)centroidCount);
-            anchorOffset_[0] = 0.5f * (mn.x + mx.x) - c.x;
-            anchorOffset_[1] = 0.5f * (mn.y + mx.y) - c.y;
-            anchorOffset_[2] = 0.5f * (mn.z + mx.z) - c.z;
+            anchorOffset_[0] = 0.5f * (activeMn.x + activeMx.x) - c.x;
+            anchorOffset_[1] = 0.5f * (activeMn.y + activeMx.y) - c.y;
+            anchorOffset_[2] = 0.5f * (activeMn.z + activeMx.z) - c.z;
             anchorOffsetValid_ = true;
         }
+        // Publish the active-clip box for the fit policy (getActiveClipBounds).
+        if (sweepAllClips_ && activeHas) {
+            activeBoxMin_[0] = activeMn.x; activeBoxMin_[1] = activeMn.y; activeBoxMin_[2] = activeMn.z;
+            activeBoxMax_[0] = activeMx.x; activeBoxMax_[1] = activeMx.y; activeBoxMax_[2] = activeMx.z;
+            activeBoxValid_ = true;
+        }
     }
+}
+
+bool ModelRenderer::getActiveClipBounds(float outMin[3], float outMax[3]) const {
+    if (!modelLoaded_ || !activeBoxValid_) return false;
+    std::memcpy(outMin, activeBoxMin_, sizeof(activeBoxMin_));
+    std::memcpy(outMax, activeBoxMax_, sizeof(activeBoxMax_));
+    return true;
 }
 
 void ModelRenderer::renderEye(VkImage swapchainImage,
@@ -2380,6 +2449,7 @@ void ModelRenderer::cleanupModel() {
     bindNodes_.clear();
     animAnchorValid_ = false;
     hasBBox_ = false;
+    activeBoxValid_ = false;   // else a static reload inherits the last model's box
     numPrimitives_ = 0;
     modelLoaded_ = false;
     loadedModelPath_.clear();

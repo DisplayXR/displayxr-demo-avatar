@@ -79,7 +79,21 @@ struct ModelRenderer {
         return true;
     }
 
+    // Sweep EVERY clip (not just the active one) when computing the animated
+    // bounds at load. Set BEFORE loadModel. The avatar needs it: it switches
+    // clips at runtime, and an auto-fit taken from only the load-time clip
+    // truncates the poses of the others at the zone edge.
+    // Template default off — a model viewer fits the clip it is playing.
+    void setBoundsSweepAllClips(bool v) { sweepAllClips_ = v; }
+
     bool getSceneBBox(float outMin[3], float outMax[3]) const;
+    // The ACTIVE clip's swept bounds, available only after a
+    // setBoundsSweepAllClips(true) load (else returns false). The fit policy
+    // needs BOTH boxes: the active box is "the subject as the user sees it"
+    // (sizing — framed at <= 80% of the zone viewport per axis), the union box
+    // (getSceneBBox / getRobustSceneBounds) is the safety envelope (its floor
+    // keeps feet from truncating in whichever clip dips lowest).
+    bool getActiveClipBounds(float outMin[3], float outMax[3]) const;
     bool getRobustSceneBounds(float loPct, float hiPct,
                               float outCenter[3], float outExtent[3]) const;
     // Smoothed world-space centroid of the active skeleton (mean joint
@@ -337,6 +351,7 @@ private:
     float animTime_   = 0.0f;            // playhead within the active clip (seconds)
     bool  paused_     = false;           // freeze the playhead (Phase 4 play/pause)
     std::vector<ModelNode> bindNodes_;   // bind-pose TRS snapshot; restored on clip switch
+    bool  sweepAllClips_ = false;        // see setBoundsSweepAllClips
 
     // Display-rig bind: smoothed mean joint position (world space). Valid only
     // while a skinned model is animating; snaps on the first frame then eases.
@@ -355,4 +370,10 @@ private:
     float bboxMin_[3] = {0, 0, 0};
     float bboxMax_[3] = {0, 0, 0};
     bool  hasBBox_ = false;
+
+    // Active-clip swept box (see getActiveClipBounds). Valid only after a
+    // sweep-all-clips recomputeAnimatedBounds.
+    float activeBoxMin_[3] = {0, 0, 0};
+    float activeBoxMax_[3] = {0, 0, 0};
+    bool  activeBoxValid_ = false;
 };
