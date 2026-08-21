@@ -176,8 +176,24 @@ struct SilhouetteCoverage
 	// area is touchable and everything outside it falls through to the launcher.
 	int bboxX = 0, bboxY = 0, bboxW = 0, bboxH = 0;
 	bool bbox_valid = false;                          // false when the tiger covers 0 px
+	// #66 input punch-through: the silhouette reduced to a handful of horizontal
+	// band rects, flat x,y,w,h in CANVAS px. MainActivity unions these into the
+	// window's touchable region so a tap that misses the tiger is never delivered
+	// to us at all. A per-pixel Region would be hundreds of rects re-sent to
+	// WindowManager on every silhouette tick; bands track the outline closely
+	// enough for a fingertip and cost one setInsets call.
+	std::vector<int> bands;
 };
 SilhouetteCoverage g_sil;
+
+// #66: the speech bubble's CANVAS rect, republished by the render loop every
+// frame (it slides with the lateral pan, far faster than the ~10 Hz silhouette
+// tick) and unioned into the touchable region. The bubble is ours to tap even
+// though it is not part of the tiger silhouette.
+std::mutex g_bubble_rect_mtx;
+int g_bubble_rect[4] = {0, 0, 0, 0};
+bool g_bubble_rect_valid = false;
+
 ModelImage g_sil_image = {};
 ModelBuffer g_sil_readback = {};
 void *g_sil_mapped = nullptr;
@@ -258,6 +274,11 @@ PFN_xrGetDisplayZoneRecommendedViewSizeDXR g_pfnGetDisplayZoneViewSize = nullptr
 bool g_zones_active = false;          // caps query passed; zone framing live
 // Top fraction reserved for the (future) speech bubble; tiger gets the rest.
 constexpr float kBubbleBandFrac = 0.25f;
+// #66: width of the avatar's window as a percentage of the screen's long edge —
+// the "slab". 100 = full width, and 100 is the shipped default because on stock
+// Android 13 a narrower window buys NOTHING: see nativeGetSlabPercent. Kept as a
+// live knob so an OEM-exempted build can be A/B'd without a new APK.
+constexpr int kDefaultSlabPercent = 100;
 float g_rig_vh = 1.33f;  // virtual display height (app units); refit per model
 
 // Worst-case view/tile capacity for the one atlas swapchain (multiview-tiling
@@ -640,7 +661,56 @@ update_silhouette(uint32_t imgW, uint32_t imgH, int zoneX, int zoneY, int zoneW,
 		     zoneX, zoneY, zoneW, zoneH, covered * 100u / (w * h));
 		s_sil_logged = true;
 	}
+	// ── #66 touch-passthrough bands ─────────────────────────────────────────
+	// Reduce the coverage bitmap to kBandCount horizontal spans (min/max covered
+	// x per band) in CANVAS px. MainActivity turns these into the window's
+	// touchable region: everything outside them is not our input at all, so
+	// Android is free to route it to whatever is behind us. Same +pad as the
+	// bbox, matching sil_hit's R=2 dilation so the gesture gate and the
+	// touchable region agree about where the tiger ends.
+	constexpr int kBandCount = 20;
+	std::vector<int> bands;
+	bands.reserve(kBandCount * 4);
+	{
+		const int pad = 2;  // coverage px
+		const int rows_per = ((int)h + kBandCount - 1) / kBandCount;
+		for (int b = 0; b < kBandCount; ++b) {
+			const int r0 = b * rows_per;
+			if (r0 >= (int)h) break;
+			int r1 = r0 + rows_per;
+			if (r1 > (int)h) r1 = (int)h;
+			int sx0 = (int)w, sx1 = -1;
+			for (int y = r0; y < r1; ++y) {
+				const uint8_t *row = &uni[(size_t)y * w];
+				for (int x = 0; x < (int)w; ++x) {
+					if (row[x] > 40) {
+						if (x < sx0) sx0 = x;
+						if (x > sx1) sx1 = x;
+					}
+				}
+			}
+			if (sx1 < sx0) continue;  // band is empty
+			int x0 = sx0 - pad, x1 = sx1 + 1 + pad;
+			int y0 = r0 - pad, y1 = r1 + pad;
+			if (x0 < 0) x0 = 0;
+			if (y0 < 0) y0 = 0;
+			if (x1 > (int)w) x1 = (int)w;
+			if (y1 > (int)h) y1 = (int)h;
+			const int cx0 = zoneX + (int)((float)x0 * (float)zoneW / (float)w);
+			const int cy0 = zoneY + (int)((float)y0 * (float)zoneH / (float)h);
+			const int cx1 = zoneX + (int)((float)x1 * (float)zoneW / (float)w);
+			const int cy1 = zoneY + (int)((float)y1 * (float)zoneH / (float)h);
+			if (cx1 > cx0 && cy1 > cy0) {
+				bands.push_back(cx0);
+				bands.push_back(cy0);
+				bands.push_back(cx1 - cx0);
+				bands.push_back(cy1 - cy0);
+			}
+		}
+	}
+
 	std::lock_guard<std::mutex> lock(g_sil.mtx);
+	g_sil.bands.swap(bands);
 	g_sil.bits.resize((size_t)w * h);
 	for (uint32_t i = 0; i < w * h; ++i) g_sil.bits[i] = (uni[i] > 40) ? 1 : 0;
 	g_sil.covW = (int)w;
@@ -1977,6 +2047,17 @@ render_frame()
 			// The band collapses whenever the canvas rect comes back small, so
 			// drop the bubble for that frame rather than taking the session down.
 			bubble_active = (bw > 0 && bh > 0);
+			// #66: republish the bubble's canvas rect for the touchable region.
+			// It slides with the pan every frame, so it can't ride the ~10 Hz
+			// silhouette tick.
+			{
+				std::lock_guard<std::mutex> lock(g_bubble_rect_mtx);
+				g_bubble_rect[0] = bx0;
+				g_bubble_rect[1] = by0;
+				g_bubble_rect[2] = bw;
+				g_bubble_rect[3] = bh;
+				g_bubble_rect_valid = bubble_active;
+			}
 			if (!bubble_active) {
 				static bool warned = false;
 				if (!warned) {
@@ -1986,6 +2067,14 @@ render_frame()
 				}
 			}
 		}
+	}
+
+	// #66 catch-all: on a non-zones frame (or before the bubble is ready) the
+	// block above never runs, so retire any stale rect rather than leaving a
+	// phantom touchable island where no bubble is drawn.
+	if (!bubble_active) {
+		std::lock_guard<std::mutex> lock(g_bubble_rect_mtx);
+		g_bubble_rect_valid = false;
 	}
 
 	// Layer order: projection/zone first, then the #568 speech bubble on top.
@@ -2250,6 +2339,75 @@ Java_com_displayxr_avatar_1vk_1android_MainActivity_nativeOnTouch(
     jfloat x0, jfloat y0, jfloat x1, jfloat y1)
 {
 	handle_touch(action, count, x0, y0, x1, y1);
+}
+
+// ── #66 input punch-through ─────────────────────────────────────────────────
+// The tiger's touchable region, in WINDOW px, as flat x,y,w,h quads: the
+// silhouette bands plus the speech bubble. MainActivity feeds this to the
+// window's TOUCHABLE_INSETS_REGION, so a tap that misses the tiger is never
+// delivered to this app and Android routes it to whatever is behind.
+//
+// Architecture A makes the coordinate spaces line up for free: the canvas IS
+// our window (render_frame takes canvas_w/h straight from g_win_rect), and
+// dispatchTouchEvent already hands raw view coordinates to sil_hit as canvas
+// px. So no rebase is needed here — canvas px == window px.
+//
+// Returns the number of rects written, 0 for "nothing is touchable", or -1 for
+// "not measured yet — make the whole window touchable" (fail-OPEN, the same
+// warmup contract sil_hit uses, so the app is never dead to input).
+extern "C" JNIEXPORT jint JNICALL
+Java_com_displayxr_avatar_1vk_1android_MainActivity_nativeGetTouchRegion(
+    JNIEnv *env, jobject /*thiz*/, jintArray out)
+{
+	// `adb shell setprop debug.dxr.avatar.passthrough 0` restores the old
+	// whole-window-touchable behaviour, so the input policy can be A/B'd on
+	// device without a rebuild.
+	{
+		char prop[PROP_VALUE_MAX] = {0};
+		if (__system_property_get("debug.dxr.avatar.passthrough", prop) > 0 &&
+		    atoi(prop) == 0)
+			return -1;
+	}
+
+	const jsize cap = env->GetArrayLength(out) / 4;
+	if (cap <= 0) return -1;
+
+	std::vector<jint> rects;
+	{
+		std::lock_guard<std::mutex> lock(g_sil.mtx);
+		if (!g_sil.ready) return -1;  // pre-warmup → whole window
+		rects.assign(g_sil.bands.begin(), g_sil.bands.end());
+	}
+	{
+		std::lock_guard<std::mutex> lock(g_bubble_rect_mtx);
+		if (g_bubble_rect_valid)
+			for (int i = 0; i < 4; ++i) rects.push_back(g_bubble_rect[i]);
+	}
+
+	jsize n = (jsize)(rects.size() / 4);
+	if (n > cap) n = cap;
+	if (n > 0) env->SetIntArrayRegion(out, 0, n * 4, rects.data());
+	return n;
+}
+
+// #66: how wide the avatar's window should be, as a percentage of the screen's
+// long edge. Shrinking the frame is the only geometry lever an unprivileged app
+// has, and on stock Android 13 it is not enough on its own — ActivityRecordInputSink
+// swallows whatever falls outside (see MainActivity's touch-region notes and
+// docs/android-input-passthrough.md). Left as a live knob for a platform that
+// grants the S2/L13 exemption:
+//   adb shell setprop debug.dxr.avatar.slab 55   # percent, 0 or >=100 = full
+extern "C" JNIEXPORT jint JNICALL
+Java_com_displayxr_avatar_1vk_1android_MainActivity_nativeGetSlabPercent(
+    JNIEnv * /*env*/, jobject /*thiz*/)
+{
+	char prop[PROP_VALUE_MAX] = {0};
+	if (__system_property_get("debug.dxr.avatar.slab", prop) > 0) {
+		const int v = atoi(prop);
+		if (v > 0 && v < 100) return v;
+		if (v <= 0) return 100;  // explicit opt-out → full width
+	}
+	return kDefaultSlabPercent;
 }
 
 // Double-tap (from Java's GestureDetector) recenters the camera (pan/dolly/zoom
