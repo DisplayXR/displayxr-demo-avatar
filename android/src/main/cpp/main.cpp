@@ -1429,6 +1429,11 @@ load_model_path(const char *path)
 	if (g_vk_device != VK_NULL_HANDLE) {
 		vkDeviceWaitIdle(g_vk_device);  // no GPU work touching the old model
 	}
+	// Sweep every clip's bounds, not just the load-time one: the avatar switches
+	// clips at runtime, so the fit has to know the union envelope (and the active
+	// clip's own box — see the auto-frame block below). Sticky on the renderer,
+	// but set at the load site so no path can drift.
+	g_model.setBoundsSweepAllClips(true);
 	if (!g_model.loadModel(path)) {
 		LOGE("ModelRenderer::loadModel failed for %s", path);
 		return false;
@@ -1439,6 +1444,10 @@ load_model_path(const char *path)
 	// distance from the scene extent so it starts at a comfortable size.
 	float ext[3] = {1.0f, 1.0f, 1.0f};
 	if (g_model.getRobustSceneBounds(0.05f, 0.95f, g_scene_center, ext)) {
+		// The UNION box centre, captured before the anchor / active-clip
+		// recentres below overwrite g_scene_center: its floor is the safety
+		// envelope the vertical clamp uses.
+		const float union_center_y = g_scene_center[1];
 		float maxe = ext[0] > ext[1] ? ext[0] : ext[1];
 		if (ext[2] > maxe) {
 			maxe = ext[2];
@@ -1495,12 +1504,63 @@ load_model_path(const char *path)
 				width_bound = true;
 			}
 		}
+		const char *fit_box = "union";
+
+		// Phase 2 of the 80% rule: when the model was loaded with the all-clips
+		// bounds sweep (every load path sets it), SIZE the rig from the ACTIVE
+		// clip's swept box — the subject as the user actually sees it — and keep
+		// the union box only as the safety envelope. Sizing off the union would
+		// shrink the subject by however far the widest/tallest OTHER clip
+		// reaches (a wave clip's raised arm, a walk clip's root travel), which
+		// reads as "the avatar loaded small and distant". A model with no clips,
+		// or one loaded without the sweep, keeps the union fit above unchanged.
+		// Same inlined 80% rule as above (displayxr-common's auto_fit.h is not
+		// reachable from the Android build).
+		float a_min[3], a_max[3];
+		if (g_model.getActiveClipBounds(a_min, a_max)) {
+			const float raw_w = a_max[0] - a_min[0];
+			const float raw_h = a_max[1] - a_min[1];
+			const float subj_w = (raw_w > 1e-5f) ? raw_w : 1e-5f;
+			const float subj_h = (raw_h > 1e-5f) ? raw_h : 1e-5f;
+			vh = subj_h / kAutoFitFill;
+			width_bound = false;
+			if (zone_w > 0.0f && zone_h > 0.0f) {
+				const float zone_aspect = zone_w / zone_h;
+				const float vh_for_width = subj_w / (kAutoFitFill * zone_aspect);
+				if (vh_for_width > vh) {
+					vh = vh_for_width;
+					width_bound = true;
+				}
+			}
+			fit_box = "active-clip";
+			g_scene_center[0] = 0.5f * (a_min[0] + a_max[0]);
+			g_scene_center[1] = 0.5f * (a_min[1] + a_max[1]);
+			g_scene_center[2] = 0.5f * (a_min[2] + a_max[2]);
+			// Clamp the vertical placement so the UNION floor stays in frame:
+			// the feet of whichever clip dips lowest must never truncate at the
+			// zone edge, even though the active clip decided the size. Note the
+			// #568 per-frame animated-anchor recentre in the render loop takes
+			// over from this load-time placement on the first animated frame —
+			// same division of labour as the Windows leg, where the recenter
+			// pins ride on top of the fit centre.
+			const float union_floor = union_center_y - 0.5f * ext[1];
+			const float pad = vh * 0.02f;
+			const float max_cy = union_floor - pad + 0.5f * vh;
+			const bool clamped = g_scene_center[1] > max_cy;
+			if (clamped) {
+				g_scene_center[1] = max_cy;
+			}
+			LOGI("auto-fit (active clip): subject=%.4fx%.4f centre=(%.3f,%.3f,%.3f) "
+			     "union_floor=%.4f max_cy=%.4f%s",
+			     subj_w, subj_h, g_scene_center[0], g_scene_center[1], g_scene_center[2],
+			     union_floor, max_cy, clamped ? " (clamped)" : "");
+		}
 		g_rig_vh = (vh > 1e-3f) ? vh : kTargetSize / kAutoFitFill;
 		LOGI("scene center=(%.2f,%.2f,%.2f) extent=(%.2f,%.2f,%.2f) push=%.2f "
-		     "rig_vh=%.2f (%s-bound, zone=%.0fx%.0f fill=%.2f)",
+		     "rig_vh=%.2f (%s box, %s-bound, zone=%.0fx%.0f fill=%.2f)",
 		     g_scene_center[0], g_scene_center[1], g_scene_center[2],
 		     ext[0], ext[1], ext[2], g_scene_push.load(std::memory_order_relaxed), g_rig_vh,
-		     width_bound ? "width" : "height", zone_w, zone_h, kAutoFitFill);
+		     fit_box, width_bound ? "width" : "height", zone_w, zone_h, kAutoFitFill);
 	}
 	g_scene_loaded.store(true, std::memory_order_relaxed);
 	return true;
