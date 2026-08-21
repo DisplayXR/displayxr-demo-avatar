@@ -55,7 +55,6 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import android.os.SystemClock
 import android.provider.Settings
 import android.view.Choreographer
 import android.view.Gravity
@@ -91,15 +90,6 @@ class MainActivity : NativeActivity() {
         // Ignore sub-fingertip jitter so an animating tiger doesn't ask for a
         // layout traversal every single frame.
         private const val REGION_EPS_PX = 8
-        // #67 silhouette shaping. Each applied width change recreates the
-        // swapchain (surfaceChanged), so the loop is heavily damped: poll at
-        // ~7 Hz, ignore anything inside a fingertip-and-a-half of the applied
-        // width, sit on a shrink for a second before believing it, and never
-        // resize faster than once a second.
-        private const val SHAPE_POLL_MS = 140L
-        private const val SHAPE_HYSTERESIS_PX = 72
-        private const val SHAPE_SHRINK_HOLD_MS = 1000L
-        private const val SHAPE_MIN_INTERVAL_MS = 900L
     }
 
     // Implemented in main.cpp. rotation = Surface.ROTATION_0/90/180/270 → 0/1/2/3.
@@ -136,12 +126,6 @@ class MainActivity : NativeActivity() {
     // #66: how wide this window should be, as a percentage of the screen's long
     // edge. 100 = full width (the pre-#66 behaviour).
     private external fun nativeGetSlabPercent(): Int
-
-    // #67: the overlay WIDTH that hugs Leo's silhouette ∪ the speech bubble, in
-    // px, given the full-band reference width and the frame's current size.
-    // -1 = no opinion (warmup, or debug.dxr.avatar.overlay.shape 0). Height is
-    // deliberately NOT driven — see the long note on the native side.
-    private external fun nativeGetOverlayWidthPx(refW: Int, curW: Int, curH: Int): Int
 
     // runtime#1110 click-through overlay mode: hand the runtime the Surface of
     // the WindowManager overlay we present into instead of the Activity's.
@@ -277,7 +261,6 @@ class MainActivity : NativeActivity() {
             if (!rectPollRunning) return
             sampleWindowRect()
             sampleTouchRegion()
-            sampleOverlayShape()
             Choreographer.getInstance().postFrameCallback(this)
         }
     }
@@ -531,7 +514,6 @@ class MainActivity : NativeActivity() {
             pushRotation()
             // Fires even while the Activity is stopped (overlay mode), which
             // onConfigurationChanged does not.
-            resetOverlayShape()
             resizeOverlay()
         }
         override fun onDisplayAdded(displayId: Int) {}
@@ -642,9 +624,8 @@ class MainActivity : NativeActivity() {
         return Point(w, h)
     }
 
-    private fun overlayLayoutParams(widthOverride: Int = -1): WindowManager.LayoutParams {
+    private fun overlayLayoutParams(): WindowManager.LayoutParams {
         val e = overlayExtent()
-        if (widthOverride in 1 until e.x) e.x = widthOverride
         val type = if (Build.VERSION.SDK_INT >= 26) {
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
         } else {
@@ -751,105 +732,13 @@ class MainActivity : NativeActivity() {
         }
     }
 
-    private fun resizeOverlay(widthOverride: Int = shapedWidth) {
+    private fun resizeOverlay() {
         val root = overlayRoot ?: return
         try {
-            overlayWindowManager.updateViewLayout(root, overlayLayoutParams(widthOverride))
+            overlayWindowManager.updateViewLayout(root, overlayLayoutParams())
         } catch (t: Throwable) {
             android.util.Log.w(TAG, "overlay resize failed", t)
         }
-    }
-
-    // ----------------------------------------------- #67 silhouette shaping
-    //
-    // Narrow the overlay onto Leo so the dead margin stops eating taps. Only the
-    // WIDTH moves; the native side explains why height would collapse and width
-    // cannot (metres-per-pixel is rig_vh / zone_height, so width is not in the
-    // loop, and a centred frame makes the half-extent invariant under its own
-    // resize).
-    //
-    // Every applied change costs a surfaceChanged -> new buffer queue -> swapchain
-    // recreate, i.e. a visible hitch, so the policy is deliberately sticky:
-    // GROW immediately (never clip Leo, even for one frame) but SHRINK only after
-    // the narrower value has held continuously for kShapeShrinkHoldMs, and never
-    // resize more often than kShapeMinIntervalMs. Leo idles, so in practice this
-    // settles a second or two after launch and then stays put.
-    private var shapedWidth = -1
-    private var shapeRefW = -1
-    private var shapeRefH = -1
-    private var shapeShrinkSinceMs = 0L
-    private var shapeShrinkCandidate = -1
-    private var shapeLastApplyMs = 0L
-    private var shapeLastPollMs = 0L
-
-    private fun sampleOverlayShape() {
-        if (!overlayActive) return
-        val root = overlayRoot ?: return
-        val now = SystemClock.uptimeMillis()
-        if (now - shapeLastPollMs < SHAPE_POLL_MS) return
-        shapeLastPollMs = now
-
-        val curW = root.width
-        val curH = root.height
-        if (curW <= 0 || curH <= 0) return
-        val refW = overlayExtent().x
-        if (refW <= 0) return
-
-        val want = try {
-            nativeGetOverlayWidthPx(refW, curW, curH)
-        } catch (_: Throwable) {
-            -1
-        }
-        if (want <= 0) return
-
-        val applied = if (shapedWidth > 0) shapedWidth else refW
-        if (kotlin.math.abs(want - applied) < SHAPE_HYSTERESIS_PX) {
-            shapeShrinkCandidate = -1
-            return
-        }
-        if (want > applied) {
-            // Grow: immediate, and it also cancels any pending shrink.
-            shapeShrinkCandidate = -1
-        } else {
-            if (shapeShrinkCandidate < 0 ||
-                kotlin.math.abs(want - shapeShrinkCandidate) >= SHAPE_HYSTERESIS_PX
-            ) {
-                shapeShrinkCandidate = want
-                shapeShrinkSinceMs = now
-                return
-            }
-            if (now - shapeShrinkSinceMs < SHAPE_SHRINK_HOLD_MS) return
-        }
-        if (now - shapeLastApplyMs < SHAPE_MIN_INTERVAL_MS) return
-
-        shapedWidth = want
-        shapeShrinkCandidate = -1
-        shapeLastApplyMs = now
-        android.util.Log.i(TAG, "#67 overlay shape: width $applied -> $want (ref $refW, h $curH)")
-        resizeOverlay(want)
-    }
-
-    /**
-     * Drop back to the full band and re-derive from scratch, but ONLY when the
-     * reference extent actually moved.
-     *
-     * The guard is load-bearing, not defensive. `onDisplayChanged` fires for
-     * anything the display does, and this panel hops between its 60/90/120/144 Hz
-     * modes on its own — resetting on every callback bounced the frame
-     * 800 -> 1200 -> 800 every six seconds, one swapchain recreate each way
-     * (measured 2026-08-21). And a plain rotation is deliberately NOT a reset:
-     * overlayExtent() keys off the panel's SHORT edge, so the frame — and Leo
-     * inside it — is the same size in both orientations, which makes the width
-     * we already settled on still the right one.
-     */
-    private fun resetOverlayShape() {
-        val e = overlayExtent()
-        if (e.x == shapeRefW && e.y == shapeRefH) return
-        shapeRefW = e.x
-        shapeRefH = e.y
-        shapedWidth = -1
-        shapeShrinkCandidate = -1
-        shapeLastApplyMs = SystemClock.uptimeMillis()
     }
 
     private fun stopOverlayMode() {
@@ -954,7 +843,6 @@ class MainActivity : NativeActivity() {
         if (!overlayActive) applySlabWidth()
         // The overlay is sized in panel px, so a rotation changes it — and an
         // overlay window gets no layout pass out of the rotation on its own.
-        resetOverlayShape()
         resizeOverlay()
     }
 

@@ -157,96 +157,84 @@ misinterpreted. What is blocked is only cross-uid pass-through to the desktop.
 
 ---
 
-## Update, 2026-08-21 — the residual bounding box, and how it shrank (#67)
+## Update, 2026-08-21 — the tight overlay works; shrinking it onto Leo does not (#67, reverted)
 
-Both hypotheses above have since been *measured*, and the picture changed:
+Two things have since been *measured*, and they point opposite ways.
 
-* The tight-overlay route **works** (runtime#1110 §4, shipped in #66): a
-  touchable, tight, no-foreground-Activity `TYPE_APPLICATION_OVERLAY` gets
-  `alpha=1.00` *and* click-through with zero grants. Two corrections to the text
-  above: the 0.80 was **not** only self-imposed — the platform clamps a
-  `FLAG_NOT_TOUCHABLE` app overlay, so being *touchable* is what kills the ghost;
-  and `moveTaskToBack(true)` is enough to make the Activity's sink inert, so the
-  Activity need not be gone.
-* Per-pixel is still dead: `TOUCHABLE_INSETS_REGION` is blocklisted for **overlay
-  windows too** — the blocklist is per-API, not per-window-type. So an overlay's
-  touchable region is exactly its **frame**, and "shape the region to the
-  silhouette" can only mean "shrink the frame onto the silhouette".
+**The tight-overlay route works** (runtime#1110 §4, shipped in #66). A touchable,
+tight, no-foreground-Activity `TYPE_APPLICATION_OVERLAY` gets `alpha=1.00` *and*
+click-through with zero grants. Two corrections to the text above: the 0.80 was
+**not** only self-imposed — the platform clamps a `FLAG_NOT_TOUCHABLE` app
+overlay, so being *touchable* is what kills the ghost; and `moveTaskToBack(true)`
+is enough to make the Activity's sink inert, so the Activity need not be gone.
 
-That is what #67 does, and the interesting part is why it is safe.
+**Per-pixel shaping is still dead.** `TOUCHABLE_INSETS_REGION` is blocklisted for
+**overlay windows too** — the blocklist is per-API, not per-window-type. An
+overlay's touchable region is exactly its **frame**.
 
-### Width is free; height is not
+That leaves only "shrink the frame onto the silhouette", which #67 implemented and
+which was **reverted the same night**. It is worth recording precisely why,
+because the failure is structural and any retry will hit it again.
 
-Under Architecture A the frame **is** the canvas, so resizing it feeds straight
-back into what we render — the collapse this repo already documents for
-`canvasRectPx`. But the two axes are not alike:
+### Width is NOT free — the speech bubble puts it back in the loop
 
-`render_frame` chains `XrDisplayRigDXR.virtualDisplayHeight = rig_vh`, and
-`rig_vh` comes from the **model's** extent, never from the canvas. The runtime
-frames the zone rect to that many metres of world height, so metres-per-pixel is
-`rig_vh / zone_height`:
+#67's safety argument was that only the HEIGHT axis feeds back. That is true *for
+Leo*: `render_frame` chains `XrDisplayRigDXR.virtualDisplayHeight = rig_vh`, and
+`rig_vh` comes from the **model's** extent, so metres-per-pixel is
+`rig_vh / zone_height` — a function of height alone. Leo really is invariant under
+a width change (measured: a 1200 → 800 px frame moved his bbox from
+`308,460 600x1096` to `108,464 596x1092`).
 
-* shrink the **height** → Leo shrinks by the same factor → his bbox shrinks →
-  the next height shrinks → collapse. **Never touched.**
-* shrink the **width** at constant height → only the horizontal extent of the
-  off-axis frustum changes. Leo keeps his pixel size *and* his position on the
-  panel.
+The argument does not cover the **speech bubble**, and the bubble is the whole
+problem. The bubble is a Local2D layer whose rect is a straight fraction of the
+canvas **pixel width**:
 
-Measured on the reference NP02J, 1200 px → 800 px frame width:
-`silhouette bbox: 308,460 600x1096` → `108,464 596x1092`. Leo is invariant to
-within the ~10 Hz sampling jitter.
-
-The driver is also invariant under its own output. The frame is centred, so a
-width change of `dw` moves the origin by `-dw/2` and grows the canvas by `dw`;
-the half-extent measured from the frame **centre**, `|bbox_edge - curW/2|`, does
-not move. It converges in one step rather than asymptotically, and cannot walk
-the frame off Leo. The speech bubble is unioned in (it is ours to tap) and is a
-contraction too — its own width is ~0.47 of the canvas, so it can never demand a
-frame wider than itself.
-
-### What it costs, and the damping
-
-Every applied change is a `surfaceChanged` → new buffer queue → swapchain
-recreate, i.e. a visible hitch. So the policy is deliberately sticky: **grow
-immediately** (never clip Leo, even for a frame), **shrink only** after the
-narrower value has held a second, and never resize twice inside 900 ms. In
-practice it settles once, a second or so after launch, and then stays put.
-
-Two traps found while building it:
-
-* `onDisplayChanged` fires for **refresh-rate** switches, and this panel hops
-  60/90/120/144 Hz on its own. Resetting the shaper there bounced the frame
-  800→1200→800 every six seconds. It now resets only when the reference extent
-  really moved.
-* A plain rotation is deliberately **not** a reset: `overlayExtent()` keys off
-  the panel's short edge, so the frame — and Leo in it — is the same size in both
-  orientations, and the settled width is still right.
-
-### Result
-
-Reference NP02J, portrait: frame `[0,680][1600,1880]` → `[384,960][1216,2560]`,
-i.e. 1200×1600 → 832×1600, **31 % less screen eaten**, and the horizontal dead
-margin around Leo drops from ~600 px to ~230 px. `alpha=1.00`, `USE_OPACITY`, no
-`ActivityRecordInputSink`. A tap at panel (210, 1645) — inside the old band, dead
-before — opens App Center with no `Untrusted touch` line; a drag on Leo still
-drives Leo and the launcher does not see it.
-
-The knob, live, no rebuild:
-
-```bash
-adb shell setprop debug.dxr.avatar.overlay.shape 0   # back to the full band
+```c
+const uint32_t cw = g_win_px_w.load(...);          // the overlay window's px width
+float bwf = (float)cw * (0.70f * 2.0f / 3.0f);     // = 0.4667 * cw
+float bhf = bwf * bubble_aspect;                   // aspect = 384/1024
 ```
 
-### What is still eaten, and the only route to per-pixel
+So the bubble is (a) **sized from** the frame width and (b) **an input to** the
+width driver, which unions its rect in. Both halves of a feedback loop. Solving
+the bubble-only fixed point of `want = 2*(0.4667*cw/2 + 0.05*curH)` gives
+`cw ≈ 300` — it collapses to the `kShapeMinFrac` floor. Only Leo's bbox holds the
+frame open, so on any frame where `g_sil.bbox_valid` is false — including the
+surfaceChanged transient the resize itself causes — the frame dives.
 
-The residual is the **union rectangle** of Leo ∪ the bubble, so the transparent
-corners inside that rectangle still swallow taps. One rect cannot do better,
-because the platform gives an overlay exactly one touchable rect.
+### What that produced on the reference NP02J
 
-Getting true silhouette precision on stock needs a second, consent-gated
-mechanism: an in-app `AccessibilityService` that re-dispatches a tap the app
-knows landed on a transparent pixel (`sil_hit` already answers that question,
-from scene geometry, with no readback). Designed and tracked in
-displayxr-runtime#1114. It costs a one-time accessibility toggle by the user and
-~50-100 ms of forwarded-tap latency, which is why it is a *tier B* opt-in rather
-than the default.
+With grow-immediate / shrink-held-1 s, the loop does not settle, it **oscillates**.
+Measured over 24 s of an idle Leo, 10 applied resizes:
+
+```
+1200 -> 736 -> 896 -> 992 -> 1088 -> 768 -> 928 -> 1056 -> 896 -> 992 -> 1088
+```
+
+Three user-visible symptoms, all one storm:
+
+* **Flicker.** Every applied width change is `surfaceChanged` → new buffer queue →
+  swapchain recreate. A screencap taken mid-oscillation shows Leo **entirely
+  absent**. The "one resize, one hitch" reasoning held for a single resize, not a
+  stream of them.
+* **Minuscule speech bubble.** Direct first-order consequence of `bw = 0.4667*cw`:
+  1200 px → 560 px wide, 832 px → 388 px, and at the 408 px floor → **190 px**,
+  under a tenth of the original area.
+* **Black fringes.** `AG_GEO` re-derives strip + framebuffer + viewport from the
+  frame on every change (`target=1200x1600` → `736x1600` → `896x1600` → …). The T2
+  backdrop re-crop is asynchronous, so between the resize and the re-crop the gate
+  runs against a stale backdrop and the fresh swapchain edges read black. Because
+  the frame never stops moving, that transient is permanent.
+
+### If this is retried
+
+The bbox driving the frame must be **pose-independent** — the model's scene-space
+footprint at the current dolly, which changes only on a deliberate user
+interaction — not a live projection that jitters with head tracking, and not
+anything that is itself sized from the frame. Concretely: give the bubble a
+width-invariant size (derive it from the canvas HEIGHT, which is already fixed, or
+from a scene-space extent) *before* re-attempting any width shaping, and damp
+GROW as well as SHRINK so no single jitter spike can trigger a resize.
+
+True per-pixel shaping still needs the consent-gated AccessibilityService route
+designed in displayxr-runtime#1114.
