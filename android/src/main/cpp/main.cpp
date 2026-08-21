@@ -12,6 +12,7 @@
 #include <android/asset_manager_jni.h>
 #include <android/input.h>
 #include <android/log.h>
+#include <android/native_window_jni.h>
 #include <android_native_app_glue.h>
 
 #define XR_USE_PLATFORM_ANDROID
@@ -254,6 +255,27 @@ PFN_xrSetAndroidWindowGeometryDXR g_pfnSetAndroidWindowGeometry = nullptr;
 // The window this app currently owns; the android_main thread publishes it and
 // the frame loop consumes it, hence the atomic.
 std::atomic<ANativeWindow *> g_app_window{nullptr};
+
+// ── Click-through overlay mode (runtime#1110) ────────────────────────────────
+//
+// In overlay mode the window we present into is NOT the Activity's — it is a
+// tight, full-opacity, TOUCHABLE TYPE_APPLICATION_OVERLAY the app adds through
+// WindowManager, with the Activity moved out of the foreground task. Measured on
+// an NP02J (Android 13, stock): such a window is the *touched* window inside its
+// own frame, so the untrusted-touch opacity policy is never consulted for it
+// (alpha stays 1.00 — a FLAG_NOT_TOUCHABLE overlay is clamped to 0.80 by the
+// platform, which is where the old ghost came from), and a tap OUTSIDE its frame
+// reaches the launcher normally because occlusion is evaluated at the touch point
+// against obscuring FRAMES. The Activity must genuinely leave the foreground task
+// or its display-wide ActivityRecordInputSink eats the fall-through.
+//
+// Window type is orthogonal to the handoff class: XR_DXR_android_surface_binding
+// takes any ANativeWindow, so everything #1063 bought is kept.
+std::atomic<bool> g_overlay_mode{false};
+// Set from the UI thread (JNI), drained on the android_main thread: OpenXR/Vulkan
+// bring-up and the vendor face tracker's looper must stay on the render thread.
+std::atomic<ANativeWindow *> g_pending_window{nullptr};
+std::atomic<bool> g_pending_window_valid{false};
 
 // Live window geometry, sampled on the UI thread by MainActivity's Choreographer
 // callback (Android reports a pure window MOVE to nobody else) and consumed once
@@ -2158,57 +2180,79 @@ destroy_all()
 	}
 }
 
+// A window we present into arrived (or went away). Called ONLY from the
+// android_main thread: either from APP_CMD_INIT_WINDOW/TERM_WINDOW (the
+// Activity's own window) or from the pending-window drain in android_main (the
+// #1110 overlay window, handed over from the UI thread via JNI). First non-null
+// window runs the whole bring-up chain; later ones are republishes.
+void
+on_present_window(struct android_app *app, ANativeWindow *win)
+{
+#ifdef AVATAR_HAVE_ANDROID_SURFACE_BINDING
+	// Publish OUR window (#1063). Before the bring-up chain on first launch
+	// (create_session chains it); after it on every resume, where it goes out
+	// as xrSetAndroidSurfaceDXR so the runtime rebuilds its VkSurfaceKHR and
+	// the DP resumes.
+	publish_app_surface(win);
+#else
+	(void)win;
+#endif
+	if (win != nullptr && g_instance == XR_NULL_HANDLE) {
+		bool ok =
+		    create_instance(app) &&
+		    query_system_and_graphics_reqs() &&
+		    create_vulkan_instance() &&
+		    pick_physical_device() &&
+		    create_vulkan_device() &&
+		    create_session() &&
+		    // Enumerate modes BEFORE create_swapchains so the worst-case tile
+		    // (g_worst_tile_edge) + per-mode scales are known when the (never-
+		    // reallocated) swapchain is sized. (multiview-tiling invariant.)
+		    enumerate_rendering_modes() &&
+		    create_swapchains() &&
+		    create_reference_space() &&
+		    gs_init() &&
+		    load_model_index(app, 0);
+		if (ok && g_has_local_3d_zone) {
+			// #568 speech bubble (Local2D layer in the top-25% band). Non-fatal:
+			// on failure the bubble simply doesn't draw. Rasterized once here.
+			if (hud_bar_init(g_bubble, g_session, g_vk_phys_device, g_vk_device,
+			                 g_vk_queue, g_vk_queue_family, g_swapchain_format,
+			                 kBubbleTexW, kBubbleTexH, 56.0f)) {
+				hud_bar_render_bubble(g_bubble, kBubbleText);
+				hud_bar_upload(g_bubble, 1.0f);
+				LOGI("#568 speech bubble ready (%ux%u)", kBubbleTexW, kBubbleTexH);
+			}
+		}
+		LOGI(ok ? "Bring-up complete." : "Bring-up failed; see logs.");
+	}
+}
+
 void
 handle_cmd(struct android_app *app, int32_t cmd)
 {
 	switch (cmd) {
 	case APP_CMD_INIT_WINDOW:
-		LOGI("APP_CMD_INIT_WINDOW (window=%p)", app->window);
-#ifdef AVATAR_HAVE_ANDROID_SURFACE_BINDING
-		// Publish OUR window (#1063). Before the bring-up chain on first launch
-		// (create_session chains it); after it on every resume, where it goes out
-		// as xrSetAndroidSurfaceDXR so the runtime rebuilds its VkSurfaceKHR and
-		// the DP resumes.
-		publish_app_surface(app->window);
-#endif
-		if (g_instance == XR_NULL_HANDLE) {
-			bool ok =
-			    create_instance(app) &&
-			    query_system_and_graphics_reqs() &&
-			    create_vulkan_instance() &&
-			    pick_physical_device() &&
-			    create_vulkan_device() &&
-			    create_session() &&
-			    // Enumerate modes BEFORE create_swapchains so the worst-case tile
-			    // (g_worst_tile_edge) + per-mode scales are known when the (never-
-			    // reallocated) swapchain is sized. (multiview-tiling invariant.)
-			    enumerate_rendering_modes() &&
-			    create_swapchains() &&
-			    create_reference_space() &&
-			    gs_init() &&
-			    load_model_index(app, 0);
-			if (ok && g_has_local_3d_zone) {
-				// #568 speech bubble (Local2D layer in the top-25% band). Non-fatal:
-				// on failure the bubble simply doesn't draw. Rasterized once here.
-				if (hud_bar_init(g_bubble, g_session, g_vk_phys_device, g_vk_device,
-				                 g_vk_queue, g_vk_queue_family, g_swapchain_format,
-				                 kBubbleTexW, kBubbleTexH, 56.0f)) {
-					hud_bar_render_bubble(g_bubble, kBubbleText);
-					hud_bar_upload(g_bubble, 1.0f);
-					LOGI("#568 speech bubble ready (%ux%u)", kBubbleTexW, kBubbleTexH);
-				}
-			}
-			LOGI(ok ? "Bring-up complete." : "Bring-up failed; see logs.");
+		LOGI("APP_CMD_INIT_WINDOW (window=%p, overlay_mode=%d)", app->window,
+		     (int)g_overlay_mode.load(std::memory_order_acquire));
+		// #1110 overlay mode: the Activity's window is NOT what we present into
+		// (and it goes away entirely once the Activity leaves the foreground
+		// task), so ignore it. The overlay's Surface arrives via JNI instead.
+		if (!g_overlay_mode.load(std::memory_order_acquire)) {
+			on_present_window(app, app->window);
 		}
 		break;
 	case APP_CMD_TERM_WINDOW:
-		LOGI("APP_CMD_TERM_WINDOW");
-#ifdef AVATAR_HAVE_ANDROID_SURFACE_BINDING
+		LOGI("APP_CMD_TERM_WINDOW (overlay_mode=%d)",
+		     (int)g_overlay_mode.load(std::memory_order_acquire));
 		// Surface lost. Tell the runtime BEFORE native_app_glue frees it, so
 		// nothing presents into a dead window and the DP pauses (releasing its
-		// 3D-lens vote, ADR-036 D7) instead of holding the panel.
-		publish_app_surface(nullptr);
-#endif
+		// 3D-lens vote, ADR-036 D7) instead of holding the panel. In overlay mode
+		// this fires when the Activity backgrounds and must NOT tear down the
+		// live overlay surface.
+		if (!g_overlay_mode.load(std::memory_order_acquire)) {
+			on_present_window(app, nullptr);
+		}
 		break;
 	case APP_CMD_DESTROY:
 		LOGI("APP_CMD_DESTROY");
@@ -2242,6 +2286,58 @@ Java_com_displayxr_avatar_1vk_1android_MainActivity_nativeXrReady(
 {
 	return (g_instance != XR_NULL_HANDLE) ? JNI_TRUE : JNI_FALSE;
 }
+
+// Read an int system property from Java. android.os.SystemProperties is a hidden
+// API the reflection blocklist can (and does) refuse, so the Kotlin side asks the
+// native lib -- which already reads props this way for debug.dxr.mode -- instead
+// of reflecting.
+extern "C" JNIEXPORT jint JNICALL
+Java_com_displayxr_avatar_1vk_1android_MainActivity_nativeGetIntProp(
+    JNIEnv *env, jobject /*thiz*/, jstring name, jint def)
+{
+	if (name == nullptr) return def;
+	const char *n = env->GetStringUTFChars(name, nullptr);
+	if (n == nullptr) return def;
+	char prop[PROP_VALUE_MAX] = {0};
+	jint out = def;
+	if (__system_property_get(n, prop) > 0 && prop[0] != '\0') {
+		out = (jint)atoi(prop);
+	}
+	env->ReleaseStringUTFChars(name, n);
+	return out;
+}
+
+#ifdef AVATAR_HAVE_ANDROID_SURFACE_BINDING
+// runtime#1110: hand over the click-through overlay's Surface. Called on the UI
+// thread from MainActivity's SurfaceHolder.Callback, so it does NOT touch OpenXR
+// -- it only parks the ANativeWindow for the android_main thread to pick up (the
+// bring-up chain and the vendor face tracker's looper both belong there).
+//
+// Ownership: ANativeWindow_fromSurface returns a NEW strong reference we own; the
+// previous one is released once the render thread has stopped using it (it drains
+// the slot before we can be called again with a different window, because both
+// hand-overs come from the same UI thread and the drain publishes synchronously).
+// The Java side ALSO keeps the SurfaceView alive for as long as the window is
+// published -- runtime#1040: a Surface with no Java reference is finalized and
+// takes the native window's refcount with it.
+extern "C" JNIEXPORT void JNICALL
+Java_com_displayxr_avatar_1vk_1android_MainActivity_nativeSetOverlaySurface(
+    JNIEnv *env, jobject /*thiz*/, jobject surface)
+{
+	ANativeWindow *win = nullptr;
+	if (surface != nullptr) {
+		win = ANativeWindow_fromSurface(env, surface);
+	}
+	g_overlay_mode.store(true, std::memory_order_release);
+	ANativeWindow *prev = g_pending_window.exchange(win, std::memory_order_acq_rel);
+	g_pending_window_valid.store(true, std::memory_order_release);
+	if (prev != nullptr && prev != win) {
+		// Superseded before the render thread ever saw it.
+		ANativeWindow_release(prev);
+	}
+	LOGI("nativeSetOverlaySurface(%p) queued", (void *)win);
+}
+#endif
 
 
 // Touch bridge, fed from Java. Architecture A (#1063): we own our window, so
@@ -2471,6 +2567,20 @@ android_main(struct android_app *app)
 				return;
 			}
 		}
+#ifdef AVATAR_HAVE_ANDROID_SURFACE_BINDING
+		// #1110 overlay mode: pick up a Surface handed over by the UI thread.
+		// Read the flag FIRST -- a null window is a legitimate value (the overlay
+		// view was detached), so the flag, not the pointer, says "there is news".
+		if (g_pending_window_valid.exchange(false, std::memory_order_acquire)) {
+			static ANativeWindow *owned = nullptr;
+			ANativeWindow *win = g_pending_window.exchange(nullptr, std::memory_order_acq_rel);
+			on_present_window(app, win);
+			if (owned != nullptr && owned != win) {
+				ANativeWindow_release(owned);
+			}
+			owned = win;
+		}
+#endif
 		if (g_instance != XR_NULL_HANDLE) {
 			poll_xr_events();
 			if (g_exit_requested) {
@@ -2509,7 +2619,17 @@ android_main(struct android_app *app)
 			// missing window means there is nothing to render into -- full stop.
 			// (The old #558 overlay path kept rendering with no window because the
 			// runtime owned a service overlay surface; that path is gone.)
-			if (g_session_running && app->window != nullptr) {
+			//
+			// #1110: gate on the window we actually PRESENT into, which in overlay
+			// mode is the WindowManager overlay, not the Activity's (the latter is
+			// destroyed the moment the Activity leaves the foreground task, which
+			// is exactly the state click-through requires).
+#ifdef AVATAR_HAVE_ANDROID_SURFACE_BINDING
+			ANativeWindow *present_win = g_app_window.load(std::memory_order_acquire);
+#else
+			ANativeWindow *present_win = app->window;
+#endif
+			if (g_session_running && present_win != nullptr) {
 				render_frame();
 			}
 		}
