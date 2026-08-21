@@ -154,3 +154,99 @@ hypothesis to test, not as a result.
 In-app input is unaffected and correct: taps on the tiger drive it, taps
 elsewhere in our window are ignored by the gesture gate (`sil_hit`) rather than
 misinterpreted. What is blocked is only cross-uid pass-through to the desktop.
+
+---
+
+## Update, 2026-08-21 — the residual bounding box, and how it shrank (#67)
+
+Both hypotheses above have since been *measured*, and the picture changed:
+
+* The tight-overlay route **works** (runtime#1110 §4, shipped in #66): a
+  touchable, tight, no-foreground-Activity `TYPE_APPLICATION_OVERLAY` gets
+  `alpha=1.00` *and* click-through with zero grants. Two corrections to the text
+  above: the 0.80 was **not** only self-imposed — the platform clamps a
+  `FLAG_NOT_TOUCHABLE` app overlay, so being *touchable* is what kills the ghost;
+  and `moveTaskToBack(true)` is enough to make the Activity's sink inert, so the
+  Activity need not be gone.
+* Per-pixel is still dead: `TOUCHABLE_INSETS_REGION` is blocklisted for **overlay
+  windows too** — the blocklist is per-API, not per-window-type. So an overlay's
+  touchable region is exactly its **frame**, and "shape the region to the
+  silhouette" can only mean "shrink the frame onto the silhouette".
+
+That is what #67 does, and the interesting part is why it is safe.
+
+### Width is free; height is not
+
+Under Architecture A the frame **is** the canvas, so resizing it feeds straight
+back into what we render — the collapse this repo already documents for
+`canvasRectPx`. But the two axes are not alike:
+
+`render_frame` chains `XrDisplayRigDXR.virtualDisplayHeight = rig_vh`, and
+`rig_vh` comes from the **model's** extent, never from the canvas. The runtime
+frames the zone rect to that many metres of world height, so metres-per-pixel is
+`rig_vh / zone_height`:
+
+* shrink the **height** → Leo shrinks by the same factor → his bbox shrinks →
+  the next height shrinks → collapse. **Never touched.**
+* shrink the **width** at constant height → only the horizontal extent of the
+  off-axis frustum changes. Leo keeps his pixel size *and* his position on the
+  panel.
+
+Measured on the reference NP02J, 1200 px → 800 px frame width:
+`silhouette bbox: 308,460 600x1096` → `108,464 596x1092`. Leo is invariant to
+within the ~10 Hz sampling jitter.
+
+The driver is also invariant under its own output. The frame is centred, so a
+width change of `dw` moves the origin by `-dw/2` and grows the canvas by `dw`;
+the half-extent measured from the frame **centre**, `|bbox_edge - curW/2|`, does
+not move. It converges in one step rather than asymptotically, and cannot walk
+the frame off Leo. The speech bubble is unioned in (it is ours to tap) and is a
+contraction too — its own width is ~0.47 of the canvas, so it can never demand a
+frame wider than itself.
+
+### What it costs, and the damping
+
+Every applied change is a `surfaceChanged` → new buffer queue → swapchain
+recreate, i.e. a visible hitch. So the policy is deliberately sticky: **grow
+immediately** (never clip Leo, even for a frame), **shrink only** after the
+narrower value has held a second, and never resize twice inside 900 ms. In
+practice it settles once, a second or so after launch, and then stays put.
+
+Two traps found while building it:
+
+* `onDisplayChanged` fires for **refresh-rate** switches, and this panel hops
+  60/90/120/144 Hz on its own. Resetting the shaper there bounced the frame
+  800→1200→800 every six seconds. It now resets only when the reference extent
+  really moved.
+* A plain rotation is deliberately **not** a reset: `overlayExtent()` keys off
+  the panel's short edge, so the frame — and Leo in it — is the same size in both
+  orientations, and the settled width is still right.
+
+### Result
+
+Reference NP02J, portrait: frame `[0,680][1600,1880]` → `[384,960][1216,2560]`,
+i.e. 1200×1600 → 832×1600, **31 % less screen eaten**, and the horizontal dead
+margin around Leo drops from ~600 px to ~230 px. `alpha=1.00`, `USE_OPACITY`, no
+`ActivityRecordInputSink`. A tap at panel (210, 1645) — inside the old band, dead
+before — opens App Center with no `Untrusted touch` line; a drag on Leo still
+drives Leo and the launcher does not see it.
+
+The knob, live, no rebuild:
+
+```bash
+adb shell setprop debug.dxr.avatar.overlay.shape 0   # back to the full band
+```
+
+### What is still eaten, and the only route to per-pixel
+
+The residual is the **union rectangle** of Leo ∪ the bubble, so the transparent
+corners inside that rectangle still swallow taps. One rect cannot do better,
+because the platform gives an overlay exactly one touchable rect.
+
+Getting true silhouette precision on stock needs a second, consent-gated
+mechanism: an in-app `AccessibilityService` that re-dispatches a tap the app
+knows landed on a transparent pixel (`sil_hit` already answers that question,
+from scene geometry, with no readback). Designed and tracked in
+displayxr-runtime#1114. It costs a one-time accessibility toggle by the user and
+~50-100 ms of forwarded-tap latency, which is why it is a *tier B* opt-in rather
+than the default.
