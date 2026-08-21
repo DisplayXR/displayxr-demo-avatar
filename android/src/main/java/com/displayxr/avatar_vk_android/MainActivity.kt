@@ -593,8 +593,30 @@ class MainActivity : NativeActivity() {
     // canvas it gets, so this is purely how much desktop we leave clickable.
     private val overlayAspect = 0.75f
 
+    // #1110 rotation fix: an application context never receives configuration
+    // updates, so a window added through its WindowManager stays anchored to the
+    // boot-time display rotation — after a rotate, SF composites the stale-framed
+    // portrait buffer through a transform every frame (whole-window flicker). A
+    // window context (API 30+) tracks the display configuration, so WM re-lays
+    // the overlay out on rotation. Pre-30 keeps the old behaviour.
+    private var overlayWindowContextCache: Context? = null
+    private val overlayWindowContext: Context
+        get() {
+            overlayWindowContextCache?.let { return it }
+            val ctx = if (Build.VERSION.SDK_INT >= 30) {
+                val dm = getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
+                val display = dm.getDisplay(android.view.Display.DEFAULT_DISPLAY)
+                applicationContext.createDisplayContext(display)
+                    .createWindowContext(WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY, null)
+            } else {
+                applicationContext
+            }
+            overlayWindowContextCache = ctx
+            return ctx
+        }
+
     private val overlayWindowManager: WindowManager
-        get() = applicationContext.getSystemService(Context.WINDOW_SERVICE) as WindowManager
+        get() = overlayWindowContext.getSystemService(Context.WINDOW_SERVICE) as WindowManager
 
     /**
      * Overlay size in px: a 3:4 box whose HEIGHT is the panel's short edge, scaled
@@ -677,7 +699,7 @@ class MainActivity : NativeActivity() {
         if (nativeGetIntProp("debug.dxr.avatar.overlay", 1) == 0) return false
         if (!Settings.canDrawOverlays(this)) return false
 
-        val sv = SurfaceView(this).apply {
+        val sv = SurfaceView(overlayWindowContext).apply {
             // Above the (empty) host window, and alpha-blended against whatever is
             // behind the overlay — this is what lets the desktop show through
             // around Leo at full opacity.
@@ -687,7 +709,7 @@ class MainActivity : NativeActivity() {
         }
         // A SurfaceView needs a real ViewParent: added bare it trips
         // requestTransparentRegion on a null parent (SurfaceView.java:294).
-        val root = FrameLayout(this).apply {
+        val root = FrameLayout(overlayWindowContext).apply {
             addView(
                 sv,
                 FrameLayout.LayoutParams(
