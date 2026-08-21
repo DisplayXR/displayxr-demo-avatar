@@ -33,6 +33,7 @@
 #include <openxr/XR_DXR_view_rig.h>       // XrDisplayRigDXR locate + XrViewDisplayRawDXR readback
 #include "display3d_view.h"
 #include "projection_depth.h"
+#include "auto_fit.h"       // dxr::AutoFitVHeight — shared load-time framing rule
 
 #include "hud_renderer.h"   // HudRenderer + text_overlay (RenderFilledRect/RenderText) — drive the speech bubble
 #include "atlas_capture.h"
@@ -258,6 +259,11 @@ static XrSessionManager* g_xr = nullptr;
 // Size = user-tuned on the 3840x2160 Leia panel (measured client area).
 static UINT g_windowWidth = 811;
 static UINT g_windowHeight = 1421;
+// The app window, published by CreateAppWindow. Auto-fit reads the LIVE client
+// rect from it: g_windowWidth/Height only become authoritative once WM_SIZE has
+// landed on the message thread, and the startup auto-load runs right after
+// creation. nullptr (pre-creation) falls back to the tracked dims.
+static HWND g_appWindow = nullptr;
 
 // 3DGS state
 static ModelRenderer g_modelRenderer;
@@ -322,11 +328,9 @@ static std::vector<XrSwapchainImageVulkanKHR> g_animBtnSwapImages;
 // Fallback vHeight when no scene is loaded or auto-fit hits a degenerate
 // extent. Matches macOS demo's kDefaultVirtualDisplayHeightM (1.5m).
 static constexpr float kFallbackVirtualDisplayHeightM = 1.5f;
-// Initial virtual-display height as a multiple of the avatar's height. The
-// avatar should occupy 90% of the virtual-display (i.e. its bottom-75% canvas)
-// height at start, so vHeight = modelHeight / 0.90 = modelHeight × 1.111 → 5%
-// headroom top and bottom.
-static constexpr float kAutoFitVerticalComfort = 1.111f;
+// Initial framing comes from the shared rule in displayxr-common's auto_fit.h:
+// vHeight = max(H, W / zoneAspect) / dxr::kAutoFitDefaultFill, so the avatar caps
+// at 80% of the 3D zone in BOTH axes.
 
 // Cached auto-fit pose for the currently loaded scene. Reused by Reset
 // so 'Space' returns to the framed pose rather than world origin.
@@ -369,7 +373,45 @@ static void ApplyAutoFitForLoadedScene_locked() {
         g_fitCenter[0] = center[0];
         g_fitCenter[1] = center[1];
         g_fitCenter[2] = center[2];
-        float vh = extent[1] * kAutoFitVerticalComfort;
+        // Fit the WIDTH as well as the height (displayxr-common auto_fit.h):
+        // vHeight is the VIRTUAL DISPLAY height, so a larger value renders the
+        // model smaller and taking the binding axis crops nothing. A T-pose
+        // humanoid is nearly square while the zone is portrait, so a height-only
+        // fit let its arms clip at the zone edge.
+        //
+        // The viewport is the 3D ZONE, not the client window: the model renders
+        // into the zone swapchain and the zone rect IS the bottom
+        // (1 - TOAST_BAND_BOTTOM) of the client rect (see the zones path in the
+        // render loop) — the top band is the Local2D speech bubble and never
+        // holds model pixels. Using the window aspect here would over-shrink by
+        // exactly 1/(1 - TOAST_BAND_BOTTOM).
+        //
+        // Two reasons a little overflow can still survive, both deliberate:
+        //  - these are 5th–95th-PERCENTILE bounds, so the real fingertips sit
+        //    slightly outside extent[0]. Widening the percentile would regress
+        //    the assets the trim exists for, so it stays.
+        //  - the idle auto-orbit yaws the model, and the projected half-width at
+        //    intermediate yaws is bounded by hypot(extentX, extentZ), not
+        //    extentX. Fitting that circumscribed radius would guarantee no
+        //    clipping at any yaw at the cost of a further shrink, so we fit the
+        //    dominant axis and accept a sliver mid-orbit.
+        float clientW = 0.0f, clientH = 0.0f;
+        RECT clientRect = {};
+        if (g_appWindow != nullptr && GetClientRect(g_appWindow, &clientRect)) {
+            clientW = (float)(clientRect.right - clientRect.left);
+            clientH = (float)(clientRect.bottom - clientRect.top);
+        }
+        if (!(clientW > 0.0f) || !(clientH > 0.0f)) {
+            std::lock_guard<std::mutex> dims(g_inputMutex);
+            clientW = (float)g_windowWidth;
+            clientH = (float)g_windowHeight;
+        }
+        const float zoneW = clientW;
+        const float zoneH = clientH * (1.0f - TOAST_BAND_BOTTOM);
+        const float zoneAspect = (zoneH > 0.0f) ? zoneW / zoneH : 0.0f;
+        const float heightFit = extent[1] / dxr::kAutoFitDefaultFill;
+        float vh = dxr::AutoFitVHeight(extent[0], extent[1], zoneW, zoneH);
+        const bool widthBound = vh > heightFit * 1.0001f;
         // Degenerate scene (all splats in a thin slice) — fall back to a
         // sensible vHeight rather than failing the fit. Mirrors macOS:1399.
         if (!(vh > 1e-3f)) vh = kFallbackVirtualDisplayHeightM;
@@ -380,9 +422,16 @@ static void ApplyAutoFitForLoadedScene_locked() {
         // macOS:1407 — the user can drag with LMB if a particular asset's
         // authored orientation is off.
         g_fitYaw = 0.0f;
-        LOG_INFO("Auto-fit: center=(%.3f, %.3f, %.3f) extent=(%.3f, %.3f, %.3f) vHeight=%.3f yaw=%.0fdeg",
+        // Log which axis won the fit: a surprise "width" on an asset you expected
+        // to be height-bound is the tell that its silhouette is wider than the
+        // zone can show at all.
+        LOG_INFO("Auto-fit: center=(%.3f, %.3f, %.3f) extent=(%.3f, %.3f, %.3f) "
+                 "vHeight=%.3f (%s-bound, zone=%.0fx%.0f aspect=%.3f fill=%.2f) yaw=%.0fdeg",
                  center[0], center[1], center[2],
-                 extent[0], extent[1], extent[2], vh, g_fitYaw * 57.2957795f);
+                 extent[0], extent[1], extent[2], vh,
+                 widthBound ? "width" : "height",
+                 zoneW, zoneH, zoneAspect, dxr::kAutoFitDefaultFill,
+                 g_fitYaw * 57.2957795f);
     }
     g_fitValid.store(ok);
 
@@ -1402,6 +1451,9 @@ static HWND CreateAppWindow(HINSTANCE hInstance, int width, int height) {
     // style, so it survives ToggleDecoration's GWL_STYLE rewrite; where a drop
     // actually lands is governed by the click-through region — see WM_DROPFILES.
     DragAcceptFiles(hwnd, TRUE);
+
+    // Publish for auto-fit's live GetClientRect (see ApplyAutoFitForLoadedScene_locked).
+    g_appWindow = hwnd;
 
     LOG_INFO("Window created: 0x%p", hwnd);
     return hwnd;

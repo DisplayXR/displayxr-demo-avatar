@@ -57,6 +57,7 @@
 #include "display3d_view.h"
 #include "camera3d_view.h"
 #include "projection_depth.h"
+#include "auto_fit.h"    // dxr::AutoFitVHeight — shared load-time framing rule
 #include "model_renderer.h"
 #include "model_vulkan_utils.h"   // scratch image/buffer for the click-through silhouette
 
@@ -150,11 +151,9 @@ struct InputState {
 // percentile-based extent — see ApplyAutoFitForLoadedScene().
 static constexpr float kDefaultVirtualDisplayHeightM = 1.5f;
 
-// Initial virtual-display height as a multiple of the model's height: the
-// display-centric rig frames the (centered) model with 1.111× its height, i.e.
-// the avatar occupies ~90% of the virtual display (5% headroom top and bottom).
-// Matches the Windows avatar leg (windows/main.cpp kAutoFitVerticalComfort).
-static constexpr float kAutoFitVerticalComfort = 1.111f;
+// Initial framing comes from the shared rule in displayxr-common's auto_fit.h:
+// vHeight = max(H, W / canvasAspect) / dxr::kAutoFitDefaultFill, so the avatar
+// caps at 80% of the avatar canvas in BOTH axes. Matches the Windows leg.
 
 // Cached auto-fit result for the currently loaded scene. Reused by Reset
 // so 'Space' returns to the framed pose rather than world origin.
@@ -2060,7 +2059,25 @@ static void ApplyAutoFitForLoadedScene() {
         g_fitCenter[0] = center[0];
         g_fitCenter[1] = center[1];
         g_fitCenter[2] = center[2];
-        float vh = extent[1] * kAutoFitVerticalComfort;
+        // Fit the WIDTH as well as the height (displayxr-common auto_fit.h):
+        // vHeight is the VIRTUAL DISPLAY height, so a larger value renders the
+        // model smaller and taking the binding axis crops nothing. A T-pose
+        // humanoid is nearly square while the window is portrait, so a
+        // height-only fit let its arms clip at the canvas edge.
+        //
+        // The viewport is the AVATAR CANVAS, not the whole window: when the
+        // speech bubble is live the avatar renders into the bottom
+        // kAvatarCanvasFrac of the drawable (the top band is the Local2D bubble
+        // and never holds model pixels) — the same canvasFrac the render loop's
+        // Kooima and sub-viewport use. g_windowW/H are drawable px; only their
+        // ratio matters, so the backing scale cancels.
+        const float canvasFrac = g_bubbleReady ? kAvatarCanvasFrac : 1.0f;
+        const float canvasW = (float)g_windowW;
+        const float canvasH = (float)g_windowH * canvasFrac;
+        const float canvasAspect = (canvasH > 0.0f) ? canvasW / canvasH : 0.0f;
+        const float heightFit = extent[1] / dxr::kAutoFitDefaultFill;
+        float vh = dxr::AutoFitVHeight(extent[0], extent[1], canvasW, canvasH);
+        const bool widthBound = vh > heightFit * 1.0001f;
         if (!(vh > 1e-3f)) vh = kDefaultVirtualDisplayHeightM; // degenerate scene
         g_fitVHeight = vh;
 
@@ -2069,9 +2086,16 @@ static void ApplyAutoFitForLoadedScene() {
         g_fitYaw = 0.0f;
 
         g_fitValid = true;
-        LOG_INFO("Auto-fit: center=(%.3f, %.3f, %.3f) extent=(%.3f, %.3f, %.3f) vHeight=%.3f yaw=%.0fdeg",
+        // Log which axis won the fit: a surprise "width" on an asset you expected
+        // to be height-bound is the tell that its silhouette is wider than the
+        // canvas can show at all.
+        LOG_INFO("Auto-fit: center=(%.3f, %.3f, %.3f) extent=(%.3f, %.3f, %.3f) "
+                 "vHeight=%.3f (%s-bound, canvas=%.0fx%.0f aspect=%.3f fill=%.2f) yaw=%.0fdeg",
                  center[0], center[1], center[2],
-                 extent[0], extent[1], extent[2], vh, g_fitYaw * 57.2957795f);
+                 extent[0], extent[1], extent[2], vh,
+                 widthBound ? "width" : "height",
+                 canvasW, canvasH, canvasAspect, dxr::kAutoFitDefaultFill,
+                 g_fitYaw * 57.2957795f);
     } else {
         g_fitValid = false;
     }

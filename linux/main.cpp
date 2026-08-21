@@ -104,6 +104,7 @@
 // near-clipped in Vulkan (the ZDP-anchored near sits close to the content).
 // Header-only static inline — same include the win/mac peers + cube_handle use.
 #include "projection_depth.h"
+#include "auto_fit.h"            // dxr::AutoFitVHeight — shared load-time framing rule
 
 #include "stb_truetype.h"        // CPU text rasterizer for the speech bubble
                                  // (impl defined in stb_truetype_impl.cpp)
@@ -244,11 +245,19 @@ static void mat4_view_from_xr_pose(float* m, const XrPosef& pose) {
 
 // Auto-fit — SIZE THE VIRTUAL DISPLAY TO THE MODEL (matches windows/macOS
 // ApplyAutoFitForLoadedScene). The model renders at its NATIVE scale; the display
-// view rig is placed at the model center with virtualDisplayHeight = model height
-// × comfort, so the avatar fills ~90% of the panel. No model scaling, no offsets —
-// the runtime rig + eye positions own the view pose.
+// view rig is placed at the model center with the virtualDisplayHeight that caps
+// it at dxr::kAutoFitDefaultFill (80%) of the 3D zone in BOTH axes — the shared
+// rule in displayxr-common's auto_fit.h. No model scaling, no offsets — the
+// runtime rig + eye positions own the view pose.
 static constexpr float kFallbackVHeightM = 1.5f;         // degenerate-extent fallback (win/mac parity)
-static constexpr float kAutoFitVerticalComfort = 1.111f; // model fills 90% (5% headroom top/bottom)
+
+// Live client size of the avatar window (px), tracked so ComputeAutoFit — which
+// has no session handle — can fit against the zone rect. Seeded at window
+// creation, refreshed on ConfigureNotify. 0 = unknown, which degrades the fit to
+// height-only. Caveat: on the app-owned path the runtime may reposition/resize
+// the overlay without a ConfigureNotify, so this can lag the real geometry (the
+// per-frame consumers re-query via XGetGeometry; load-time framing does not).
+static unsigned int g_clientPxW = 0, g_clientPxH = 0;
 static float g_fitCenter[3] = {0.0f, 0.0f, 0.0f};        // rig pose position (model AABB center)
 static float g_fitVHeight = kFallbackVHeightM;           // rig virtualDisplayHeight (model height × comfort)
 static bool g_fitValid = false;
@@ -266,12 +275,26 @@ static void ComputeAutoFit() {
     g_fitCenter[0] = center[0];
     g_fitCenter[1] = center[1];
     g_fitCenter[2] = center[2];
-    float vh = extent[1] * kAutoFitVerticalComfort;
+    // Fit the WIDTH as well as the height: vHeight is the VIRTUAL DISPLAY
+    // height, so a larger value renders the model smaller and taking the binding
+    // axis crops nothing. The viewport is the 3D ZONE — the bottom
+    // kAvatarCanvasFrac of the client rect (the top band is the Local2D speech
+    // bubble and never holds model pixels), the same rect the zone render path
+    // submits.
+    const float zoneW = (float)g_clientPxW;
+    const float zoneH = (float)g_clientPxH * kAvatarCanvasFrac;
+    const float zoneAspect = (zoneH > 0.0f) ? zoneW / zoneH : 0.0f;
+    const float heightFit = extent[1] / dxr::kAutoFitDefaultFill;
+    float vh = dxr::AutoFitVHeight(extent[0], extent[1], zoneW, zoneH);
+    const bool widthBound = vh > heightFit * 1.0001f;
     if (!(vh > 1e-3f)) vh = kFallbackVHeightM; // degenerate (thin) extent
     g_fitVHeight = vh;
     g_fitValid = true;
-    LOG_INFO("Auto-fit: center=(%.3f,%.3f,%.3f) extent=(%.3f,%.3f,%.3f) vHeight=%.3f",
-             center[0], center[1], center[2], extent[0], extent[1], extent[2], vh);
+    LOG_INFO("Auto-fit: center=(%.3f,%.3f,%.3f) extent=(%.3f,%.3f,%.3f) "
+             "vHeight=%.3f (%s-bound, zone=%.0fx%.0f aspect=%.3f fill=%.2f)",
+             center[0], center[1], center[2], extent[0], extent[1], extent[2], vh,
+             widthBound ? "width" : "height",
+             zoneW, zoneH, zoneAspect, dxr::kAutoFitDefaultFill);
 }
 
 // Rig position for this frame (concept 2, dynamic recenter): a pinned axis tracks
@@ -603,6 +626,8 @@ static bool CreateAppWindow(AppXrSession& xr) {
     xr.xColormap = cmap;
     xr.xWinW = w;
     xr.xWinH = h;
+    g_clientPxW = w;   // seed the auto-fit viewport (see g_clientPxW above)
+    g_clientPxH = h;
     LOG_INFO("Created %ux%u 32-bit ARGB portrait app window at (%d,%d)", w, h, px, py);
     return true;
 }
@@ -628,6 +653,8 @@ static void PumpXEvents(AppXrSession& xr) {
             if (ev.xconfigure.width > 0 && ev.xconfigure.height > 0) {
                 xr.xWinW = (unsigned int)ev.xconfigure.width;
                 xr.xWinH = (unsigned int)ev.xconfigure.height;
+                g_clientPxW = xr.xWinW;
+                g_clientPxH = xr.xWinH;
             }
             break;
         default: break;
