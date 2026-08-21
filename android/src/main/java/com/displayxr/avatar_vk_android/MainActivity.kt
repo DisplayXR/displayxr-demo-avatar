@@ -591,7 +591,12 @@ class MainActivity : NativeActivity() {
 
     // Leo's window aspect (w:h). The renderer auto-fits the character to whatever
     // canvas it gets, so this is purely how much desktop we leave clickable.
-    private val overlayAspect = 0.75f
+    // Width/height of the overlay box. Width is a pure horizontal crop (Leo's
+    // scale keys off HEIGHT only), so narrowing via this knob costs nothing —
+    // debug.dxr.avatar.overlay.aspect is percent width-of-height (default 75,
+    // i.e. the historical 3:4 box; 38 halves the width at the same Leo size).
+    private val overlayAspect: Float
+        get() = nativeGetIntProp("debug.dxr.avatar.overlay.aspect", 75).coerceIn(20, 100) / 100f
 
     // #1110 rotation fix: an application context never receives configuration
     // updates, so a window added through its WindowManager stays anchored to the
