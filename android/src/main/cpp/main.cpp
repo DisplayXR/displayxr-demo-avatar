@@ -325,6 +325,11 @@ float g_rig_vh = 1.33f;  // virtual display height (app units); refit per model
 // Scalar mirror of dxr::FitTransition -- same SmoothStep curve, same "starts
 // landed" convention. Inlined because the Android build cannot link
 // displayxr_common_lib; displayxr::rules is the follow-up that retires it.
+// Fill fraction for the load-time fit AND the viewport refit. File scope so the
+// two cannot drift apart: a refit using a different fill than the load would
+// resize the avatar on rotation for no reason the user can see.
+constexpr float kAutoFitFill = 0.8f;
+
 float g_fit_ext_w = 0.0f;      // cached CONTENT extents that produced the base
 float g_fit_ext_h = 0.0f;
 float g_fit_zone_aspect = 0.0f; // zone aspect the base was derived from
@@ -1540,7 +1545,6 @@ load_model_path(const char *path)
 		//
 		// mirrors displayxr-common auto_fit.h AutoFitVHeight (not reachable from
 		// the Android build — it does not consume displayxr-common).
-		constexpr float kAutoFitFill = 0.8f;
 		const uint32_t canvas_w = g_win_px_w.load(std::memory_order_relaxed);
 		const uint32_t canvas_h = g_win_px_h.load(std::memory_order_relaxed);
 		const float zone_w = (float)canvas_w;
