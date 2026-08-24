@@ -1850,8 +1850,25 @@ render_frame()
 				clock_gettime(CLOCK_MONOTONIC, &ts_dbnc);
 				const int64_t now_dbnc =
 				    (int64_t)ts_dbnc.tv_sec * 1000000000ll + ts_dbnc.tv_nsec;
+				// Gate on a RELATIVE aspect change, not an absolute epsilon.
+				// Measured: rotating passes through 1600x2500 (nav-bar insets)
+				// and HOLDS it for ~770 ms before settling at 1600x2560 -- far
+				// too long for a time debounce to absorb without making every
+				// real rotation feel laggy. But that transient is only a 2.4%
+				// aspect change, while an actual rotation is ~156%. Below this
+				// threshold a refit costs more than it buys: the animation is
+				// visible, the framing gain is not.
+				constexpr float kMinAspectChange = 0.05f; // 5%
+				// A load with NO viewport yet (the canvas arrives with the
+				// first frame, so the load-time fit was height-only and stored
+				// aspect 0) must count as "differs": the first valid aspect IS
+				// the refit that replaces that bootstrap. Guarding on a prior
+				// aspect > 0 here silently disabled the mechanism for exactly
+				// that case -- caught on device as `zone=0x0` at load followed
+				// by no refit ever, on rotation or otherwise.
 				const bool differs =
-				    g_fit_zone_aspect > 0.0f && std::fabs(a - g_fit_zone_aspect) > 1e-3f;
+				    (g_fit_zone_aspect <= 0.0f) ||
+				    (std::fabs(a - g_fit_zone_aspect) / g_fit_zone_aspect > kMinAspectChange);
 				if (!differs) {
 					s_pending_since_ns = 0;
 				} else if (std::fabs(a - s_pending_a) > 1e-3f) {
