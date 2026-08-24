@@ -1854,8 +1854,16 @@ render_frame()
 					}
 				}
 			}
+			// Sample the clock EVERY frame, not just while a transition runs.
+			// refit_dt_s() keeps a static prev_ns: calling it only inside the
+			// branch let prev_ns go stale between rotations, so the first tick
+			// of a new transition saw "time since the last one ended", clamped
+			// to 100 ms -- half the 200 ms duration. The move jumped 50% in one
+			// frame and then eased the rest, which reads as a stutter at the
+			// start of every rotation.
+			const float dt_s = refit_dt_s();
 			if (g_refit_t < 1.0f) {
-				g_refit_t += refit_dt_s() / kRefitDurationS;
+				g_refit_t += dt_s / kRefitDurationS;
 				if (g_refit_t > 1.0f) g_refit_t = 1.0f;
 				g_rig_vh = g_refit_from +
 				           (g_refit_to - g_refit_from) * refit_curve(g_refit_t);
