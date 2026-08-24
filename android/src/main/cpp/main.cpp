@@ -303,6 +303,57 @@ constexpr float kBubbleBandFrac = 0.25f;
 constexpr int kDefaultSlabPercent = 100;
 float g_rig_vh = 1.33f;  // virtual display height (app units); refit per model
 
+// ── Viewport-change refit ───────────────────────────────────────────────────
+// vHeight is a function of (content, viewport) and must be re-derived whenever
+// the viewport changes -- rotation loudly (a 2560x1600 panel held portrait is a
+// 1600x2560 viewport). Policy: displayxr-common common/auto_fit.h, "WHEN TO
+// RECOMPUTE".
+//
+// The VIEWPORT HERE IS THE TIGER ZONE, not the whole canvas: the top
+// kBubbleBandFrac is the Local2D speech bubble and never holds model pixels.
+// The refit must apply the same band fraction or it re-derives against a
+// viewport the model never renders into.
+//
+// The user's zoom is preserved for free: pinch drives g_scene_scale, which is
+// CONTENT-side, while g_rig_vh is VIEWPORT-side. Only the base moves.
+//
+// The load-time centre CLAMP (feet must not truncate at the zone edge) is
+// deliberately NOT re-applied: the #568 per-frame animated-anchor recentre in
+// the render loop owns g_scene_center from the first animated frame onward, so
+// re-clamping here would fight it.
+//
+// Scalar mirror of dxr::FitTransition -- same SmoothStep curve, same "starts
+// landed" convention. Inlined because the Android build cannot link
+// displayxr_common_lib; displayxr::rules is the follow-up that retires it.
+float g_fit_ext_w = 0.0f;      // cached CONTENT extents that produced the base
+float g_fit_ext_h = 0.0f;
+float g_fit_zone_aspect = 0.0f; // zone aspect the base was derived from
+float g_refit_from = 0.0f;
+float g_refit_to = 0.0f;
+float g_refit_t = 1.0f;         // 1 = landed
+constexpr float kRefitDurationS = 0.2f;
+
+inline float
+refit_curve(float x)
+{
+	if (x <= 0.0f) return 0.0f;
+	if (x >= 1.0f) return 1.0f;
+	return x * x * (3.0f - 2.0f * x);
+}
+
+inline float
+refit_dt_s()
+{
+	static int64_t prev_ns = 0;
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	const int64_t now_ns = (int64_t)ts.tv_sec * 1000000000ll + ts.tv_nsec;
+	if (prev_ns == 0) { prev_ns = now_ns; return 0.0f; }
+	const float dt = (float)(now_ns - prev_ns) * 1e-9f;
+	prev_ns = now_ns;
+	return (dt > 0.1f) ? 0.1f : dt; // clamp: a resumed app must not snap
+}
+
 // Worst-case view/tile capacity for the one atlas swapchain (multiview-tiling
 // invariant): the array sizing must cover the runtime's MAX advertised view
 // count — Leia maxes at 2 (LeiaSR stereo) but sim_display advertises a 4-view
@@ -1495,6 +1546,10 @@ load_model_path(const char *path)
 		const float zone_w = (float)canvas_w;
 		const float zone_h = (float)canvas_h * (1.0f - kBubbleBandFrac);
 		float vh = ext[1] / kAutoFitFill;
+		// Which extents produced `vh` -- the union box here, overwritten below
+		// if the active-clip box takes over. Cached for the viewport refit.
+		float fit_used_w = ext[0];
+		float fit_used_h = ext[1];
 		bool width_bound = false;
 		if (ext[0] > 0.0f && zone_w > 0.0f && zone_h > 0.0f) {
 			const float zone_aspect = zone_w / zone_h;
@@ -1523,6 +1578,8 @@ load_model_path(const char *path)
 			const float subj_w = (raw_w > 1e-5f) ? raw_w : 1e-5f;
 			const float subj_h = (raw_h > 1e-5f) ? raw_h : 1e-5f;
 			vh = subj_h / kAutoFitFill;
+			fit_used_w = subj_w;
+			fit_used_h = subj_h;
 			width_bound = false;
 			if (zone_w > 0.0f && zone_h > 0.0f) {
 				const float zone_aspect = zone_w / zone_h;
@@ -1556,6 +1613,12 @@ load_model_path(const char *path)
 			     union_floor, max_cy, clamped ? " (clamped)" : "");
 		}
 		g_rig_vh = (vh > 1e-3f) ? vh : kTargetSize / kAutoFitFill;
+		// Cache for the viewport-change refit: CONTENT extents + the ZONE
+		// aspect they were fitted against.
+		g_fit_ext_w = fit_used_w;
+		g_fit_ext_h = fit_used_h;
+		g_fit_zone_aspect = (zone_h > 0.0f) ? (zone_w / zone_h) : 0.0f;
+		g_refit_t = 1.0f; // landed
 		LOGI("scene center=(%.2f,%.2f,%.2f) extent=(%.2f,%.2f,%.2f) push=%.2f "
 		     "rig_vh=%.2f (%s box, %s-bound, zone=%.0fx%.0f fill=%.2f)",
 		     g_scene_center[0], g_scene_center[1], g_scene_center[2],
@@ -1754,6 +1817,46 @@ render_frame()
 		    {g_scene_center[0] + kPanSign * g_cam_pan_x.load(std::memory_order_relaxed),
 		     g_scene_center[1],
 		     g_scene_center[2] + g_cam_dolly_z.load(std::memory_order_relaxed)}};
+		// Viewport-change refit. The live canvas rect is orientation-aware, so a
+		// rotation surfaces here as a new ZONE aspect (canvas minus the bubble
+		// band -- the model never renders into that band, so fitting against the
+		// full canvas would be wrong by the band fraction).
+		//
+		// Gate on the ASPECT, not the pixel size, so an intermediate size
+		// mid-rotation cannot retrigger; RETARGET in flight so a two-step settle
+		// cannot snap back. g_scene_center is NOT touched -- the #568 per-frame
+		// animated-anchor recentre owns it from the first animated frame.
+		{
+			const uint32_t cw = g_win_px_w.load(std::memory_order_relaxed);
+			const uint32_t ch = g_win_px_h.load(std::memory_order_relaxed);
+			if (cw > 0 && ch > 0 && g_fit_ext_h > 0.0f) {
+				const float zw = (float)cw;
+				const float zh = (float)ch * (1.0f - kBubbleBandFrac);
+				const float a = (zh > 0.0f) ? (zw / zh) : 0.0f;
+				if (a > 0.0f && g_fit_zone_aspect > 0.0f &&
+				    std::fabs(a - g_fit_zone_aspect) > 1e-3f) {
+					float vh = g_fit_ext_h / kAutoFitFill;
+					const float vh_w = g_fit_ext_w / (kAutoFitFill * a);
+					if (vh_w > vh) vh = vh_w;
+					if (vh > 1e-3f) {
+						g_refit_from = g_rig_vh;
+						g_refit_to = vh;
+						g_refit_t = 0.0f;
+						g_fit_zone_aspect = a;
+						LOGI("refit: zone=%.0fx%.0f aspect=%.3f base %.2f -> %.2f "
+						     "(scene scale %.2f preserved)",
+						     zw, zh, a, g_refit_from, vh,
+						     g_scene_scale.load(std::memory_order_relaxed));
+					}
+				}
+			}
+			if (g_refit_t < 1.0f) {
+				g_refit_t += refit_dt_s() / kRefitDurationS;
+				if (g_refit_t > 1.0f) g_refit_t = 1.0f;
+				g_rig_vh = g_refit_from +
+				           (g_refit_to - g_refit_from) * refit_curve(g_refit_t);
+			}
+		}
 		const float rig_vh = g_rig_vh;
 		if (g_has_view_rig) {
 			display_rig.pose = rig_pose;
