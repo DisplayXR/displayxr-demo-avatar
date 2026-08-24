@@ -1837,8 +1837,32 @@ render_frame()
 				const float zw = (float)cw;
 				const float zh = (float)ch * (1.0f - kBubbleBandFrac);
 				const float a = (zh > 0.0f) ? (zw / zh) : 0.0f;
-				if (a > 0.0f && g_fit_zone_aspect > 0.0f &&
-				    std::fabs(a - g_fit_zone_aspect) > 1e-3f) {
+				// DEBOUNCE. A rotation passes through transient window sizes
+				// before settling -- measured 1600x2500 (system bars still
+				// laying out) on the way to 1600x2560. Their aspect differs by
+				// ~2.4%, far more than the equality epsilon, so refitting on
+				// them produced a visible shrink-then-grow: two transitions
+				// 0.6 s apart, which reads as a stutter on the first rotation.
+				// Require the new aspect to HOLD before committing to it.
+				static float s_pending_a = 0.0f;
+				static int64_t s_pending_since_ns = 0;
+				struct timespec ts_dbnc;
+				clock_gettime(CLOCK_MONOTONIC, &ts_dbnc);
+				const int64_t now_dbnc =
+				    (int64_t)ts_dbnc.tv_sec * 1000000000ll + ts_dbnc.tv_nsec;
+				const bool differs =
+				    g_fit_zone_aspect > 0.0f && std::fabs(a - g_fit_zone_aspect) > 1e-3f;
+				if (!differs) {
+					s_pending_since_ns = 0;
+				} else if (std::fabs(a - s_pending_a) > 1e-3f) {
+					s_pending_a = a;          // a new candidate; restart the clock
+					s_pending_since_ns = now_dbnc;
+				}
+				const bool settled =
+				    differs && s_pending_since_ns != 0 &&
+				    (now_dbnc - s_pending_since_ns) > 120000000ll; // 120 ms
+				if (settled) {
+					s_pending_since_ns = 0;
 					float vh = g_fit_ext_h / kAutoFitFill;
 					const float vh_w = g_fit_ext_w / (kAutoFitFill * a);
 					if (vh_w > vh) vh = vh_w;
