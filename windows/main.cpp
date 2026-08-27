@@ -33,7 +33,8 @@
 #include <openxr/XR_DXR_view_rig.h>       // XrDisplayRigDXR locate + XrViewDisplayRawDXR readback
 #include "display3d_view.h"
 #include "projection_depth.h"
-#include "auto_fit.h"       // dxr::AutoFitVHeight — shared load-time framing rule
+#include "auto_fit.h"       // dxr::AutoFitVHeight / FitTransition — shared framing rule
+#include "auto_fit_canvas.h" // dxr::AutoFitCanvas — the runtime-resolved zone canvas
 
 #include "hud_renderer.h"   // HudRenderer + text_overlay (RenderFilledRect/RenderText) — drive the speech bubble
 #include "atlas_capture.h"
@@ -340,6 +341,52 @@ static float g_fitVHeight   = kFallbackVirtualDisplayHeightM;
 static float g_fitYaw       = 0.0f;
 static std::atomic<bool> g_fitValid{false};
 
+// Refit state (displayxr-common common/auto_fit_canvas.h). vHeight is a
+// function of (content, viewport): the CONTENT half is cached here — whichever
+// box actually sized the rig, active-clip or union — so a viewport change
+// re-derives the base without re-measuring the model.
+static std::atomic<float> g_fitExtentW{0.0f};
+static std::atomic<float> g_fitExtentH{0.0f};
+static std::atomic<float> g_fitUnionFloor{0.0f}; //!< union floor, for the reset-target clamp
+static std::atomic<float> g_fitAspect{0.0f};     //!< viewport the current base was derived for
+static dxr::AutoFitCanvas g_autoFitCanvas;       //!< runtime-resolved ZONE canvas (zone-scoped locate)
+static dxr::FitTransition g_fitTransition;       //!< render-thread only
+
+// Viewport the auto-fit frames against: the 3D ZONE, not the client window.
+//
+// The zone rect IS the bottom (1 - TOAST_BAND_BOTTOM) of the client rect — the
+// top band is the Local2D speech bubble and never holds model pixels — so
+// fitting the window aspect would over-shrink by exactly 1/(1 - BAND).
+//
+// Under the shell the client rect is wrong for a second, larger reason: a
+// shell-launched app is composed into a 3D window tile the shell owns, and its
+// own HWND is hidden (SW_HIDE) and holds whatever size it was created at until
+// the runtime resizes it — deferred and async, long after the bundled model
+// auto-loads during init.
+//
+// The zone-scoped locate answers both at once: the runtime rebases its window
+// metrics to the zone rect, so XrViewDisplayRawDXR.canvasRectPx comes back as
+// the zone ON THE TILE — already band-subtracted, already tile-scoped. The
+// client-rect path below stays only as the bootstrap for the fit that runs
+// before the first locate, and it is the only place the band factor is applied
+// by hand.
+//
+// Returns true when the dims came from the runtime canvas.
+static bool GetAutoFitZoneViewport(float& outW, float& outH) {
+    float clientW = 0.0f, clientH = 0.0f;
+    RECT clientRect = {};
+    if (g_appWindow != nullptr && GetClientRect(g_appWindow, &clientRect)) {
+        clientW = (float)(clientRect.right - clientRect.left);
+        clientH = (float)(clientRect.bottom - clientRect.top);
+    }
+    if (!(clientW > 0.0f) || !(clientH > 0.0f)) {
+        std::lock_guard<std::mutex> dims(g_inputMutex);
+        clientW = (float)g_windowWidth;
+        clientH = (float)g_windowHeight;
+    }
+    return g_autoFitCanvas.Viewport(clientW, clientH * (1.0f - TOAST_BAND_BOTTOM), outW, outH);
+}
+
 // Dynamic-recenter pins. Default X Y (not Z) = the avatar's historical behaviour:
 // pin the centroid horizontally+vertically (with A/D pan on X), leave Z as the
 // free W/S dolly. DXR_RECENTER_PIN overrides (e.g. XYZ also pins depth/in-focus).
@@ -396,24 +443,16 @@ static void ApplyAutoFitForLoadedScene_locked() {
         //    extentX. Fitting that circumscribed radius would guarantee no
         //    clipping at any yaw at the cost of a further shrink, so we fit the
         //    dominant axis and accept a sliver mid-orbit.
-        float clientW = 0.0f, clientH = 0.0f;
-        RECT clientRect = {};
-        if (g_appWindow != nullptr && GetClientRect(g_appWindow, &clientRect)) {
-            clientW = (float)(clientRect.right - clientRect.left);
-            clientH = (float)(clientRect.bottom - clientRect.top);
-        }
-        if (!(clientW > 0.0f) || !(clientH > 0.0f)) {
-            std::lock_guard<std::mutex> dims(g_inputMutex);
-            clientW = (float)g_windowWidth;
-            clientH = (float)g_windowHeight;
-        }
-        const float zoneW = clientW;
-        const float zoneH = clientH * (1.0f - TOAST_BAND_BOTTOM);
+        float zoneW = 0.0f, zoneH = 0.0f;
+        const bool fromCanvas = GetAutoFitZoneViewport(zoneW, zoneH);
         const float zoneAspect = (zoneH > 0.0f) ? zoneW / zoneH : 0.0f;
         const float heightFit = extent[1] / dxr::kAutoFitDefaultFill;
         float vh = dxr::AutoFitVHeight(extent[0], extent[1], zoneW, zoneH);
         bool widthBound = vh > heightFit * 1.0001f;
         const char* fitBox = "union";
+        // CONTENT half of the fit, for RefitForViewport. Whichever box ends up
+        // sizing the rig below is the one it must re-derive from.
+        float fitExtentW = extent[0], fitExtentH = extent[1];
 
         // Phase 2 of the 80% rule: when the model was loaded with the all-clips
         // bounds sweep (every load path sets it), SIZE the rig from the ACTIVE
@@ -431,6 +470,8 @@ static void ApplyAutoFitForLoadedScene_locked() {
             vh = dxr::AutoFitVHeight(subjW, subjH, zoneW, zoneH);
             widthBound = vh > subjHeightFit * 1.0001f;
             fitBox = "active-clip";
+            fitExtentW = subjW;
+            fitExtentH = subjH;
             g_fitCenter[0] = 0.5f * (aMin[0] + aMax[0]);
             g_fitCenter[1] = 0.5f * (aMin[1] + aMax[1]);
             g_fitCenter[2] = 0.5f * (aMin[2] + aMax[2]);
@@ -451,6 +492,15 @@ static void ApplyAutoFitForLoadedScene_locked() {
         // sensible vHeight rather than failing the fit. Mirrors macOS:1399.
         if (!(vh > 1e-3f)) vh = kFallbackVirtualDisplayHeightM;
         g_fitVHeight = vh;
+        // Cache what RefitForViewport needs: the content box that sized the rig,
+        // the union floor the vertical clamp is measured from, and the viewport
+        // aspect this base was derived for. A load lands the base immediately —
+        // the framing IS the load's result, so there is nothing to animate.
+        g_fitExtentW.store(fitExtentW, std::memory_order_relaxed);
+        g_fitExtentH.store(fitExtentH, std::memory_order_relaxed);
+        g_fitUnionFloor.store(center[1] - 0.5f * extent[1], std::memory_order_relaxed);
+        g_fitAspect.store(zoneAspect, std::memory_order_relaxed);
+        g_fitTransition.start(vh, vh, 0.0f);
         // Anchor at yaw=0 and trust the loader's RUB convention (PLY loader
         // converts RDF+X-mirror → RUB at load time; SPZ is RUB-native and
         // SuperSplat-authored scenes already face −Z at yaw=0). Matches
@@ -461,12 +511,13 @@ static void ApplyAutoFitForLoadedScene_locked() {
         // to be height-bound is the tell that its silhouette is wider than the
         // zone can show at all.
         LOG_INFO("Auto-fit: center=(%.3f, %.3f, %.3f) extent=(%.3f, %.3f, %.3f) "
-                 "vHeight=%.3f (%s box, %s-bound, zone=%.0fx%.0f aspect=%.3f fill=%.2f) "
+                 "vHeight=%.3f (%s box, %s-bound, zone=%.3fx%.3f (%s) aspect=%.3f fill=%.2f) "
                  "yaw=%.0fdeg",
                  center[0], center[1], center[2],
                  extent[0], extent[1], extent[2], vh,
                  fitBox, widthBound ? "width" : "height",
-                 zoneW, zoneH, zoneAspect, dxr::kAutoFitDefaultFill,
+                 zoneW, zoneH, fromCanvas ? "runtime zone canvas" : "client rect, px",
+                 zoneAspect, dxr::kAutoFitDefaultFill,
                  g_fitYaw * 57.2957795f);
     }
     g_fitValid.store(ok);
@@ -506,6 +557,65 @@ static void ApplyAutoFitForLoadedScene_locked() {
     // exists and the base tools are already up, so the tiger's clips surface
     // the tools immediately; late loads via the load_model tool refresh them.
     UpdateMcpAnimationTools();
+}
+
+// Re-derive the base vHeight when the zone's ASPECT changes, and animate the
+// move. Render thread only.
+//
+// This is what makes the load-time fit correct under the shell. The tiger
+// auto-loads during init, before the first zone-scoped xrLocateViews, so the
+// only viewport available then is this window's own client rect — which under a
+// workspace is the hidden creation-size window, not the tile the user sees. The
+// first located frame publishes the real zone canvas, the aspect gate sees it
+// differ from the bootstrap one, and the fit lands on the tile. The same path
+// handles a live 3D-window resize, which mis-framed identically before.
+//
+// Only the BASE moves: the render path computes rigVH = virtualDisplayHeight /
+// scaleFactor, so the user's zoom stays relative and orbit/pan are untouched. A
+// viewport change is not a request to undo deliberate user state — recentring
+// belongs on Space, so the live camera is never repositioned here.
+static void RefitForViewport(float dtSeconds) {
+    if (!g_fitValid.load(std::memory_order_relaxed)) {
+        return;
+    }
+    const float extW = g_fitExtentW.load(std::memory_order_relaxed);
+    const float extH = g_fitExtentH.load(std::memory_order_relaxed);
+    if (!(extH > 0.0f)) {
+        return;
+    }
+
+    float zoneW = 0.0f, zoneH = 0.0f;
+    const bool fromCanvas = GetAutoFitZoneViewport(zoneW, zoneH);
+    const float aspect = (zoneH > 0.0f) ? (zoneW / zoneH) : 0.0f;
+    if (dxr::AutoFitAspectChanged(g_fitAspect.load(std::memory_order_relaxed), aspect)) {
+        const float vh = dxr::AutoFitVHeight(extW, extH, zoneW, zoneH);
+        if (vh > 1e-3f) {
+            // Retarget rather than restart: a resize that settles in two steps
+            // must not snap back to where it started.
+            g_fitTransition.start(g_fitTransition.value(), vh);
+            const float prev = g_fitVHeight;
+            g_fitAspect.store(aspect, std::memory_order_relaxed);
+            g_fitVHeight = vh;  // Space-reset target follows the live zone
+            // Re-apply the union-floor clamp to the RESET TARGET only. A smaller
+            // vHeight tightens maxCy, and the feet of whichever clip dips lowest
+            // must still be in frame the next time Space recentres. The live
+            // camera is deliberately left alone — that is the user's.
+            const float unionFloor = g_fitUnionFloor.load(std::memory_order_relaxed);
+            const float maxCy = unionFloor - vh * 0.02f + 0.5f * vh;
+            if (g_fitCenter[1] > maxCy) g_fitCenter[1] = maxCy;
+            LOG_INFO("Auto-fit refit: zone=%.3fx%.3f (%s) aspect=%.3f bound=%s "
+                     "base %.3f -> %.3f (zoom preserved)",
+                     zoneW, zoneH, fromCanvas ? "runtime zone canvas" : "client rect, px", aspect,
+                     (aspect > 0.0f && extW / aspect > extH) ? "width" : "height",
+                     prev, vh);
+        }
+    }
+
+    float animated = 0.0f;
+    if (g_fitTransition.update(dtSeconds, &animated)) {
+        std::lock_guard<std::mutex> lock(g_inputMutex);
+        g_inputState.viewParams.virtualDisplayHeight = animated;
+    }
 }
 
 // Fullscreen state
@@ -2343,6 +2453,16 @@ static void RenderThreadFunc(
 
         g_modelRenderer.updateAnimation(perfStats.deltaTime);
 
+        // Re-derive the base against the zone the runtime actually resolved
+        // (published from the previous frame's zone-scoped locate) and advance
+        // the move. Runs before the reset block so a Space in the same frame wins.
+        RefitForViewport(perfStats.deltaTime);
+        {
+            std::lock_guard<std::mutex> lock(g_inputMutex);
+            inputSnapshot.viewParams.virtualDisplayHeight =
+                g_inputState.viewParams.virtualDisplayHeight;
+        }
+
         // On Space-reset: shared UpdateCameraMovement returns to (0,0,0) + default
         // vHeight. For the splat demo, restore the per-scene auto-fit pose instead.
         if (resetRequested && g_fitValid.load()) {
@@ -2351,6 +2471,9 @@ static void RenderThreadFunc(
             inputSnapshot.cameraPosZ = g_fitCenter[2];
             inputSnapshot.yaw = g_fitYaw;
             inputSnapshot.viewParams.virtualDisplayHeight = g_fitVHeight;
+            // Land any in-flight refit on the reset target so the animation
+            // cannot drag the base back off it over the next frames.
+            g_fitTransition.start(g_fitVHeight, g_fitVHeight, 0.0f);
         }
 
         {
@@ -2836,6 +2959,16 @@ static void RenderThreadFunc(
                                 if (zoneRaw.canvasRectPx.extent.width > 0) {
                                     s_zoneCanvasPx = zoneRaw.canvasRectPx;
                                     s_zoneCanvasValid = true;
+                                    // Same rect is the auto-fit's viewport. The
+                                    // runtime rebased its window metrics to the
+                                    // zone, so this is the zone ON THE TILE —
+                                    // already band-subtracted and tile-scoped,
+                                    // unlike our own hidden window's client rect.
+                                    g_autoFitCanvas.PublishFromRaw(
+                                        zoneRaw.canvasSizeMeters.width,
+                                        zoneRaw.canvasSizeMeters.height,
+                                        zoneRaw.canvasRectPx.extent.width,
+                                        zoneRaw.canvasRectPx.extent.height);
                                 }
                             } else {
                                 static bool s_zoneLocateWarned = false;
