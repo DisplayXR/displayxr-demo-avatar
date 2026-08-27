@@ -48,6 +48,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdint>   // SIZE_MAX — click-region band coalescing
 #include <cstdio>    // snprintf — MCP tool-result JSON
 #include <cstdlib>   // strtod / strtof — MCP numeric args
 #include <cstring>   // strcmp / strstr / strchr — MCP tool dispatch
@@ -1209,24 +1210,45 @@ static void UpdateClickRegion(HWND hwnd) {
             return;
         const int cw = g_silCoverage.covW, ch = g_silCoverage.covH;
         winW = g_silCoverage.winW; winH = g_silCoverage.winH;
-        // One client-space RECT per horizontal run of covered coverage-pixels.
+        // One client-space RECT per horizontal run of covered coverage-pixels,
+        // with identical consecutive rows folded into a single band — the
+        // coverage raster now scales with the window (540 rows on a 4K panel)
+        // and would otherwise hand GDI thousands of rects per frame for a shape
+        // that is mostly vertical edges.
+        //
         // Skip the top 25%: the avatar is confined to the bottom 75%, and the
         // top-25% silhouette pixels are stale/untouched (the bubble rect is added
         // to the region separately below).
         const int yStart = (ch * 1) / 4;
+        std::vector<int> runs, prevRuns;
+        size_t bandFirst = SIZE_MAX;
         for (int y = yStart; y < ch; ++y) {
+            runs.clear();
             int x = 0;
             while (x < cw) {
                 if (!g_silCoverage.bits[(size_t)y * cw + x]) { ++x; continue; }
                 int xs = x;
                 while (x < cw && g_silCoverage.bits[(size_t)y * cw + x]) ++x;
+                runs.push_back(xs);
+                runs.push_back(x);
+            }
+            const LONG bottom = (LONG)(((int64_t)y + 1) * winH / ch);
+            if (runs.empty()) { bandFirst = SIZE_MAX; prevRuns.clear(); continue; }
+            if (bandFirst != SIZE_MAX && runs == prevRuns) {
+                for (size_t i = bandFirst; i < rects.size(); ++i) rects[i].bottom = bottom;
+                continue;
+            }
+            bandFirst = rects.size();
+            const LONG top = (LONG)((int64_t)y * winH / ch);
+            for (size_t i = 0; i + 1 < runs.size(); i += 2) {
                 RECT r;
-                r.left   = xs * winW / cw;
-                r.right  = x  * winW / cw;
-                r.top    = y       * winH / ch;
-                r.bottom = (y + 1) * winH / ch;
+                r.left   = (LONG)((int64_t)runs[i]     * winW / cw);
+                r.right  = (LONG)((int64_t)runs[i + 1] * winW / cw);
+                r.top    = top;
+                r.bottom = bottom;
                 rects.push_back(r);
             }
+            prevRuns = runs;
         }
     }
 
@@ -1576,9 +1598,16 @@ static void RenderPlaceholder(VkDevice device, VkQueue queue, VkCommandPool cmdP
     vkFreeCommandBuffers(device, cmdPool, 1, &cmd);
 }
 
-// Scratch GPU image + host-visible readback for the silhouette pass (created
+// Scratch GPU images + host-visible readback for the silhouette pass (created
 // lazily, resized with the window). Render-thread-owned.
-static ModelImage  g_silImage = {};
+//
+// TWO scratch images: the coverage is the UNION of the outermost views, and
+// both halves must come from the SAME frame or the union is stale in one eye.
+// One image with a render/copy/render ping-pong would need a layout round-trip
+// mid-frame; two images are cheap at this resolution and keep the ordering
+// trivial. The readback holds both planes, first view then last.
+static ModelImage  g_silImage = {};    // first view
+static ModelImage  g_silImage2 = {};   // last view (stereo only)
 static ModelBuffer g_silReadback = {};
 static void*       g_silMapped = nullptr;
 
@@ -1586,6 +1615,7 @@ static bool EnsureSilhouetteTargets(VkDevice dev, VkPhysicalDevice phys, uint32_
     if (g_silImage.image != VK_NULL_HANDLE && g_silImage.width == w && g_silImage.height == h)
         return true;
     if (g_silImage.image != VK_NULL_HANDLE) modelDestroyImage(dev, g_silImage);
+    if (g_silImage2.image != VK_NULL_HANDLE) modelDestroyImage(dev, g_silImage2);
     if (g_silReadback.buffer != VK_NULL_HANDLE) {
         if (g_silMapped) vkUnmapMemory(dev, g_silReadback.memory);
         modelDestroyBuffer(dev, g_silReadback);
@@ -1594,54 +1624,120 @@ static bool EnsureSilhouetteTargets(VkDevice dev, VkPhysicalDevice phys, uint32_
     g_silImage = modelCreateImage2D(dev, phys, w, h, VK_FORMAT_R8G8B8A8_UNORM,
         VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
     if (g_silImage.image == VK_NULL_HANDLE) return false;
-    g_silReadback = modelCreateBuffer(dev, phys, (VkDeviceSize)w * h * 4,
+    g_silImage2 = modelCreateImage2D(dev, phys, w, h, VK_FORMAT_R8G8B8A8_UNORM,
+        VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+    if (g_silImage2.image == VK_NULL_HANDLE) return false;
+    // HOST_CACHED: this buffer is READ back every frame, and
+    // HOST_VISIBLE|HOST_COHERENT alone is typically WRITE-COMBINED on a
+    // discrete GPU — fast to write, pathologically slow to read. Measured on an
+    // RTX 3080 (2026-08-26) an identical allocation in the sibling 2D composite
+    // cost ~127 ms/frame to read against 0.6 ms for the window present it was
+    // blamed on; HOST_CACHED took that stage to 0.86 ms. This is what made the
+    // silhouette pass look too expensive to run properly, which is how it ended
+    // up throttled and capped in the first place. Falls back where no cached
+    // type exists; DXR_VK_NO_HOST_CACHED=1 forces the legacy allocation so the
+    // pathology stays reproducible.
+    const VkDeviceSize silBytes = (VkDeviceSize)w * h * 4 * 2;
+    static const bool s_noCached =
+        GetEnvironmentVariableA("DXR_VK_NO_HOST_CACHED", nullptr, 0) > 0;
+    g_silReadback = modelCreateBuffer(dev, phys, silBytes,
         VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        s_noCached
+            ? (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
+            : (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+               VK_MEMORY_PROPERTY_HOST_CACHED_BIT));
+    if (g_silReadback.buffer == VK_NULL_HANDLE) {
+        LOG_WARN("silhouette readback: no HOST_CACHED memory type - using write-combined; "
+                 "the per-frame coverage read will be slower on this driver.");
+        g_silReadback = modelCreateBuffer(dev, phys, silBytes,
+            VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    }
     if (g_silReadback.buffer == VK_NULL_HANDLE) return false;
-    vkMapMemory(dev, g_silReadback.memory, 0, (VkDeviceSize)w * h * 4, 0, &g_silMapped);
+    vkMapMemory(dev, g_silReadback.memory, 0, silBytes, 0, &g_silMapped);
     return g_silMapped != nullptr;
 }
 
-// Render the avatar silhouette into the scratch image, read the alpha back,
-// and publish the coverage bitmap consumed by WM_NCHITTEST. Cheap (downscaled to
-// ~1/3 the window). Runs on the render thread right after the main eye render so
-// it reuses the renderer's internal targets (no resize thrash — imgW/imgH must
-// match the swapchain dims the main eye render passed, else ensureTargets churns
-// every frame as the two callers alternate sizes).
+// Render the avatar silhouette into the scratch images, read the alpha back,
+// and publish the coverage bitmap that shapes the window. Runs on the render
+// thread right after the main eye render so it reuses the renderer's internal
+// targets (grow-only, sized to the largest viewport seen — no resize thrash).
 //
-// The hit mask is the UNION of the FIRST and LAST active views: the weave shows
+// THE COVERAGE IS A VISUAL CLIP, NOT ONLY A HIT MASK. UpdateClickRegion turns
+// it into a window region via SetWindowRgn, and outside that region the HWND
+// does not exist — for rendering as much as for hit-testing. Everything this
+// pass used to trade away was justified against WM_NCHITTEST ("finer than the
+// dilation hit-tests apply anyway"), a claim that was true for input and was
+// never established for what the user sees. It was not true for the eye: a
+// fixed 256x144 raster gave a 3840 px window 15 px per texel, each texel
+// binary at alpha>40, with no dilation, so thin features (fingers, a hat brim,
+// hair) fell below one texel and were deleted from the window.
+//
+//   - the raster SCALES with the window (kSilTexelPx px per texel, capped),
+//     so precision no longer degrades as the window grows;
+//   - the coverage is DILATED by one texel before the region is built. The
+//     error is asymmetric: an over-large region leaves a few transparent
+//     pixels clickable, an under-large one deletes content;
+//   - the alpha threshold for coverage is LOW (kSilAlphaMin), not the hit
+//     test's 40, which erased anti-aliased edges;
+//   - and both halves of the union come from the SAME frame (below).
+//
+// The coverage is the UNION of the FIRST and LAST active views: the weave shows
 // every view at once with horizontal disparity that grows with window size — a
 // single-view mask visibly clips the other view's tiger on a large window. The
 // two outermost views bound the spread (middle views of a quad layout fall
 // between them for the convex-ish tiger).
+//
+// Env levers: DXR_AVATAR_SIL_TEXEL_PX (window px per texel, default 4),
+// DXR_AVATAR_SIL_DILATE (texels, default 1), DXR_AVATAR_SIL_ALPHA (1..255,
+// default 8), DXR_VK_NO_HOST_CACHED=1, DXR_DUMP_SILHOUETTE=1.
+static constexpr uint32_t kSilMaxW = 1024, kSilMaxH = 576;
+static constexpr uint32_t kSilMinW = 64, kSilMinH = 64;
+static constexpr uint32_t kSilTexelPxDefault = 4;
+
+static uint32_t SilEnvUInt(const char* name, uint32_t def, uint32_t lo, uint32_t hi) {
+    const char* e = std::getenv(name);
+    if (e == nullptr || e[0] == 0) return def;
+    const long v = std::strtol(e, nullptr, 10);
+    if (v < (long)lo || v > (long)hi) return def;
+    return (uint32_t)v;
+}
+
 static void UpdateSilhouette(VkDevice dev, VkPhysicalDevice phys, VkQueue queue, VkCommandPool pool,
                             uint32_t imgW, uint32_t imgH, uint32_t winW, uint32_t winH,
                             const float (*viewMats)[16], const float (*projMats)[16],
                             const float* clipFars, uint32_t numViews) {
     if (winW == 0 || winH == 0 || numViews == 0) return;
-    // Capped to 256x144 (was 640x360 — 6.2x the pixels). This mask is only ever
-    // consumed by WM_NCHITTEST, at a 3x3 dilation, to decide whether a click is
-    // on the avatar: a 256-wide mask over an ~800 px window is ~3 px of hit
-    // precision, which is finer than the dilation already applied. The extra
-    // resolution was buying nothing and every pixel is a full PBR+IBL+skinned
-    // shade at the renderer's MSAA level, twice (first and last view).
-    uint32_t w = winW / 3; if (w < 64) w = 64; if (w > 256) w = 256;
-    uint32_t h = winH / 3; if (h < 64) h = 64; if (h > 144) h = 144;
+    // Coverage resolution tracks the window instead of sitting at a fixed cap.
+    // Every texel is a full PBR+IBL+skinned shade, so this is not free — but at
+    // 4 px/texel a 3840x2160 window is 960x540 per view, ~5% of the main
+    // render's pixel count, and the renderer's targets are grow-only so the
+    // silhouette pass shares the (much larger) per-eye tile's targets.
+    static const uint32_t s_texelPx =
+        SilEnvUInt("DXR_AVATAR_SIL_TEXEL_PX", kSilTexelPxDefault, 1, 64);
+    static const uint32_t s_dilate = SilEnvUInt("DXR_AVATAR_SIL_DILATE", 1, 0, 16);
+    static const uint8_t s_alphaMin = (uint8_t)SilEnvUInt("DXR_AVATAR_SIL_ALPHA", 8, 1, 255);
+    uint32_t w = (winW + s_texelPx - 1) / s_texelPx;
+    uint32_t h = (winH + s_texelPx - 1) / s_texelPx;
+    if (w < kSilMinW) w = kSilMinW; if (w > kSilMaxW) w = kSilMaxW;
+    if (h < kSilMinH) h = kSilMinH; if (h > kSilMaxH) h = kSilMaxH;
 
-    // #837 pipelined readback: each invocation renders ONE view (alternating
-    // first/last), submits its render + copy with a fence, and does NOT wait —
-    // the NEXT invocation consumes the readback (by which time the fence is
-    // long signaled: the runtime's per-frame commit drains the queue). The
-    // published coverage is the union of the two most-recent per-view slots,
-    // so it lags a couple of frames — irrelevant for a dilated hit mask, and
-    // it removes the ~16 ms synchronous GPU stall this pass used to inject
-    // into every other frame.
+    // #837 pipelined readback: each invocation renders BOTH outermost views,
+    // submits its renders + copies with a fence, and does NOT wait — the NEXT
+    // invocation consumes the readback (by which time the fence is long
+    // signaled: the runtime's per-frame commit drains the queue). Staleness is
+    // therefore ONE frame, the pipelined readback, which is the ~16 ms
+    // synchronous stall this design correctly avoids. It used to be far worse:
+    // the pass ran every other frame, each pass rendered ONE view alternating
+    // first/last, and the published coverage unioned the two most-recent
+    // per-view slots — so the oldest pixels in the union could be ~6 frames
+    // (~100 ms) old, and the region visibly trailed a moving avatar, clipping
+    // its leading edge.
     static VkFence s_silFence = VK_NULL_HANDLE;
     static bool s_silPending = false;
-    static uint32_t s_silPendingSlot = 0, s_silPendingW = 0, s_silPendingH = 0;
+    static uint32_t s_silPendingW = 0, s_silPendingH = 0;
     static uint32_t s_silPendingWinW = 0, s_silPendingWinH = 0;
-    static std::vector<uint8_t> s_silSlot[2];
-    static uint32_t s_silNextSlot = 0;
+    static bool s_silPendingTwo = false;
 
     // 1. Consume the previous invocation's readback BEFORE EnsureSilhouetteTargets
     //    may recreate the image/buffer under the in-flight copy.
@@ -1651,36 +1747,84 @@ static void UpdateSilhouette(VkDevice dev, VkPhysicalDevice phys, VkQueue queue,
         const uint8_t* px = (const uint8_t*)g_silMapped;
         const size_t n = (size_t)s_silPendingW * s_silPendingH;
         if (px != nullptr && n > 0) {
-            auto& slot = s_silSlot[s_silPendingSlot];
-            slot.resize(n);
-            for (size_t i = 0; i < n; ++i) slot[i] = px[i * 4 + 3];
-            // Publish the union of both slots (a missing/mismatched slot
-            // contributes nothing).
+            const uint32_t cw = s_silPendingW, ch = s_silPendingH;
+            // Union the two planes of THIS readback: plane 0 = first view,
+            // plane 1 = last view, both rendered in the same frame. Mono has
+            // only plane 0.
+            //
+            // Row-wise memcpy BEFORE touching the bytes: memcpy uses wide
+            // streaming loads, which survive write-combined memory; the
+            // per-texel loop does not. Insurance for drivers with no
+            // HOST_CACHED type (see EnsureSilhouetteTargets).
             std::vector<uint8_t> unionAlpha(n, 0);
-            for (auto& s : s_silSlot) {
-                if (s.size() != n) continue;
-                for (size_t i = 0; i < n; ++i)
-                    if (s[i] > unionAlpha[i]) unionAlpha[i] = s[i];
+            std::vector<uint8_t> rowBuf((size_t)cw * 4);
+            for (uint32_t y = 0; y < ch; ++y) {
+                uint8_t* out = unionAlpha.data() + (size_t)y * cw;
+                memcpy(rowBuf.data(), px + (size_t)y * cw * 4, (size_t)cw * 4);
+                for (uint32_t x = 0; x < cw; ++x) out[x] = rowBuf[(size_t)x * 4 + 3];
+                if (s_silPendingTwo) {
+                    memcpy(rowBuf.data(), px + n * 4 + (size_t)y * cw * 4, (size_t)cw * 4);
+                    for (uint32_t x = 0; x < cw; ++x) {
+                        const uint8_t a = rowBuf[(size_t)x * 4 + 3];
+                        if (a > out[x]) out[x] = a;
+                    }
+                }
             }
-            {
-                std::lock_guard<std::mutex> lock(g_silCoverage.mtx);
-                g_silCoverage.bits.resize(n);
-                for (size_t i = 0; i < n; ++i) g_silCoverage.bits[i] = (unionAlpha[i] > 40) ? 1 : 0;
-                g_silCoverage.covW = (int)s_silPendingW; g_silCoverage.covH = (int)s_silPendingH;
-                g_silCoverage.winW = (int)s_silPendingWinW; g_silCoverage.winH = (int)s_silPendingWinH;
-                g_silCoverage.ready = true;
+            // Threshold, then dilate (separable). Both biased outward: the
+            // region deletes what it does not cover.
+            std::vector<uint8_t> bits(n, 0);
+            for (size_t i = 0; i < n; ++i) bits[i] = (unionAlpha[i] > s_alphaMin) ? 1 : 0;
+            if (s_dilate > 0) {
+                const uint32_t R = s_dilate;
+                std::vector<uint8_t> tmp(n, 0);
+                for (uint32_t y = 0; y < ch; ++y) {
+                    const uint8_t* src = bits.data() + (size_t)y * cw;
+                    uint8_t* dst = tmp.data() + (size_t)y * cw;
+                    for (uint32_t x = 0; x < cw; ++x) {
+                        if (!src[x]) continue;
+                        const uint32_t x0 = (x > R) ? x - R : 0;
+                        const uint32_t x1 = (x + R + 1 < cw) ? x + R + 1 : cw;
+                        memset(dst + x0, 1, x1 - x0);
+                    }
+                }
+                std::vector<uint8_t> out(n, 0);
+                for (uint32_t y = 0; y < ch; ++y) {
+                    const uint8_t* src = tmp.data() + (size_t)y * cw;
+                    const uint32_t y0 = (y > R) ? y - R : 0;
+                    const uint32_t y1 = (y + R + 1 < ch) ? y + R + 1 : ch;
+                    for (uint32_t yy = y0; yy < y1; ++yy) {
+                        uint8_t* d = out.data() + (size_t)yy * cw;
+                        for (uint32_t x = 0; x < cw; ++x) d[x] |= src[x];
+                    }
+                }
+                bits.swap(out);
             }
-
-            // Debug: with DXR_DUMP_SILHOUETTE set, dump the union (~once/sec) to
-            // %TEMP%\avatar_silhouette.png (white = avatar, black = pass-through).
+            // Debug: with DXR_DUMP_SILHOUETTE set, dump the mask AS PUBLISHED
+            // (~once/sec) to %TEMP%\avatar_silhouette.png — white = covered by
+            // the raw alpha test, grey = added by the dilation, black = clipped
+            // away. Diffing this against the rendered frame is what turns "the
+            // region eats content" into a comparison instead of an eyeballing
+            // exercise; dumping raw alpha (as this used to) could not show what
+            // the region actually deletes.
             static const bool s_dumpSil = (GetEnvironmentVariableA("DXR_DUMP_SILHOUETTE", nullptr, 0) > 0);
             static int s_dbgCounter = 0;
             if (s_dumpSil && (s_dbgCounter++ % 60) == 0) {
+                std::vector<uint8_t> dbg(n);
+                for (size_t i = 0; i < n; ++i) {
+                    dbg[i] = (unionAlpha[i] > s_alphaMin) ? 255 : (bits[i] ? 160 : 0);
+                }
                 char tmp[MAX_PATH] = {0};
                 GetTempPathA(MAX_PATH, tmp);
                 std::string path = std::string(tmp) + "avatar_silhouette.png";
-                stbi_write_png(path.c_str(), (int)s_silPendingW, (int)s_silPendingH, 1,
-                               unionAlpha.data(), (int)s_silPendingW);
+                stbi_write_png(path.c_str(), (int)cw, (int)ch, 1, dbg.data(), (int)cw);
+            }
+
+            {
+                std::lock_guard<std::mutex> lock(g_silCoverage.mtx);
+                g_silCoverage.bits.swap(bits);
+                g_silCoverage.covW = (int)s_silPendingW; g_silCoverage.covH = (int)s_silPendingH;
+                g_silCoverage.winW = (int)s_silPendingWinW; g_silCoverage.winH = (int)s_silPendingWinH;
+                g_silCoverage.ready = true;
             }
         }
     }
@@ -1691,14 +1835,21 @@ static void UpdateSilhouette(VkDevice dev, VkPhysicalDevice phys, VkQueue queue,
         if (vkCreateFence(dev, &fci, nullptr, &s_silFence) != VK_SUCCESS) return;
     }
 
-    // 2. Kick this invocation's view (alternating first/last on stereo).
-    const uint32_t slot = (numViews > 1) ? s_silNextSlot : 0u;
-    const uint32_t v = (slot == 0) ? 0u : numViews - 1;
+    // 2. Kick BOTH outermost views THIS frame.
+    //
+    // The coverage must stay a UNION of the first and last views — the weave
+    // shows every view at once with horizontal disparity, so a single-view mask
+    // visibly clips the other view's avatar. What changed is WHERE the halves
+    // come from: they used to be alternate invocations, so the union mixed data
+    // up to 4 frames apart. Rendering both here makes it self-consistent.
+    const uint32_t vFirst = 0u;
+    const uint32_t vLast = (numViews > 1) ? numViews - 1 : 0u;
+    const bool twoViews = (numViews > 1);
     {
         std::lock_guard<std::mutex> lock(g_sceneMutex);
         if (!g_modelRenderer.hasModel()) return;
         // Render the avatar into the bottom 75% of the silhouette image, so the
-        // hit mask matches the confined on-screen avatar (the zone-framed views
+        // mask matches the confined on-screen avatar (the zone-framed views
         // map 1:1 onto this sub-viewport — same NDC mapping). The top 25% is
         // left as-is (covered by the full-top-25% bubble rect in the click
         // region).
@@ -1706,8 +1857,14 @@ static void UpdateSilhouette(VkDevice dev, VkPhysicalDevice phys, VkQueue queue,
         const uint32_t silAvY = h - silAvH;
         g_modelRenderer.renderEye(g_silImage.image, VK_FORMAT_R8G8B8A8_UNORM,
             imgW, imgH,
-            0, silAvY, w, silAvH, viewMats[v], projMats[v], /*transparentBg=*/true,
-            clipFars[v]);
+            0, silAvY, w, silAvH, viewMats[vFirst], projMats[vFirst], /*transparentBg=*/true,
+            clipFars[vFirst]);
+        if (twoViews) {
+            g_modelRenderer.renderEye(g_silImage2.image, VK_FORMAT_R8G8B8A8_UNORM,
+                imgW, imgH,
+                0, silAvY, w, silAvH, viewMats[vLast], projMats[vLast], /*transparentBg=*/true,
+                clipFars[vLast]);
+        }
     }
     // renderEye leaves the scratch image in COLOR_ATTACHMENT_OPTIMAL → copy to host.
     VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
@@ -1732,8 +1889,17 @@ static void UpdateSilhouette(VkDevice dev, VkPhysicalDevice phys, VkQueue queue,
     region.bufferRowLength = w;
     region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     region.imageExtent = {w, h, 1};
+    region.bufferOffset = 0;
     vkCmdCopyImageToBuffer(cmd, g_silImage.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
         g_silReadback.buffer, 1, &region);
+    if (twoViews) {
+        toSrc.image = g_silImage2.image;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toSrc);
+        region.bufferOffset = (VkDeviceSize)w * h * 4;
+        vkCmdCopyImageToBuffer(cmd, g_silImage2.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            g_silReadback.buffer, 1, &region);
+    }
     vkEndCommandBuffer(cmd);
     VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
     si.commandBufferCount = 1; si.pCommandBuffers = &cmd;
@@ -1741,10 +1907,9 @@ static void UpdateSilhouette(VkDevice dev, VkPhysicalDevice phys, VkQueue queue,
     vkResetFences(dev, 1, &s_silFence);
     if (vkQueueSubmit(queue, 1, &si, s_silFence) == VK_SUCCESS) {
         s_silPending = true;
-        s_silPendingSlot = slot;
+        s_silPendingTwo = twoViews;
         s_silPendingW = w; s_silPendingH = h;
         s_silPendingWinW = winW; s_silPendingWinH = winH;
-        s_silNextSlot = (numViews > 1) ? (slot ^ 1u) : 0u;
     }
     // NOTE: cmd is consumed on the next invocation's fence wait; freeing it
     // here while in flight would be invalid. Free it lazily next call.
@@ -3046,15 +3211,24 @@ static void RenderThreadFunc(
                             // tracks the animation, W/S dolly, billboard yaw, and
                             // the display-plane clip) — union of the outermost
                             // views, see UpdateSilhouette. Render-thread-local.
-                            // Throttled to every other frame: the pass adds GPU
-                            // waits, and ~30 Hz is plenty for the hit region —
-                            // keeping it off the every-frame path steadies frame
-                            // timing (no billboard stutter). imgW/imgH = the dims
-                            // the eye render used, so the renderer's internal
-                            // targets don't churn.
+                            //
+                            // Runs EVERY frame, at the render rate. It used to be
+                            // throttled to every other frame because "the pass
+                            // adds GPU waits" and "~30 Hz is plenty for the hit
+                            // region". Both premises were wrong. The waits were
+                            // expensive because the readback buffer was
+                            // write-combined and read back byte-wise — fixed by
+                            // HOST_CACHED in EnsureSilhouetteTargets. And it is
+                            // not only a hit region: UpdateClickRegion turns this
+                            // coverage into a window region via SetWindowRgn,
+                            // which CLIPS THE WINDOW VISUALLY. Stacked with the
+                            // old view alternation and the pipelined readback the
+                            // oldest pixels in the union could be ~6 frames old,
+                            // and a fast-moving avatar had its leading edge
+                            // clipped away. imgW/imgH = the dims the eye render
+                            // used, so the renderer's internal targets don't churn.
                             if (s_stageTiming) stM[2] = stNow();
-                            static uint32_t s_silFrame = 0;
-                            if (hasGsScene && (s_silFrame++ & 1u) == 0u)
+                            if (hasGsScene)
                                 UpdateSilhouette(vkDevice, physDevice, graphicsQueue, renderCmdPool,
                                     targetW, targetH, windowW, windowH,
                                     viewMat, projMat, clipFar, (uint32_t)eyeCount);

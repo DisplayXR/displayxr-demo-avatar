@@ -26,11 +26,16 @@ at startup.
   (always on). `g_transparentBg` flips the renderer's output alpha + enables
   display-plane foreground clipping. `Ctrl+T` toggles for debugging. `B` toggles
   decoration (title bar) so the OS can move/resize, then back to borderless.
-- **Per-pixel click-through** — `UpdateSilhouette` renders one mono eye into a
-  scratch image (~1/3 res, every other frame), reads back alpha → coverage
-  bitmap; `UpdateClickRegion` shapes the window with `SetWindowRgn` so input
-  outside the silhouette falls through cross-process. `DXR_DUMP_SILHOUETTE=1`
-  dumps the mask to `%TEMP%\avatar_silhouette.png`.
+- **Per-pixel click-through** — `UpdateSilhouette` renders the FIRST and LAST
+  views into two scratch images **every frame** (same frame → the union is
+  self-consistent), reads back alpha through a `HOST_CACHED` pipelined readback
+  → thresholded + 1-texel-dilated coverage bitmap; `UpdateClickRegion` shapes
+  the window with `SetWindowRgn` so input outside the silhouette falls through
+  cross-process. **The region is a VISUAL CLIP, not just a hit mask** — outside
+  it the window is not drawn — so the raster scales with the window
+  (4 px/texel, capped 1024×576) and errs outward. Levers:
+  `DXR_AVATAR_SIL_TEXEL_PX` / `_DILATE` / `_ALPHA`, `DXR_VK_NO_HOST_CACHED=1`.
+  `DXR_DUMP_SILHOUETTE=1` dumps the mask to `%TEMP%\avatar_silhouette.png`.
 - **Face-the-viewer billboard** — yaw tracks the tracked head centre (from
   `rawEyes`), time-based smoothing, gated on `xr->isEyeTracking`. Pitch is
   implemented but disabled (`FACE_PITCH_SIGN`). LMB-drag overrides it.
@@ -192,9 +197,12 @@ Two capture paths, both readable on a flat monitor:
   `%USERPROFILE%\Pictures\DisplayXR\<name>_atlas_<vc>_<cols>x<rows>.png` (skipped
   for 1×1 mono), via runtime-owned `xrCaptureAtlasDXR`. Good for
   geometry/shading/framing + the bottom-70% confinement.
-- **Silhouette dump (`DXR_DUMP_SILHOUETTE=1`)** — writes the click-through hit
-  mask to `%TEMP%\avatar_silhouette.png` (~1/sec; white = avatar, black =
-  pass-through). Good for debugging projection + the shaped window region.
+- **Silhouette dump (`DXR_DUMP_SILHOUETTE=1`)** — writes the click-through mask
+  **as published** to `%TEMP%\avatar_silhouette.png` (~1/sec; white = covered by
+  the raw alpha test, grey = added by the dilation, black = clipped away). Diff
+  it against the rendered frame to see exactly what the shaped window is
+  deleting — that comparison is the point, and dumping raw alpha (as this used
+  to) could not show it.
 
 The compositor file-trigger screenshot does **not** work for the in-process VK
 compositor — use the two dumps above, or ask the user to eyeball the live SR
