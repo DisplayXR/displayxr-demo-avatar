@@ -1775,7 +1775,20 @@ render_frame()
 	XrFrameBeginInfo begin_info = {};
 	begin_info.type = XR_TYPE_FRAME_BEGIN_INFO;
 	res = xrBeginFrame(g_session, &begin_info);
-	if (res != XR_SUCCESS) {
+	/*
+	 * XR_FRAME_DISCARDED is a SUCCESS code (+9), not an error. Testing
+	 * `!= XR_SUCCESS` bailed here WITHOUT calling xrEndFrame — and the runtime
+	 * clears its `frame_started` flag ONLY in xrEndFrame. So one discarded
+	 * frame latched the session permanently: every later xrBeginFrame returned
+	 * XR_FRAME_DISCARDED, this branch skipped xrEndFrame again, and the loop
+	 * spun at ~375 calls/sec pegging a core with nothing reaching the screen.
+	 * Observed on an NP02J as a hard "app froze" with no crash and no error.
+	 *
+	 * XR_FAILED() tests result < 0, so a discard now falls through and we still
+	 * reach xrEndFrame, which is what lets the runtime recover. Rendering is
+	 * separately gated on frame_state.shouldRender.
+	 */
+	if (XR_FAILED(res)) {
 		log_xr_result("xrBeginFrame", res);
 		return false;
 	}
@@ -2655,6 +2668,24 @@ handle_touch(jint action, jint count, jfloat x0, jfloat y0, jfloat x1, jfloat y1
 			zone_h = g_sil.zoneH;
 		}
 		if (zone_h > 0 && g_rig_vh > 1e-3f) s_pan_per_px = g_rig_vh / (float)zone_h;
+		drag_x = x0;
+		drag_y = y0;
+		drag_valid = true;
+	} else if (action == kMove && !drag_valid) {
+		/*
+		 * Re-arm mid-gesture instead of waiting for a fresh ACTION_DOWN.
+		 *
+		 * `drag_valid` is cleared by ANY event reporting count >= 2 and was
+		 * re-armed ONLY by ACTION_DOWN, so a single transient two-pointer
+		 * report during a one-finger drag — a palm graze, a thumb edge, one
+		 * spurious digitizer contact — killed the gesture permanently: the
+		 * camera stopped responding, further finger movement did nothing, and
+		 * the user had to lift and drag again.
+		 *
+		 * Re-seed the anchor from the current position and consume this event
+		 * without applying a delta, so recovery costs one sample rather than
+		 * jumping the camera by the whole gap since the drag was lost.
+		 */
 		drag_x = x0;
 		drag_y = y0;
 		drag_valid = true;
