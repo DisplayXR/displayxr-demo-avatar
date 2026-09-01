@@ -2632,13 +2632,48 @@ handle_touch(jint action, jint count, jfloat x0, jfloat y0, jfloat x1, jfloat y1
 		return;
 	}
 
-	if (count >= 2) {
+	/*
+	 * EXACTLY two pointers. This panel delivers phantom contacts during an
+	 * ordinary one-finger swipe (count seen as 2 and 3 on an NP02J), and with
+	 * three the "second finger" at index 1 is whichever phantom the platform
+	 * ordered there — there is no pinch to measure, so do not guess one.
+	 */
+	if (count > 2) {
+		pinch_last = 0.0f;
+		drag_valid = false;
+		return;
+	}
+	if (count == 2) {
 		// ── two fingers: pinch-to-zoom (scale around the auto-fit size) ──
 		drag_valid = false;  // suppress rotation while pinching
 		const float dx = x0 - x1, dy = y0 - y1;
 		const float dist = std::sqrt(dx * dx + dy * dy);
+		/*
+		 * A pinch STARTS on ACTION_POINTER_DOWN and only then. It used to start
+		 * on any count >= 2 event including a MOVE, so a phantom contact
+		 * appearing mid-swipe opened a pinch against a distance that was never
+		 * a real finger separation. Measured on an NP02J during an ordinary
+		 * ONE-finger swipe: count reported as 2 AND 3, p0 frozen at ~(1171,1319)
+		 * while p1 teleported 629 -> 949 -> 320 -> 285 between samples, giving
+		 * ratios like 998/370 = 2.7x in a single event. The model lurched in
+		 * saccades. (kPointerDown == AMOTION_EVENT_ACTION_POINTER_DOWN.)
+		 */
+		constexpr int kPointerDown = 5;
+		if (action == kPointerDown) {
+			pinch_last = dist;
+			return;
+		}
 		if (action == kMove && pinch_last > 1.0f) {
-			float s = g_scene_scale.load(std::memory_order_relaxed) * (dist / pinch_last);
+			/*
+			 * Clamp the PER-EVENT ratio. Real fingers change separation smoothly
+			 * at touch-sample rate. The lo/hi clamp below bounds only the
+			 * ACCUMULATED scale, so a single 2.7x sample sailed straight through
+			 * it — which is why that existing clamp never caught this.
+			 */
+			float ratio = dist / pinch_last;
+			if (ratio < 0.9f) ratio = 0.9f;
+			if (ratio > 1.111f) ratio = 1.111f;
+			float s = g_scene_scale.load(std::memory_order_relaxed) * ratio;
 			const float lo = g_fit_scale * 0.15f, hi = g_fit_scale * 8.0f;
 			if (s < lo) s = lo;
 			if (s > hi) s = hi;
