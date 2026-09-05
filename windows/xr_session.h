@@ -26,6 +26,12 @@ extern bool g_hasViewRigExt;
 // (the tiger, bottom 75%) framed by the runtime rig instead of app-side Kooima.
 extern bool g_hasDisplayZonesExt;
 
+// True when the runtime advertises XR_DXR_depth_budget (set in InitializeOpenXR).
+// An older runtime lacks the extension entirely — the app must keep running
+// with today's hand-rolled ZDP clip unchanged (dxr::ResolveClipPlanes' no-budget
+// fallback), never fail to start. See displayxr-demo-avatar#81.
+extern bool g_hasDepthBudgetExt;
+
 // XR_DXR_display_zones entry points (resolved in InitializeOpenXR; NULL when
 // the extension is absent — callers must check).
 extern PFN_xrGetDisplayZoneCapabilitiesDXR g_pfnGetDisplayZoneCaps;
