@@ -7,8 +7,9 @@
 
 #include "xr_session.h"
 #include "logging.h"
-#include <openxr/XR_DXR_local_3d_zone.h>  // Local2D speech-bubble layer
-#include <openxr/XR_DXR_view_rig.h>       // XR_DXR_VIEW_RIG_EXTENSION_NAME
+#include <openxr/XR_DXR_local_3d_zone.h>   // Local2D speech-bubble layer
+#include <openxr/XR_DXR_view_rig.h>        // XR_DXR_VIEW_RIG_EXTENSION_NAME
+#include <openxr/XR_DXR_depth_budget.h>    // XR_DXR_DEPTH_BUDGET_EXTENSION_NAME
 #include <cstring>
 
 // App-side availability flag (XrSessionManager carries no app-named fields).
@@ -21,6 +22,11 @@ bool g_hasLocal3DZone = false;
 // consumes render-ready XrView pose/fov instead of running app-side Kooima).
 bool g_hasViewRigExt = false;
 bool g_hasDisplayZonesExt = false;
+
+// XR_DXR_depth_budget (#81): runtime-advisory rear depth budget for the
+// transparent-standalone ZDP clip. Optional — older runtimes (including the
+// one on this box today) don't advertise it, and the app must run unchanged.
+bool g_hasDepthBudgetExt = false;
 PFN_xrGetDisplayZoneCapabilitiesDXR g_pfnGetDisplayZoneCaps = nullptr;
 PFN_xrGetDisplayZoneRecommendedViewSizeDXR g_pfnGetDisplayZoneViewSize = nullptr;
 
@@ -97,6 +103,9 @@ bool InitializeOpenXR(XrSessionManager& xr) {
         if (strcmp(ext.extensionName, XR_DXR_MCP_TOOLS_EXTENSION_NAME) == 0) {
             g_hasMcpToolsExt = true;
         }
+        if (strcmp(ext.extensionName, XR_DXR_DEPTH_BUDGET_EXTENSION_NAME) == 0) {
+            g_hasDepthBudgetExt = true;
+        }
     }
 
     LOG_INFO("XR_KHR_vulkan_enable2: %s", hasVulkan ? "AVAILABLE" : "NOT FOUND");
@@ -108,6 +117,7 @@ bool InitializeOpenXR(XrSessionManager& xr) {
     LOG_INFO("XR_DXR_view_rig: %s", g_hasViewRigExt ? "AVAILABLE" : "NOT FOUND");
     LOG_INFO("XR_DXR_display_zones: %s", g_hasDisplayZonesExt ? "AVAILABLE" : "NOT FOUND");
     LOG_INFO("XR_DXR_mcp_tools: %s", g_hasMcpToolsExt ? "AVAILABLE" : "NOT FOUND");
+    LOG_INFO("XR_DXR_depth_budget: %s", g_hasDepthBudgetExt ? "AVAILABLE" : "NOT FOUND");
 
     if (!hasVulkan) {
         LOG_ERROR("XR_KHR_vulkan_enable2 extension not available");
@@ -144,6 +154,9 @@ bool InitializeOpenXR(XrSessionManager& xr) {
     }
     if (g_hasMcpToolsExt) {
         enabledExtensions.push_back(XR_DXR_MCP_TOOLS_EXTENSION_NAME);
+    }
+    if (g_hasDepthBudgetExt) {
+        enabledExtensions.push_back(XR_DXR_DEPTH_BUDGET_EXTENSION_NAME);
     }
 
     XrInstanceCreateInfo createInfo = {XR_TYPE_INSTANCE_CREATE_INFO};

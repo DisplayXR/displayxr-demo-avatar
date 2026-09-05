@@ -31,10 +31,12 @@
 #include <openxr/XR_DXR_local_3d_zone.h>  // XrCompositionLayerLocal2DDXR (speech bubble)
 #include <openxr/XR_DXR_display_zones.h>  // XrDisplayZoneDXR — the tiger zone (ADR-027)
 #include <openxr/XR_DXR_view_rig.h>       // XrDisplayRigDXR locate + XrViewDisplayRawDXR readback
+#include <openxr/XR_DXR_depth_budget.h>   // XrRearDepthBudgetDXR (#81)
 #include "display3d_view.h"
 #include "projection_depth.h"
 #include "auto_fit.h"       // dxr::AutoFitVHeight / FitTransition — shared framing rule
 #include "auto_fit_canvas.h" // dxr::AutoFitCanvas — the runtime-resolved zone canvas
+#include "clip_policy.h"     // dxr::ResolveClipPlanes / ChainRearDepthBudget (#81)
 
 #include "hud_renderer.h"   // HudRenderer + text_overlay (RenderFilledRect/RenderText) — drive the speech bubble
 #include "atlas_capture.h"
@@ -2751,6 +2753,13 @@ static void RenderThreadFunc(
                 XrDisplayRigDXR  tigerRig  = {XR_TYPE_DISPLAY_RIG_DXR};
                 bool zonesFrame = false;
 
+                // XR_DXR_depth_budget (#81): zero-init'd here so it's in scope at
+                // both the zone-scoped locate below (where it's chained) and the
+                // per-eye clip resolve further down. Stays a zeroed, untouched
+                // struct — and therefore ignored by dxr::ResolveClipPlanes via the
+                // `type` check — whenever the extension isn't enabled.
+                XrRearDepthBudgetDXR zoneBudget = {};
+
                 if (frameState.shouldRender) {
                     if (LocateViews(*xr, frameState.predictedDisplayTime,
                         inputSnapshot.cameraPosX, -inputSnapshot.cameraPosY, inputSnapshot.cameraPosZ,
@@ -2974,6 +2983,12 @@ static void RenderThreadFunc(
                             XrViewDisplayRawDXR zoneRaw = {XR_TYPE_VIEW_DISPLAY_RAW_DXR};
                             XrViewState zoneViewState = {XR_TYPE_VIEW_STATE};
                             zoneViewState.next = &zoneRaw;
+                            // XR_DXR_depth_budget (#81): chain AFTER zoneRaw so the
+                            // existing raw-readback chain entry is preserved
+                            // (ChainRearDepthBudget prepends, keeping zoneRaw linked).
+                            if (g_hasDepthBudgetExt) {
+                                dxr::ChainRearDepthBudget(zoneViewState, zoneBudget);
+                            }
                             for (uint32_t i = 0; i < 8; i++) zoneViews[i] = {XR_TYPE_VIEW};
                             XrResult zlr = xrLocateViews(xr->session, &zoneLocate, &zoneViewState,
                                                          8, &zoneViewCount, zoneViews);
@@ -3108,16 +3123,18 @@ static void RenderThreadFunc(
                             }
                         }
 
-                        // Foreground-only clip: in transparent mode, cull splats
+                        // Foreground-only clip: in transparent mode, cull the avatar
                         // behind the virtual display plane so only popping-out
                         // content shows. Suppressed under the shell's external
                         // multi-compositor (non-controller workspace session,
                         // where the per-app transparent bridge is bypassed) —
-                        // signalled by renderingModeIsRequestable being false.
+                        // signalled by renderingModeIsRequestable being false. This
+                        // `standalone` predicate is the same one dxr::ResolveClipPlanes
+                        // takes below (#81) — it, not a separate foregroundClip flag,
+                        // now gates both the projection far plane and clipFar.
                         bool standalone = (xr->renderingModeCount == 0) ||
                             (xr->currentModeIndex < xr->renderingModeCount &&
                              xr->renderingModeIsRequestable[xr->currentModeIndex]);
-                        bool foregroundClip = g_transparentBg.load() && standalone;
 
                         // Build per-eye view/projection matrices (column-major float[16]).
                         // Sized to the runtime's max view count so Quad mode (4 views) fits.
@@ -3136,17 +3153,28 @@ static void RenderThreadFunc(
                                 const XrView& zv = zoneViews[(uint32_t)eye < zoneViewCount ? eye : zoneViewCount - 1];
                                 const float vH = tigerRig.virtualDisplayHeight;
                                 const float ez = RigLocalEyeZ(tigerRig.pose, zv.pose.position);
-                                const float nearZ = (ez - vH > 0.001f) ? (ez - vH) : 0.001f;
-                                const float farZ  = g_transparentBg.load() ? ez : ez + 1000.0f * vH;
+                                // XR_DXR_depth_budget (#81): dxr::ResolveClipPlanes is
+                                // the ONE place that turns the runtime's advisory rear
+                                // depth budget (or its absence) into near/far + the
+                                // shader/silhouette far-cull. `budget` is non-null only
+                                // when the runtime actually filled the chained struct
+                                // this locate (see the zero-init comment above); a
+                                // runtime that predates the extension, or an app that
+                                // didn't enable it, falls back to the pre-#81 rule
+                                // baked into the helper (transparent && standalone ?
+                                // 0 : 1000 vH), applied uniformly to near/far AND
+                                // clipFar — see PR for the narrow behavior note.
+                                const XrRearDepthBudgetDXR* budget =
+                                    (zoneBudget.type == XR_TYPE_REAR_DEPTH_BUDGET_DXR) ? &zoneBudget : nullptr;
+                                const dxr::ClipPlanes clip = dxr::ResolveClipPlanes(
+                                    ez, vH, budget, g_transparentBg.load(), standalone);
                                 mat4_view_from_xr_pose(viewMat[eye], zv.pose);
-                                mat4_from_xr_fov(projMat[eye], zv.fov, nearZ, farZ);
+                                mat4_from_xr_fov(projMat[eye], zv.fov, clip.near_z, clip.far_z);
                                 // GL ([-1,1] clip-z) -> Vulkan [0,1].
                                 convert_projection_gl_to_zero_to_one(projMat[eye]);
                                 // ez = eye->display-plane forward distance, same world
                                 // units as the shader's p_view.z (ex eye_display.z).
-                                if (foregroundClip) {
-                                    clipFar[eye] = (ez > 0.2f) ? ez : 0.0f;  // never cull at/behind near
-                                }
+                                clipFar[eye] = clip.clipFar;  // 0 = no cull; never cull at/behind near (helper's ez>0.2f guard)
                             } else {
                                 // Fallback: use DirectXMath mono matrices, store as column-major
                                 XMMATRIX v = monoMode ? monoViewMatrix :
