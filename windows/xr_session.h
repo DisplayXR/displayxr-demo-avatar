@@ -32,6 +32,13 @@ extern bool g_hasDisplayZonesExt;
 // fallback), never fail to start. See displayxr-demo-avatar#81.
 extern bool g_hasDepthBudgetExt;
 
+// The runtime's reported XR_DXR_depth_budget extensionVersion (0 when the
+// extension is absent). v3 added XrContentMaskDXR — gate chaining the
+// silhouette mask on this being >= 3, never on the app's own vendored
+// SPEC_VERSION, so a v2 runtime is never handed a v3 chain it doesn't parse.
+// See displayxr-demo-avatar#81 §6.
+extern uint32_t g_depthBudgetExtVersion;
+
 // XR_DXR_display_zones entry points (resolved in InitializeOpenXR; NULL when
 // the extension is absent — callers must check).
 extern PFN_xrGetDisplayZoneCapabilitiesDXR g_pfnGetDisplayZoneCaps;

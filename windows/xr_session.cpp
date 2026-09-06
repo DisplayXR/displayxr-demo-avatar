@@ -27,6 +27,7 @@ bool g_hasDisplayZonesExt = false;
 // transparent-standalone ZDP clip. Optional — older runtimes (including the
 // one on this box today) don't advertise it, and the app must run unchanged.
 bool g_hasDepthBudgetExt = false;
+uint32_t g_depthBudgetExtVersion = 0;
 PFN_xrGetDisplayZoneCapabilitiesDXR g_pfnGetDisplayZoneCaps = nullptr;
 PFN_xrGetDisplayZoneRecommendedViewSizeDXR g_pfnGetDisplayZoneViewSize = nullptr;
 
@@ -105,6 +106,7 @@ bool InitializeOpenXR(XrSessionManager& xr) {
         }
         if (strcmp(ext.extensionName, XR_DXR_DEPTH_BUDGET_EXTENSION_NAME) == 0) {
             g_hasDepthBudgetExt = true;
+            g_depthBudgetExtVersion = ext.extensionVersion;
         }
     }
 
@@ -117,7 +119,8 @@ bool InitializeOpenXR(XrSessionManager& xr) {
     LOG_INFO("XR_DXR_view_rig: %s", g_hasViewRigExt ? "AVAILABLE" : "NOT FOUND");
     LOG_INFO("XR_DXR_display_zones: %s", g_hasDisplayZonesExt ? "AVAILABLE" : "NOT FOUND");
     LOG_INFO("XR_DXR_mcp_tools: %s", g_hasMcpToolsExt ? "AVAILABLE" : "NOT FOUND");
-    LOG_INFO("XR_DXR_depth_budget: %s", g_hasDepthBudgetExt ? "AVAILABLE" : "NOT FOUND");
+    LOG_INFO("XR_DXR_depth_budget: %s (v%u)", g_hasDepthBudgetExt ? "AVAILABLE" : "NOT FOUND",
+             g_depthBudgetExtVersion);
 
     if (!hasVulkan) {
         LOG_ERROR("XR_KHR_vulkan_enable2 extension not available");

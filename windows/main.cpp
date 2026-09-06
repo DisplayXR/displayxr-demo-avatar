@@ -38,6 +38,7 @@
 #include "auto_fit_canvas.h" // dxr::AutoFitCanvas — the runtime-resolved zone canvas
 #include "clip_policy.h"     // dxr::ResolveClipPlanes / ChainRearDepthBudget (#81)
 #include "content_bounds.h"  // dxr::ProjectAabbToWindowBounds / ChainContentBounds (#81 v2; #82 zone rebase)
+#include "content_mask.h"    // dxr::ContentMaskFromCoverage / ChainContentMask (#81 v3 silhouette ROI)
 
 #include "hud_renderer.h"   // HudRenderer + text_overlay (RenderFilledRect/RenderText) — drive the speech bubble
 #include "atlas_capture.h"
@@ -1294,6 +1295,20 @@ struct SilhouetteCoverage {
     bool ready = false;
 };
 static SilhouetteCoverage g_silCoverage;
+
+// ── XR_DXR_depth_budget v3 (#81 §6): retained silhouette content mask ──────
+// Reduced from g_silCoverage's zone sub-rect once per rendered frame (see the
+// call site beside UpdateSilhouette below) and re-chained verbatim by the
+// no-render xrEndFrame path too, so a frame that skips rendering doesn't make
+// the runtime's ROI go stale. Render-thread-owned (this whole loop is one
+// thread) — no lock needed, unlike g_silCoverage which WM_NCHITTEST also reads.
+static std::vector<uint8_t> g_contentMaskCells;
+static uint32_t g_contentMaskW = 0, g_contentMaskH = 0;
+static bool g_contentMaskChaining = false;  // one-time LOG_INFO on start/stop, never per frame
+// Grid resolution for the chained mask: well under the extension's 512 cap and
+// the 256 "recommended ceiling" (the runtime's own disparity-band dilation
+// erases anything finer anyway) — coarse is the point, not a shortcut.
+static constexpr uint32_t kContentMaskGridCells = 64;
 
 // Speech-bubble client-window rect, published by the render thread and unioned
 // into the window region by UpdateClickRegion so the bubble (which sits above
@@ -3477,10 +3492,69 @@ static void RenderThreadFunc(
                             // clipped away. imgW/imgH = the dims the eye render
                             // used, so the renderer's internal targets don't churn.
                             if (s_stageTiming) stM[2] = stNow();
-                            if (hasGsScene)
+                            if (hasGsScene) {
                                 UpdateSilhouette(vkDevice, physDevice, graphicsQueue, renderCmdPool,
                                     targetW, targetH, windowW, windowH,
                                     viewMat, projMat, clipFar, (uint32_t)eyeCount);
+
+                                // XR_DXR_depth_budget v3 (#81 §6): reduce the SAME
+                                // per-frame coverage UpdateSilhouette just published to
+                                // g_silCoverage — no second GPU readback — to the
+                                // extension's content-occupancy grid. g_silCoverage
+                                // spans the WHOLE window at coverage resolution, but the
+                                // avatar is only ever drawn into its bottom-75%
+                                // sub-image (UpdateSilhouette's silAvY/silAvH split, the
+                                // same fraction tigerZone.rect derives from windowH), so
+                                // that sub-rect IS the zone's coverage; ContentMaskFromCoverage's
+                                // srcRectPx (tigerZone.rect, window client px) places it
+                                // back into the WINDOW-normalised grid, leaving cells
+                                // outside the zone at 0. Gated on the RUNTIME's reported
+                                // extensionVersion, never this app's vendored
+                                // SPEC_VERSION — a v2 runtime must never be handed a v3
+                                // chain it was not written to parse.
+                                if (g_hasDepthBudgetExt && g_depthBudgetExtVersion >= 3 && zonesFrame) {
+                                    std::vector<uint8_t> maskCells;
+                                    bool haveMask = false;
+                                    {
+                                        std::lock_guard<std::mutex> covLock(g_silCoverage.mtx);
+                                        if (g_silCoverage.ready && g_silCoverage.covW > 0 &&
+                                            g_silCoverage.covH > 0) {
+                                            const int covW = g_silCoverage.covW;
+                                            const int covH = g_silCoverage.covH;
+                                            const int zoneCovH = (covH * 3) / 4;
+                                            const int zoneCovY = covH - zoneCovH;
+                                            if (zoneCovH > 0) {
+                                                const uint8_t* zoneSrc = g_silCoverage.bits.data() +
+                                                    (size_t)zoneCovY * (size_t)covW;
+                                                haveMask = dxr::ContentMaskFromCoverage(
+                                                    zoneSrc, (uint32_t)covW, (uint32_t)zoneCovH,
+                                                    (uint32_t)covW, windowW, windowH, &tigerZone.rect,
+                                                    kContentMaskGridCells, kContentMaskGridCells,
+                                                    maskCells);
+                                            }
+                                        }
+                                    }
+                                    const uint32_t occupied =
+                                        haveMask ? dxr::ContentMaskCoverageCells(maskCells) : 0;
+                                    if (occupied > 0) {
+                                        g_contentMaskCells.swap(maskCells);
+                                        g_contentMaskW = kContentMaskGridCells;
+                                        g_contentMaskH = kContentMaskGridCells;
+                                        if (!g_contentMaskChaining) {
+                                            g_contentMaskChaining = true;
+                                            LOG_INFO("XR_DXR_depth_budget v3: content mask "
+                                                     "chaining started (%ux%u cells, %u occupied)",
+                                                     kContentMaskGridCells, kContentMaskGridCells,
+                                                     occupied);
+                                        }
+                                    } else if (g_contentMaskChaining) {
+                                        g_contentMaskChaining = false;
+                                        g_contentMaskCells.clear();
+                                        LOG_INFO("XR_DXR_depth_budget v3: content mask chaining "
+                                                 "stopped (no coverage) - falling back to bounds");
+                                    }
+                                }
+                            }
                             if (s_stageTiming) stM[3] = stNow();
                         } else {
                             rendered = false;
@@ -3803,6 +3877,22 @@ static void RenderThreadFunc(
                     if (g_hasDepthBudgetExt && haveContentBounds) {
                         dxr::ChainContentBounds(endInfo, contentBoundsDXR, contentBoundsRect);
                     }
+                    // XR_DXR_depth_budget v3 (#81 §6): chain the silhouette content
+                    // MASK on top of the bounds above — content_mask.h documents this
+                    // exact ordering ("chain the mask first, then the bounds": calling
+                    // ChainContentMask AFTER ChainContentBounds makes fei.next -> mask
+                    // -> bounds -> ..., i.e. the mask ends up FIRST in the chain the
+                    // runtime walks). The bounds chain above is left wired regardless —
+                    // it is the fallback the runtime falls back to when the mask is
+                    // absent/all-zero/stale, never removed. g_contentMaskCells is a
+                    // retained, render-thread-owned vector (never a per-call temporary)
+                    // so it stays alive across this xrEndFrame AND the no-render path's.
+                    XrContentMaskDXR contentMaskDXR;
+                    if (g_hasDepthBudgetExt && g_depthBudgetExtVersion >= 3 &&
+                        !g_contentMaskCells.empty()) {
+                        dxr::ChainContentMask(endInfo, contentMaskDXR, g_contentMaskCells,
+                                              g_contentMaskW, g_contentMaskH);
+                    }
                     if (s_stageTiming) stM[4] = stNow();
                     xrEndFrame(xr->session, &endInfo);
                     if (s_stageTiming && stM[1] != 0 && stM[2] != 0 && stM[3] != 0) {
@@ -3834,6 +3924,19 @@ static void RenderThreadFunc(
                     endInfo.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
                     endInfo.layerCount = 0;
                     endInfo.layers = nullptr;
+                    // XR_DXR_depth_budget v3 (#81 §6): re-chain the last retained
+                    // silhouette mask even on a frame that skipped rendering (no
+                    // fresh coverage was produced this iteration), so the runtime's
+                    // ROI does not go stale just because a frame had nothing new to
+                    // draw. No XrContentBoundsDXR exists to chain behind it here —
+                    // this frame built no view/proj matrices to project with — so the
+                    // mask, if any, is the only chain entry.
+                    XrContentMaskDXR contentMaskDXR;
+                    if (g_hasDepthBudgetExt && g_depthBudgetExtVersion >= 3 &&
+                        !g_contentMaskCells.empty()) {
+                        dxr::ChainContentMask(endInfo, contentMaskDXR, g_contentMaskCells,
+                                              g_contentMaskW, g_contentMaskH);
+                    }
                     xrEndFrame(xr->session, &endInfo);
                 }
             }
