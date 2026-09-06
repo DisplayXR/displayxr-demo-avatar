@@ -238,3 +238,108 @@ GROW as well as SHRINK so no single jitter spike can trigger a resize.
 
 True per-pixel shaping still needs the consent-gated AccessibilityService route
 designed in displayxr-runtime#1114.
+
+---
+
+## Update, 2026-09-06 — the overlay must stand down while RECENTS is up (#83)
+
+The tight touchable overlay is, by construction, a live input sink inside its own
+frame. That is the whole trick (it is what keeps alpha at 1.00). It is also the
+whole bug once the launcher's **overview** comes up, because what is underneath
+the frame is then the recents cards and their per-card buttons.
+
+Measured on the NP02J, landscape, Leo up, `dumpsys input`:
+
+```
+name='… com.displayxr.avatar_vk_android', inputConfig=NOT_FOCUSABLE | PREVENT_SPLITTING,
+  alpha=1.00, frame=[0,680][1600,1880], touchableRegion=[0,680][1600,1880]
+```
+
+In landscape screen coordinates that is a full-height band at x∈[680,1880] —
+which contains the cards' freeform button (measured at x≈1504 in a two-card
+single-column overview, x≈1864 in a three-card two-column one). A tap there did
+nothing; a tap that missed the band opened whatever card was under it.
+
+### Why geometry cannot fix this
+
+Recents is full-screen. There is no overlay frame both large enough to show Leo
+and small enough to miss the cards' controls — and #67/#68 above already
+established that driving the frame off the rendered content is a feedback loop.
+The fix has to be **time-scoped**: stand the overlay's input down for the
+duration of the overview.
+
+`FLAG_NOT_TOUCHABLE` costs the platform's ≤0.80 alpha clamp (§ *Wall 2*), so it
+must never be permanent — but for the seconds the overview is on screen, nobody
+is looking at the weave, and dimming beats swallowing the launcher's own buttons.
+
+### The signal — an exact ARM edge, no exact DISARM edge
+
+`dumpsys activity broadcasts` (foreground history) on this ROM:
+
+| gesture | broadcast |
+|---|---|
+| `KEYCODE_APP_SWITCH` (open **and** close) | `CLOSE_SYSTEM_DIALOGS` `{reason=recentapps}` |
+| `KEYCODE_HOME` | `CLOSE_SYSTEM_DIALOGS` `{reason=homekey}` |
+| BACK out of the overview | *nothing* |
+| tapping a card | *nothing* |
+
+The intent carries `flg=0x50000010`, i.e. **`FLAG_RECEIVER_REGISTERED_ONLY`** — a
+manifest `<receiver>` never sees it, so registration must be dynamic. Android 12
+blocked apps from *sending* this broadcast; receiving the system-sent one from an
+ordinary uid still works on stock Android 13 (verified).
+
+Because `recentapps` fires on both open and close it cannot be used as a toggle:
+the moment the overview is dismissed any other way the toggle inverts, and an
+inverted toggle leaves Leo dead on the home screen. And nothing else observable
+to an unprivileged process moves — on this ROM the overview is a **state of the
+launcher activity**, not an activity of its own (`mCurrentFocus` stays
+`QuickstepLauncher` throughout), so there is no focus, lifecycle, configuration
+or window-visibility edge either. `UsageStatsManager` / an `AccessibilityService`
+would see it, and both are out of scope for a demo.
+
+### What ships
+
+Arm on `recentapps`. Disarm on, in decreasing exactness:
+
+1. `homekey` — the canonical way back to Leo's desktop, and exact;
+2. our own `onResume` — the user tapped **our** card;
+3. a bounded watchdog (`debug.dxr.avatar.recents.hold_ms`, default 30 s) — the
+   only thing between "dismissed by back or by tapping another card" and a
+   permanently untouchable avatar. It is a safety net, not the mechanism: if the
+   overview is left up longer than the hold, the overlay becomes touchable again
+   and behaves exactly as it did before this change. Overshooting the other way
+   only costs the ability to *drag* Leo for the remainder — the desktop under
+   him is strictly more clickable while armed, not less.
+
+Master kill-switch: `debug.dxr.avatar.recents` (default 1). It gates **arming
+only**, so flipping it off can never strand an armed overlay.
+
+The flag is folded into `overlayLayoutParams()` rather than OR-ed on at the call
+site, so it survives every `updateViewLayout` (rotation, slab change). Width and
+height do not change when it is applied, so there is no new buffer queue and no
+swapchain recreate — the #68 flicker came from *resizing*, not from
+`updateViewLayout` as such.
+
+### One more gate opens when we go NOT_TOUCHABLE — alpha
+
+While touchable, the overlay is the *touched* window, so the untrusted-touch
+occlusion policy is never consulted for it (§ *Wall 2*). `FLAG_NOT_TOUCHABLE`
+inverts that: we become an **obscuring** window over the launcher, and the tap we
+are trying to let through is dropped if the opacity accumulated from
+different-uid windows above it *exceeds*
+`Settings.Global.maximum_obscuring_opacity_for_touch`.
+
+So the armed state also requests `alpha = maximum_obscuring_opacity_for_touch`
+(read at arm time, AOSP default 0.8 if unreadable) — the largest value that still
+passes the gate. Two measurements on the reference NP02J that the older notes get
+wrong:
+
+* the setting reads **1.0** on this device, not 0.8 — so on this pad the
+  pass-through costs **no dimming at all**; and
+* the platform did **not** clamp a `FLAG_NOT_TOUCHABLE` application overlay to
+  0.80 the way #66 recorded — `dumpsys input` reported `alpha=1.00` with the flag
+  set.
+
+Neither is safe to assume on another ROM, which is why the value is read rather
+than hardcoded, and why the fallback is the conservative 0.8: too low only dims,
+too high silently eats the taps this change exists to let through.

@@ -35,6 +35,13 @@
 //      orthogonal axes, and XR_DXR_android_surface_binding takes any
 //      ANativeWindow. Without the grant the app stays on this Activity's window:
 //      still renders, still weaves, just swallows taps.
+//   7. #83 RECENTS PASS-THROUGH — job 6's overlay is deliberately touchable
+//      inside its frame, which makes it an input sink over whatever is beneath.
+//      When the launcher's overview comes up, that is the recents cards and
+//      their buttons. While recents is showing the overlay goes
+//      FLAG_NOT_TOUCHABLE (and accepts the platform's ≤0.80 alpha clamp for
+//      exactly that interval); see the note at `recentsPassThrough` for the
+//      measured arm/disarm signals and why there is a watchdog.
 //
 // Vendor-neutral: this APK carries zero CNSDK classes and zero vendor .so. It
 // does hold CAMERA, because in-process the vendor face tracker runs here.
@@ -589,6 +596,160 @@ class MainActivity : NativeActivity() {
     private var overlayActive = false
     private var quitting = false
 
+    // ───────────────────────────────────────── recents pass-through (#83)
+    //
+    // Everything above makes the overlay TOUCHABLE inside its frame, which is
+    // what buys full opacity (see the note at startOverlayMode). The cost is
+    // that the frame is a live input sink for whatever is underneath it — and
+    // when the launcher's RECENTS/overview comes up, what is underneath it is
+    // the recents cards and their per-card buttons. Measured on the NP02J,
+    // landscape, with Leo up:
+    //
+    //   frame=[0,680][1600,1880]  touchableRegion=[0,680][1600,1880]
+    //
+    // i.e. (in landscape screen coords) a full-height band at x∈[680,1880] —
+    // exactly where the cards' freeform button sits. Taps on it were swallowed
+    // by the overlay and did nothing; taps that missed the band opened whatever
+    // card was there. That is #83.
+    //
+    // The fix has to be time-scoped, not geometric: recents is full-screen, so
+    // no frame small enough to be useful can avoid it, and #67/#68 already
+    // proved that driving the frame off the rendered content is a feedback loop
+    // (the speech bubble is sized off the canvas pixel width, so width is an
+    // input to itself — see docs/android-input-passthrough.md). So: while
+    // recents is up, hand our input back to the platform by adding
+    // FLAG_NOT_TOUCHABLE, and take it back when recents goes away.
+    //
+    // FLAG_NOT_TOUCHABLE costs the ≤0.80 alpha clamp (#66 measured the platform
+    // imposing it), i.e. Leo is dimmed 20% — but ONLY while the overview is on
+    // screen, which is the one moment nobody is looking at the weave. That is
+    // why it must never be set permanently.
+    //
+    // THE SIGNAL, and what it can and cannot tell us. Measured on this device
+    // (`dumpsys activity broadcasts`, foreground history):
+    //
+    //   KEYCODE_APP_SWITCH  -> CLOSE_SYSTEM_DIALOGS extras {reason=recentapps}
+    //   KEYCODE_HOME        -> CLOSE_SYSTEM_DIALOGS extras {reason=homekey}
+    //   BACK out of recents -> NOTHING
+    //   tapping a card      -> NOTHING
+    //
+    // and the intent carries flg=0x50000010, i.e. FLAG_RECEIVER_REGISTERED_ONLY
+    // — a manifest <receiver> would never see it, so this is registered
+    // dynamically. (Android 12 blocked apps from SENDING this broadcast; it did
+    // not block receiving the system-sent one. Verified receiving it from an
+    // ordinary uid on stock Android 13.)
+    //
+    // So there is an exact ARM edge and no exact DISARM edge — APP_SWITCH is a
+    // toggle that sends `recentapps` on both open AND close, so it cannot be
+    // used as one either (a toggle desyncs the moment recents is dismissed any
+    // other way, and a desynced toggle leaves Leo dead on the home screen).
+    // Nothing else observable to an unprivileged process changes: recents on
+    // this ROM is a STATE of the launcher activity, not an activity of its own
+    // (mCurrentFocus stays QuickstepLauncher throughout), so there is no focus,
+    // lifecycle, configuration or window-visibility edge to key off, and
+    // usage-stats / accessibility are deliberately out of scope.
+    //
+    // Hence three disarms, in decreasing exactness:
+    //   1. `homekey` — the canonical way back to Leo's desktop, and exact.
+    //   2. our own onResume — the user tapped OUR card.
+    //   3. a bounded watchdog — the ONLY thing standing between "dismissed by
+    //      back/card-tap" and a permanently untouchable, permanently dimmed
+    //      avatar. It is a safety net, not the mechanism.
+    private var recentsPassThrough = false
+    private val recentsHandler = Handler(Looper.getMainLooper())
+    private val recentsWatchdog = Runnable {
+        if (recentsPassThrough) {
+            android.util.Log.i(TAG, "#83 recents pass-through: watchdog expired, re-arming touch")
+            setRecentsPassThrough(false)
+        }
+    }
+
+    private val closeSystemDialogsReceiver = object : android.content.BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            val reason = try { intent?.getStringExtra("reason") } catch (_: Throwable) { null }
+            when (reason) {
+                "recentapps" -> setRecentsPassThrough(true)
+                // homekey (and anything else the system closes dialogs for)
+                // means the overview is gone.
+                else -> setRecentsPassThrough(false)
+            }
+        }
+    }
+
+    /**
+     * How long the pass-through may stay armed with no dismissal signal.
+     *
+     * Long enough that a real overview session never outlives it (the failure
+     * would be #83 coming back mid-session), short enough that the two exits
+     * with no signal — BACK, and tapping someone else's card — self-heal.
+     * Overshooting only costs the ability to DRAG Leo for the remainder; the
+     * desktop under him is strictly *more* clickable while armed, not less.
+     */
+    private val recentsHoldMs: Long
+        get() = nativeGetIntProp("debug.dxr.avatar.recents.hold_ms", 30000)
+            .coerceIn(1000, 300000).toLong()
+
+    /**
+     * Alpha to request while armed.
+     *
+     * FLAG_NOT_TOUCHABLE moves us from being the *touched* window to being an
+     * *obscuring* one, so the untrusted-touch gate that the touchable topology
+     * side-steps entirely (see startOverlayMode) now applies to us: a tap on the
+     * launcher underneath is dropped when the opacity accumulated from the
+     * different-uid windows above it EXCEEDS `maximum_obscuring_opacity_for_touch`.
+     * Requesting exactly that value is the largest alpha that still passes.
+     *
+     * Measured on the NP02J: the setting reads **1.0**, so on this device the
+     * pass-through costs no dimming at all — and note the platform did NOT clamp
+     * us to 0.80 the way #66 recorded (`dumpsys input` kept `alpha=1.00` with
+     * NOT_TOUCHABLE set). Neither fact can be assumed on another ROM, so read it
+     * rather than hardcode it, and fall back to the AOSP default 0.8 — the
+     * conservative choice, since too low only dims and too high silently eats
+     * the taps this whole change exists to let through.
+     */
+    private val recentsArmedAlpha: Float
+        get() = try {
+            android.provider.Settings.Global.getFloat(
+                contentResolver, "maximum_obscuring_opacity_for_touch", 0.8f,
+            ).coerceIn(0.1f, 1.0f)
+        } catch (_: Throwable) {
+            0.8f
+        }
+
+    private fun setRecentsPassThrough(on: Boolean) {
+        // The kill-switch blocks ARMING only: flipping it off must never be able
+        // to strand an already-armed overlay untouchable.
+        if (on && nativeGetIntProp("debug.dxr.avatar.recents", 1) == 0) return
+        recentsHandler.removeCallbacks(recentsWatchdog)
+        if (on) recentsHandler.postDelayed(recentsWatchdog, recentsHoldMs)
+        if (recentsPassThrough == on) return
+        recentsPassThrough = on
+        // The flag lives in overlayLayoutParams(), so it survives a resize and
+        // this is the same one-call update path a rotation takes. Width and
+        // height are unchanged, so there is no new buffer queue and no
+        // swapchain recreate — the #68 flicker came from RESIZING, not from
+        // updateViewLayout as such.
+        resizeOverlay()
+        android.util.Log.i(TAG, "#83 recents pass-through: ${if (on) "ON (overlay NOT_TOUCHABLE)" else "OFF (overlay touchable)"}")
+    }
+
+    private fun registerRecentsReceiver() {
+        try {
+            @Suppress("UnspecifiedRegisterReceiverFlag")
+            registerReceiver(
+                closeSystemDialogsReceiver,
+                android.content.IntentFilter(Intent.ACTION_CLOSE_SYSTEM_DIALOGS),
+            )
+        } catch (t: Throwable) {
+            android.util.Log.w(TAG, "#83 CLOSE_SYSTEM_DIALOGS receiver failed to register", t)
+        }
+    }
+
+    private fun unregisterRecentsReceiver() {
+        recentsHandler.removeCallbacks(recentsWatchdog)
+        try { unregisterReceiver(closeSystemDialogsReceiver) } catch (_: Throwable) {}
+    }
+
     // Leo's window aspect (w:h). The renderer auto-fits the character to whatever
     // canvas it gets, so this is purely how much desktop we leave clickable.
     // Width/height of the overlay box. Width is a pure horizontal crop (Leo's
@@ -667,14 +828,25 @@ class MainActivity : NativeActivity() {
             //   the tight frame would buy nothing.
             // LAYOUT_NO_LIMITS: keeps the frame in raw panel coordinates, which is
             //   what the weave phase and the Kooima canvas are anchored to.
-            // Deliberately NOT FLAG_NOT_TOUCHABLE — see the note above.
+            // Deliberately NOT FLAG_NOT_TOUCHABLE — see the note above — EXCEPT
+            // for the duration of the launcher's recents/overview (#83), where
+            // the frame would otherwise eat the cards' own buttons. The flag is
+            // folded in here rather than OR-ed on at the call site so it
+            // survives every updateViewLayout (rotation, slab change).
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                 WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
-                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
+                (
+                    if (recentsPassThrough) {
+                        WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                    } else {
+                        0
+                    }
+                    ),
             PixelFormat.TRANSLUCENT,
         )
         lp.gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
-        lp.alpha = 1.0f
+        lp.alpha = if (recentsPassThrough) recentsArmedAlpha else 1.0f
         return lp
     }
 
@@ -730,6 +902,9 @@ class MainActivity : NativeActivity() {
             overlaySurfaceView = sv
             overlayActive = true
             startForegroundService(Intent(this, AvatarOverlayService::class.java))
+            // #83: only meaningful in overlay mode — the Activity-window
+            // fallback swallows taps everywhere anyway.
+            registerRecentsReceiver()
             true
         } catch (t: Throwable) {
             android.util.Log.w(TAG, "overlay addView failed; staying on the Activity window", t)
@@ -769,6 +944,8 @@ class MainActivity : NativeActivity() {
     }
 
     private fun stopOverlayMode() {
+        unregisterRecentsReceiver()
+        recentsPassThrough = false
         overlayRoot?.let {
             try { overlayWindowManager.removeView(it) } catch (_: Throwable) {}
         }
@@ -880,7 +1057,13 @@ class MainActivity : NativeActivity() {
         if (!overlayActive && !quitting) startOverlayMode()
         // Recents (or anything else that foregrounds us) would re-arm the
         // ActivityRecordInputSink and silently kill click-through. Step back out.
-        if (overlayActive) leaveForegroundTask()
+        if (overlayActive) {
+            leaveForegroundTask()
+            // #83: being resumed means the user tapped OUR card, so the overview
+            // is gone. One of the three disarm edges — and the only exact one
+            // for that particular exit.
+            setRecentsPassThrough(false)
+        }
         if (!rectPollRunning) {
             // Forget the last sample so the first frame after a resume always
             // re-pushes: the surface was destroyed and rebuilt underneath us and
