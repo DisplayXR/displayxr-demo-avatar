@@ -37,6 +37,7 @@
 #include "auto_fit.h"       // dxr::AutoFitVHeight / FitTransition — shared framing rule
 #include "auto_fit_canvas.h" // dxr::AutoFitCanvas — the runtime-resolved zone canvas
 #include "clip_policy.h"     // dxr::ResolveClipPlanes / ChainRearDepthBudget (#81)
+#include "content_bounds.h"  // dxr::ProjectAabbToCanvasBounds / ChainContentBounds (#81 v2)
 
 #include "hud_renderer.h"   // HudRenderer + text_overlay (RenderFilledRect/RenderText) — drive the speech bubble
 #include "atlas_capture.h"
@@ -2760,6 +2761,19 @@ static void RenderThreadFunc(
                 // `type` check — whenever the extension isn't enabled.
                 XrRearDepthBudgetDXR zoneBudget = {};
 
+                // XR_DXR_depth_budget v2 (#81 §5): union of the avatar's projected
+                // content AABB across all rendered eyes, canvas-normalised — narrows
+                // the runtime's background analysis to where the tiger actually
+                // lands instead of the whole canvas. Filled inside the zones branch
+                // below (the only path that has both view/proj matrices and the
+                // extension's near/far budget); chained on XrFrameEndInfo near
+                // xrEndFrame only when it was actually computed this frame (no model
+                // loaded, or the extension disabled, leaves haveContentBounds false
+                // and nothing is chained — the runtime then falls back to v1's
+                // whole-canvas ROI, which is the correct behaviour for those cases).
+                XrRect2Df contentBoundsRect = {};
+                bool haveContentBounds = false;
+
                 if (frameState.shouldRender) {
                     if (LocateViews(*xr, frameState.predictedDisplayTime,
                         inputSnapshot.cameraPosX, -inputSnapshot.cameraPosY, inputSnapshot.cameraPosZ,
@@ -3187,6 +3201,42 @@ static void RenderThreadFunc(
                                 XMMATRIX pT = XMMatrixTranspose(p);
                                 XMStoreFloat4x4((XMFLOAT4X4*)viewMat[eye], vT);
                                 XMStoreFloat4x4((XMFLOAT4X4*)projMat[eye], pT);
+                            }
+                        }
+
+                        // XR_DXR_depth_budget v2 (#81 §5): project the avatar's
+                        // content AABB through the SAME per-eye view/proj matrices
+                        // just built, so the ROI we report matches exactly what's
+                        // drawn this frame. Zones-only — the fallback (non-zones)
+                        // path never gets the budget's near/far either, and the
+                        // legacy DirectXMath matrices there are a mirrored-view
+                        // convention the helper doesn't assume. viewMat/projMat are
+                        // both column-major float[16] (mat4_multiply(out,a,b) = a*b
+                        // in that layout, matching ProjectAabbToCanvasBounds), and
+                        // mat4_from_xr_fov emits standard GL-style NDC (y up) —
+                        // exactly the convention ProjectAabbToCanvasBounds assumes
+                        // (u=(x+1)/2, v=(1-y)/2) — so no basis change is needed here;
+                        // convert_projection_gl_to_zero_to_one above only rewrites
+                        // the z row (indices 2/6/10/14), which this projection never
+                        // reads. aabbMin/max come from the SAME box AutoFit sizes the
+                        // rig from (active-clip swept bounds; falls back to the
+                        // load-time union box), so the ROI tracks whichever clip is
+                        // actually playing rather than a stale bind pose.
+                        if (g_hasDepthBudgetExt && zonesFrame) {
+                            float aMin[3], aMax[3];
+                            bool haveAabb = g_modelRenderer.getActiveClipBounds(aMin, aMax);
+                            if (!haveAabb) haveAabb = g_modelRenderer.getSceneBBox(aMin, aMax);
+                            if (haveAabb) {
+                                float viewProj[8][16];
+                                const float* viewProjPtrs[8];
+                                for (int eye = 0; eye < eyeCount; eye++) {
+                                    // viewProj = proj * view (column-major).
+                                    mat4_multiply(viewProj[eye], projMat[eye], viewMat[eye]);
+                                    viewProjPtrs[eye] = viewProj[eye];
+                                }
+                                haveContentBounds = dxr::ProjectAabbToCanvasBounds(
+                                    aMin, aMax, viewProjPtrs, (uint32_t)eyeCount,
+                                    &contentBoundsRect);
                             }
                         }
 
@@ -3726,6 +3776,16 @@ static void RenderThreadFunc(
                         zonesEnd.flags = XR_DISPLAY_ZONES_FRAME_END_VALIDATE_BIT_DXR;
                         zonesEnd.wishMask = XR_NULL_HANDLE;  // auto wish either way
                         endInfo.next = &zonesEnd;
+                    }
+                    // XR_DXR_depth_budget v2 (#81 §5): chain the projected content
+                    // bounds AFTER the zonesEnd assignment above — ChainContentBounds
+                    // captures whatever endInfo.next already is (zonesEnd, or
+                    // nullptr when validation is off) and links itself in front, so
+                    // the existing chain is preserved either way. contentBoundsDXR
+                    // must outlive the xrEndFrame call immediately below.
+                    XrContentBoundsDXR contentBoundsDXR;
+                    if (g_hasDepthBudgetExt && haveContentBounds) {
+                        dxr::ChainContentBounds(endInfo, contentBoundsDXR, contentBoundsRect);
                     }
                     if (s_stageTiming) stM[4] = stNow();
                     xrEndFrame(xr->session, &endInfo);
