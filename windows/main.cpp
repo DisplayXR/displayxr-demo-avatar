@@ -37,7 +37,7 @@
 #include "auto_fit.h"       // dxr::AutoFitVHeight / FitTransition — shared framing rule
 #include "auto_fit_canvas.h" // dxr::AutoFitCanvas — the runtime-resolved zone canvas
 #include "clip_policy.h"     // dxr::ResolveClipPlanes / ChainRearDepthBudget (#81)
-#include "content_bounds.h"  // dxr::ProjectAabbToCanvasBounds / ChainContentBounds (#81 v2)
+#include "content_bounds.h"  // dxr::ProjectAabbToWindowBounds / ChainContentBounds (#81 v2; #82 zone rebase)
 
 #include "hud_renderer.h"   // HudRenderer + text_overlay (RenderFilledRect/RenderText) — drive the speech bubble
 #include "atlas_capture.h"
@@ -3212,9 +3212,9 @@ static void RenderThreadFunc(
                         // legacy DirectXMath matrices there are a mirrored-view
                         // convention the helper doesn't assume. viewMat/projMat are
                         // both column-major float[16] (mat4_multiply(out,a,b) = a*b
-                        // in that layout, matching ProjectAabbToCanvasBounds), and
+                        // in that layout, matching ProjectAabbToWindowBounds), and
                         // mat4_from_xr_fov emits standard GL-style NDC (y up) —
-                        // exactly the convention ProjectAabbToCanvasBounds assumes
+                        // exactly the convention ProjectAabbToWindowBounds assumes
                         // (u=(x+1)/2, v=(1-y)/2) — so no basis change is needed here;
                         // convert_projection_gl_to_zero_to_one above only rewrites
                         // the z row (indices 2/6/10/14), which this projection never
@@ -3222,6 +3222,21 @@ static void RenderThreadFunc(
                         // rig from (active-clip swept bounds; falls back to the
                         // load-time union box), so the ROI tracks whichever clip is
                         // actually playing rather than a stale bind pose.
+                        //
+                        // displayxr-unity#318 / PR #82: these view/proj matrices are
+                        // the ZONE-scoped locate (tigerZone), so the raw projection is
+                        // normalised to the tiger zone's OWN canvas, not the window —
+                        // but XrContentBoundsDXR::bounds is a WINDOW-CLIENT-normalised
+                        // contract (it frames the runtime's background preview, which
+                        // covers the whole window, bubble band included). Chaining the
+                        // zone-normalised rect unchanged scaled the analysis region
+                        // onto the whole window and let it reach into the Local2D
+                        // speech-bubble band above the zone. ProjectAabbToWindowBounds
+                        // does the same projection then rebases through tigerZone.rect
+                        // (client px, top-left origin — the same rect used to compute
+                        // the zone above) into window-normalised space, clamping to
+                        // [0,1] in zone space first (animation bounds routinely
+                        // project outside their own frustum).
                         if (g_hasDepthBudgetExt && zonesFrame) {
                             float aMin[3], aMax[3];
                             bool haveAabb = g_modelRenderer.getActiveClipBounds(aMin, aMax);
@@ -3234,8 +3249,9 @@ static void RenderThreadFunc(
                                     mat4_multiply(viewProj[eye], projMat[eye], viewMat[eye]);
                                     viewProjPtrs[eye] = viewProj[eye];
                                 }
-                                haveContentBounds = dxr::ProjectAabbToCanvasBounds(
+                                haveContentBounds = dxr::ProjectAabbToWindowBounds(
                                     aMin, aMax, viewProjPtrs, (uint32_t)eyeCount,
+                                    tigerZone.rect, windowW, windowH,
                                     &contentBoundsRect);
                             }
                         }
