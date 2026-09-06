@@ -63,13 +63,13 @@ extern "C" {
 #endif
 
 #define XR_DXR_depth_budget 1
-#define XR_DXR_depth_budget_SPEC_VERSION 1
+#define XR_DXR_depth_budget_SPEC_VERSION 2
 #define XR_DXR_DEPTH_BUDGET_EXTENSION_NAME "XR_DXR_depth_budget"
 
 // Reserved 1004999xxx range, next free block after view_rig (…140-142).
 // Final values reconcile with the Khronos registry before spec freeze.
 #define XR_TYPE_REAR_DEPTH_BUDGET_DXR ((XrStructureType)1004999260)
-//! Reserved for v2 (app-reported content bounds narrowing the analysis ROI).
+//! App-reported content bounds, narrowing the analysis ROI (v2).
 #define XR_TYPE_CONTENT_BOUNDS_DXR ((XrStructureType)1004999261)
 #define XR_TYPE_EVENT_DATA_REAR_DEPTH_BUDGET_STATE_CHANGED_DXR ((XrStructureType)1004999262)
 
@@ -118,6 +118,44 @@ typedef struct XrRearDepthBudgetDXR {
     XrRearDepthBudgetStateDXR state;               //!< Why this value
     float                     backgroundCueEnergy; //!< 0..1 diagnostic; 0 when there is no source
 } XrRearDepthBudgetDXR;
+
+// ---- Input: app chains this on XrFrameEndInfo::next; runtime reads it. ----
+
+/*!
+ * @brief Where this frame's content actually is, so the runtime measures only
+ *        the background it will be drawn over (v2).
+ *
+ * v1 judged the whole canvas: a busy patch anywhere under the app closed the
+ * budget for the whole session, even when the model occupied one corner and
+ * the busy pixels were nowhere near it. The conflict is local — it exists only
+ * where rear content overlaps a horizontal cue — so the app, which is the only
+ * party that knows where its geometry lands, says so.
+ *
+ * Chain this on XrFrameEndInfo::next in xrEndFrame. It is OPTIONAL and purely
+ * advisory: an app that never chains it (or stops chaining it for more than a
+ * second) gets the v1 behaviour, the whole canvas. A malformed value is never
+ * an error — it degrades to "unknown", which is again the whole canvas. This
+ * struct is an input only; nothing is written back through it.
+ *
+ * The runtime DILATES the region before measuring, because the disparity
+ * conflict lives in the band around the silhouette rather than strictly under
+ * it. @ref marginNormalized is dilation the app asks for ON TOP of the
+ * runtime's own default.
+ */
+typedef struct XrContentBoundsDXR {
+    XrStructureType          type;   //!< Must be XR_TYPE_CONTENT_BOUNDS_DXR
+    const void* XR_MAY_ALIAS next;
+    /*!
+     * CANVAS-NORMALISED: offset/extent in [0,1], origin top-left (u right, v
+     * DOWN — the same convention as the display processor's background-preview
+     * canvas rect and XrViewDisplayRawDXR::canvasRectPx). The union over ALL
+     * views of the projected content AABB. An extent <= 0, or any non-finite
+     * component, means "unknown" and the runtime measures the whole canvas.
+     */
+    XrRect2Df bounds;
+    //! Extra dilation the app wants, in canvas-normalised units. 0 = the runtime default alone.
+    float marginNormalized;
+} XrContentBoundsDXR;
 
 // ---- Event: emitted on every STATE change (never on ramp progress). ----
 
