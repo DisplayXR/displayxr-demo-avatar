@@ -43,6 +43,14 @@ jobs:
           fi
           echo "OK: no non-allowlisted vendor-name references in authored files."
 
+      - name: Vendored OpenXR headers match their pinned runtime commits
+        run: |
+          # displayxr-demo-mediaplayer#61: the vendored DisplayXR extension
+          # headers are this repo's ONLY coupling to the runtime, and their
+          # provenance used to be unverifiable prose. VENDORED.json now pins each
+          # header to a full runtime commit SHA; this proves the bytes match.
+          python3 scripts/check_vendored_headers.py --drift
+
       - name: Workflow YAML is valid
         run: |
           python3 -m pip install --quiet pyyaml
