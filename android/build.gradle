@@ -17,6 +17,152 @@ plugins {
     id 'org.jetbrains.kotlin.android'
 }
 
+// ***
+// Git-derived APK version stamps (displayxr-demo-mediaplayer#60)
+// ***
+//
+// Until now this file hardcoded `versionCode 1` / `versionName "0.1"`, so every
+// released demo APK claimed to be version 0.1 and could never be told apart on
+// a device: `dumpsys package` reads 0.1 for a v1.9.2 build and for a v0.5.0
+// build alike, a version-gated device test that keys on versionName concludes
+// "old app" and passes green while proving nothing, and versionCode never
+// increased so a sideload of an OLDER build over a newer one was not rejected.
+//
+// Both stamps now come from `git describe`, using the runtime's scheme
+// verbatim (runtime#1379 / runtime#1384) so every DisplayXR APK on a device
+// encodes its version the same way. The runtime shipped BOTH of these wrong
+// once, which is why the code below is shaped the way it is:
+//
+//  - runtime#1226: a shallow, tagless clone made describe degrade to
+//    `--always`, so versionName was a bare SHA and versionCode was NULL. A null
+//    versionCode means Android cannot compare versions and an in-place upgrade
+//    is impossible. There is deliberately NO catch-and-return-null here, and
+//    CI checks out with fetch-depth: 0 + fetch-tags: true.
+//
+//  - runtime#1379: describe was invoked WITHOUT `--tags`, which considers only
+//    ANNOTATED tags. DisplayXR release tags are lightweight (plain `git tag`,
+//    see the /dxr-release skill), so the APK named itself after the last
+//    ANNOTATED tag. The fix is `--tags`. Do NOT "fix" it by annotating tags.
+//
+// ---------------------------------------------------------------------------
+// versionCode scheme. Positional arithmetic, NOT string concatenation:
+//
+//     code = major * 100_000_000        // <= 20   (weight 1e8)
+//          + minor *   1_000_000        // <= 99   (weight 1e6)
+//          + patch *      10_000        // <= 99   (weight 1e4)
+//          + commits                    // <= 9999 (weight 1e0)
+//
+// Every field is strictly narrower than its weight, so ordering by code ==
+// ordering by (major, minor, patch, commits) lexicographically. Monotonic.
+// (The runtime's OLD "%02d%01d%01d%05d" string format used MINIMUM widths, so a
+// two-digit minor/patch widened the string past Integer.MAX_VALUE, parseInt
+// threw, and an empty versionCode shipped. Hence arithmetic + hard guards.)
+//
+// Worked values for this repo's series:
+//   v0.7.6-0    ->     7_060_000        v1.9.3-0   -> 109_030_000
+//   v0.28.3-0   ->    28_030_000        v1.25.3-4  -> 125_030_004
+//   v20.99.99-9999 (absolute max) -> 2_099_999_999 <= 2_147_483_647 and <= Play's 2.1e9
+//
+// Every demo APK in the field carries versionCode 1, so anything this emits is
+// an in-place upgrade. scripts/android_version_code.py is an independent
+// implementation of the same arithmetic; CI compares the two against the stamps
+// read back out of the BUILT APK.
+// ---------------------------------------------------------------------------
+def ANDROID_VERSION_CODE_MAX      = 2147483647     // Integer.MAX_VALUE
+def ANDROID_VERSION_CODE_PLAY_CAP = 2100000000     // Google Play's ceiling
+// The largest versionCode ever shipped by this demo: the hardcoded 1 (#60).
+def ANDROID_VERSION_CODE_SHIPPED_FLOOR = 1
+
+// `git describe --long` output. --long guarantees the -<n>-g<sha> suffix even
+// when HEAD *is* the tag, so this shape is not optional.
+def gitDescribeLongPattern = ~/v(?<major>\d+)\.(?<minor>\d+)\.(?<patch>\d+)-(?<commits>\d+)-g(?<hash>[0-9a-f]+)/
+
+// Run git, failing the build loudly on a non-zero exit or empty output.
+// There is deliberately no catch-and-return-null here: see runtime#1226.
+def gitOrDie = { List<String> args, String what ->
+    def stdout = new ByteArrayOutputStream()
+    def stderr = new ByteArrayOutputStream()
+    def result
+    try {
+        result = exec {
+            commandLine args
+            standardOutput = stdout
+            errorOutput = stderr
+            ignoreExitValue = true
+            workingDir rootDir
+        }
+    } catch (Exception e) {
+        throw new GradleException(
+            "android: cannot determine ${what} -- failed to run `${args.join(' ')}`: ${e.message}. " +
+            "The APK version stamps are derived from git and MUST NOT be guessed.")
+    }
+    def out = stdout.toString().trim()
+    if (result.exitValue != 0 || out.isEmpty()) {
+        throw new GradleException(
+            "android: cannot determine ${what} -- `${args.join(' ')}` exited ${result.exitValue}: " +
+            "${stderr.toString().trim()}\n" +
+            "This usually means the clone has no v* tags (a shallow or --no-tags fetch). " +
+            "Run `git fetch --tags` (CI: actions/checkout with fetch-depth: 0 + fetch-tags: true). " +
+            "Refusing to build an APK with a missing/guessed versionCode.")
+    }
+    return out
+}
+
+// versionCode, from `git describe --tags --long`.
+def getVersionCode = { ->
+    def longOutput = gitOrDie(
+        ['git', 'describe', '--tags', '--long', '--match', 'v[0-9]*'],
+        'the Android versionCode')
+
+    def matcher = longOutput =~ gitDescribeLongPattern
+    if (!matcher.matches()) {
+        throw new GradleException(
+            "android: `git describe --tags --long --match 'v[0-9]*'` returned '${longOutput}', " +
+            "which is not a vMAJOR.MINOR.PATCH-<commits>-g<sha>. Cannot derive a versionCode.")
+    }
+
+    int major   = Integer.parseInt(matcher.group('major'))
+    int minor   = Integer.parseInt(matcher.group('minor'))
+    int patch   = Integer.parseInt(matcher.group('patch'))
+    int commits = Integer.parseInt(matcher.group('commits'))
+
+    // Field-width guards. Each field must stay strictly narrower than its
+    // weight or the positional encoding collapses and monotonicity is lost --
+    // a silently WRONG code is worse than no build.
+    if (minor > 99 || patch > 99 || commits > 9999 || major > 20) {
+        throw new GradleException(
+            "android: version ${major}.${minor}.${patch}+${commits} does not fit the versionCode " +
+            "encoding (major<=20, minor<=99, patch<=99, commits<=9999) -- see the scheme comment " +
+            "above. Refusing to emit a non-monotonic code.")
+    }
+
+    long code = (long) major * 100000000L + (long) minor * 1000000L + (long) patch * 10000L + (long) commits
+    if (code > ANDROID_VERSION_CODE_MAX) {
+        throw new GradleException(
+            "android: computed versionCode ${code} exceeds Integer.MAX_VALUE (${ANDROID_VERSION_CODE_MAX}) " +
+            "for ${longOutput}.")
+    }
+    if (code > ANDROID_VERSION_CODE_PLAY_CAP) {
+        logger.warn("android: versionCode ${code} exceeds Google Play's ${ANDROID_VERSION_CODE_PLAY_CAP} ceiling.")
+    }
+    if (code <= ANDROID_VERSION_CODE_SHIPPED_FLOOR) {
+        logger.warn("android: versionCode ${code} is NOT above the highest code already shipped " +
+                    "(${ANDROID_VERSION_CODE_SHIPPED_FLOOR}). Installed units would refuse this as a " +
+                    "downgrade. Do not release this build.")
+    }
+    return (int) code
+}
+
+// versionName, from `git describe --tags --dirty`.
+// Deliberately NOT --long: on the tag itself this yields a clean 'vX.Y.Z', and
+// 'vX.Y.Z-<n>-g<sha>' only once you are past it. --dirty appends '-dirty' for an
+// uncommitted tree, which is worth seeing on a dev pad.
+def getVersionString = { ->
+    return gitOrDie(
+        ['git', 'describe', '--tags', '--dirty', '--match', 'v[0-9]*'],
+        'the Android versionName')
+}
+
 android {
     namespace 'com.displayxr.avatar_vk_android'
     compileSdk project.sharedCompileSdk
@@ -35,8 +181,9 @@ android {
         applicationId 'com.displayxr.avatar_vk_android'
         minSdkVersion project.sharedMinSdk
         targetSdkVersion project.sharedTargetSdk
-        versionCode 1
-        versionName "0.1"
+        // Derived from `git describe --tags` -- see the scheme comment above (#60).
+        versionCode getVersionCode()
+        versionName getVersionString()
 
         externalNativeBuild {
             cmake {
