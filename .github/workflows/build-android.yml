@@ -77,6 +77,12 @@ jobs:
 
       - uses: actions/checkout@v5
         if: needs.DetectChanges.outputs.docs_only != 'true'
+        with:
+          # Full history + tags: the APK version stamps come from
+          # `git describe --tags` (#60). A shallow or tagless checkout makes
+          # describe fail and the build errors out rather than guessing.
+          fetch-depth: 0
+          fetch-tags: true
 
       - name: Set up JDK 17
         if: needs.DetectChanges.outputs.docs_only != 'true'
@@ -108,6 +114,78 @@ jobs:
           ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: ./gradlew :android:assembleRelease --no-daemon
+
+      # ---- versionCode / versionName gate (#60) ---------------------------
+      # Prove the stamps FROM THE ARTIFACT, never from the inputs that were
+      # supposed to produce them. Three failures this catches, all of which have
+      # shipped somewhere in the org:
+      #   * versionCode/versionName hardcoded (1 / "0.1") -- the #60 bug: no
+      #     on-device version signal at all, and a version-gated device test
+      #     reads "0.1", concludes "old app", and passes green proving nothing.
+      #   * EMPTY versionCode from a tagless/shallow clone + a swallowed
+      #     exception (runtime#1226). Android then cannot compare versions, so
+      #     no installed unit can upgrade in place.
+      #   * WRONG base tag: `git describe` without `--tags` sees only ANNOTATED
+      #     tags and ours are lightweight (runtime#1379).
+      # scripts/android_version_code.py is an independent implementation of the
+      # arithmetic in android/build.gradle; comparing the two is the point.
+      - name: Verify APK version stamps
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: |
+          set -euo pipefail
+          python3 scripts/android_version_code.py --selftest
+
+          APK=$(find android/build/outputs/apk/release -name '*.apk' | head -1)
+          if [ -z "$APK" ]; then
+            echo "::error::no release APK found under android/build/outputs/apk/release"
+            exit 1
+          fi
+          AAPT2=$(ls -d "${ANDROID_HOME:-$ANDROID_SDK_ROOT}"/build-tools/*/aapt2 2>/dev/null | sort -V | tail -1)
+          if [ -z "$AAPT2" ]; then
+            echo "::error::no aapt2 under \$ANDROID_HOME/build-tools -- cannot read the APK manifest"
+            exit 1
+          fi
+
+          badging=$("$AAPT2" dump badging "$APK")
+          vcode=$(printf '%s\n' "$badging" | sed -n "s/.*versionCode='\([^']*\)'.*/\1/p" | head -1)
+          vname=$(printf '%s\n' "$badging" | sed -n "s/.*versionName='\([^']*\)'.*/\1/p" | head -1)
+          echo "APK stamps: versionCode='${vcode}' versionName='${vname}'"
+
+          if [ -z "$vcode" ]; then
+            echo "::error::APK has an EMPTY versionCode. Android cannot compare versions, so no installed unit can upgrade in place."
+            exit 1
+          fi
+          case "$vcode" in
+            ''|*[!0-9]*) echo "::error::versionCode '$vcode' is not a plain integer"; exit 1 ;;
+          esac
+          if [ "$vcode" -le 1 ]; then
+            echo "::error::versionCode $vcode is <= 1, the hardcoded value every shipped demo APK carries (#60). Android refuses downgrades and an in-place upgrade would be ambiguous."
+            exit 1
+          fi
+
+          describe=$(git describe --tags --long --match 'v[0-9]*')
+          want_code=$(python3 scripts/android_version_code.py --describe "$describe" --print code)
+          want_name=$(python3 scripts/android_version_code.py --describe "$describe" --print name)
+          echo "expected from '$describe': versionCode=$want_code versionName=$want_name"
+
+          if [ "$vcode" != "$want_code" ]; then
+            echo "::error::versionCode $vcode does not match the tag arithmetic for '$describe' (expected $want_code). android/build.gradle and scripts/android_version_code.py have diverged."
+            exit 1
+          fi
+          # A dirty CI tree is its own problem; do not let it mask the check.
+          if [ "${vname%-dirty}" != "$want_name" ]; then
+            echo "::error::versionName '$vname' does not match '$want_name' derived from '$describe'. If it names an older release than the tag you are building, git describe lost --tags."
+            exit 1
+          fi
+          # On a tag build the APK's versionName must EQUAL the tag -- this is the
+          # assertion #60 asks for. A `-<n>-g<sha>` suffix here means the tag is
+          # not the commit being built, which is just as wrong as naming a
+          # different release.
+          if [ "$GITHUB_REF_TYPE" = "tag" ] && [ "${vname%-dirty}" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag build of $GITHUB_REF_NAME produced versionName '$vname'. The released APK must name itself after the tag it was built from (#60)."
+            exit 1
+          fi
+          echo "  ok: versionCode=$vcode versionName=$vname (above the shipped 1, matches $describe)"
 
       - name: Stage the APK with a release name
         if: needs.DetectChanges.outputs.docs_only != 'true'
