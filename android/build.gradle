@@ -111,7 +111,63 @@ android {
     }
 }
 
+// ---------------------------------------------------------------------------
+// DisplayXR client wake library.
+//
+// WHY THIS APP NEEDS IT. On some OEM Android builds a client cannot reach the
+// runtime at all until the runtime has been started once: the vendor's
+// AutoLaunchManagerService refuses "related start" of another package's
+// components, and the Khronos loader's broker lookup is a ContentProvider start.
+// Measured on a Lume Phone (runtime#1453): 12 broker queries, 6
+// `Provider RelatedStart BlockResult = true`, the broker answered 0 times, and
+// the app fell through to "open the DisplayXR app once". With the runtime
+// pre-started by an activity the same launch takes 1 query, 0 blocks, and
+// xrCreateInstance returns XR_SUCCESS.
+//
+// This app used to carry its own wakeRuntime() -- as all five demos did, all
+// using startService, all swallowing the exception, so a wake that never worked
+// looked like it did. The library replaces that with one implementation that
+// ships with the runtime.
+//
+// It is an AAR because its MANIFEST is load-bearing: the <queries> entries
+// (without which Android 11+ package visibility hides the runtime) and the
+// androidx.startup provider registration that makes the wake automatic. Source
+// copies would have to replicate both by hand.
+//
+// Resolution order, most specific first:
+//   1. -PdxrClientAar=<path>  or  DXR_CLIENT_AAR=<path>   -- dev loop against a
+//      runtime checkout: src/xrt/targets/displayxr_client/build/outputs/aar/…
+//   2. android/libs/DisplayXR-Client-*.aar                -- fetched by
+//      ./android/fetch-client-aar.sh, which pulls the asset from the pinned
+//      runtime release below.
+// Deliberately NO download at configuration time: a Gradle configure phase that
+// reaches the network fails in offline builds and in CI without a token.
+ext.dxrClientRuntimeTag = 'v2.16.28'
+
+def resolveDxrClientAar = {
+    def explicit = project.findProperty('dxrClientAar') ?: System.getenv('DXR_CLIENT_AAR')
+    if (explicit) {
+        def f = file(explicit)
+        if (!f.exists()) throw new GradleException("DXR_CLIENT_AAR points at a missing file: $f")
+        return f
+    }
+    def libs = file('libs')
+    def found = libs.exists() ? libs.listFiles({ d, n -> n.startsWith('DisplayXR-Client-') && n.endsWith('.aar') } as FilenameFilter) : null
+    if (found != null && found.length > 0) return found.sort { it.name }.last()
+    throw new GradleException(
+        "DisplayXR client wake library not found.\n" +
+        "  Fetch the pinned release asset:  ./android/fetch-client-aar.sh\n" +
+        "  or point at a local runtime build: -PdxrClientAar=<runtime>/src/xrt/targets/displayxr_client/build/outputs/aar/displayxr_client-release.aar")
+}
+
 dependencies {
+
+    implementation files(resolveDxrClientAar())
+    // MUST be declared here. An AAR consumed through files() carries no POM, so
+    // none of its transitive dependencies come with it -- and androidx.startup is
+    // what instantiates the library's initializer. Omit this and the provider class
+    // is simply absent at runtime: no crash, no log, the wake just never happens.
+    implementation 'androidx.startup:startup-runtime:1.1.1'
     implementation "org.jetbrains.kotlin:kotlin-stdlib:$kotlinVersion"
 
     // Khronos OpenXR loader for Android — bundles libopenxr_loader.so +
