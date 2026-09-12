@@ -71,16 +71,6 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
-
-      # The wake library is a release asset on the runtime repo, not a Maven artifact
-      # (the org's GitHub Packages budget is a $0 hard stop). Gradle deliberately does
-      # NOT download it during configuration -- a configure phase that reaches the
-      # network breaks offline builds -- so it is fetched here, before the build. The
-      # script needs no credential: the runtime repo is public, and this job's
-      # GITHUB_TOKEN is not a credential for it anyway.
-      - name: Fetch the DisplayXR client wake library
-        if: needs.DetectChanges.outputs.docs_only != 'true'
-        run: ./android/fetch-client-aar.sh
       - name: Doc-only short-circuit
         if: needs.DetectChanges.outputs.docs_only == 'true'
         run: echo "docs_only=true; build steps will skip and report success."
@@ -111,6 +101,16 @@ jobs:
           echo "$ANDROID_KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
           echo "ANDROID_KEYSTORE_FILE=$RUNNER_TEMP/release.jks" >> "$GITHUB_ENV"
 
+
+      # The wake library is a release asset on the runtime repo, not a Maven artifact
+      # (the org's GitHub Packages budget is a $0 hard stop). Gradle deliberately does
+      # NOT download it during configuration -- a configure phase that reaches the
+      # network breaks offline builds -- so it is fetched here, before the build. The
+      # script needs no credential: the runtime repo is public, and this job's
+      # GITHUB_TOKEN is not a credential for it anyway.
+      - name: Fetch the DisplayXR client wake library
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: ./android/fetch-client-aar.sh
       - name: Build release APK
         if: needs.DetectChanges.outputs.docs_only != 'true'
         env:
