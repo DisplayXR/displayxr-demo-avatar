@@ -14,3 +14,8 @@ android/.cxx/
 # Android signing keystores — never commit (CI uses GitHub secrets)
 *.jks
 *.keystore
+
+# Fetched by android/fetch-client-aar.sh from the pinned runtime release.
+# A binary that is already published elsewhere must not be vendored here: it would
+# drift from dxrClientRuntimeTag silently, which is the whole failure this replaces.
+android/libs/
