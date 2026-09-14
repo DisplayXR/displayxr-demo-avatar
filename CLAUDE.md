@@ -36,6 +36,21 @@ at startup.
   (4 px/texel, capped 1024×576) and errs outward. Levers:
   `DXR_AVATAR_SIL_TEXEL_PX` / `_DILATE` / `_ALPHA`, `DXR_VK_NO_HOST_CACHED=1`.
   `DXR_DUMP_SILHOUETTE=1` dumps the mask to `%TEMP%\avatar_silhouette.png`.
+- **Two silhouettes, deliberately.** The click-through region uses the RENDERED
+  (post-far-clip) alpha — it is a visual clip, so it must. The
+  `XR_DXR_depth_budget` v3 `XrContentMaskDXR` must NOT: `pbr.frag`'s far discard
+  would make the mask a function of the budget the runtime published, and the
+  two oscillate (~0.6–1.1 s open/close, runtime#1470). So the mask comes from
+  `ModelRenderer::beginContentMaskFrame()` / `contentMaskCoverage()` — a
+  coverage-only re-draw (same `pbr.vert`, same skinning, empty
+  `shaders/coverage.frag`) into a 256×144 R8 target, armed around the silhouette
+  pass's two views and read back one frame later in `beginFrame()`. The v2
+  `XrContentBoundsDXR` bounds were always clip-independent (a projected
+  model-space AABB) and stay chained as the runtime's fallback.
+  `DXR_AVATAR_MASKPASS_TEST=1` arms the pass on every platform and logs a
+  covered-texel count + one ASCII silhouette dump, so the Vulkan objects, the
+  draw and the flip are exercisable on macOS/MoltenVK where nothing chains a
+  mask.
 - **Face-the-viewer billboard** — yaw tracks the tracked head centre (from
   `rawEyes`), time-based smoothing, gated on `xr->isEyeTracking`. Pitch is
   implemented but disabled (`FACE_PITCH_SIGN`). LMB-drag overrides it.

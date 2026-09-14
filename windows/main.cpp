@@ -3493,45 +3493,78 @@ static void RenderThreadFunc(
                             // used, so the renderer's internal targets don't churn.
                             if (s_stageTiming) stM[2] = stNow();
                             if (hasGsScene) {
+                                // runtime#1470: arm the renderer's coverage-only
+                                // pass for the two views UpdateSilhouette is about
+                                // to render. It redraws the avatar with the far
+                                // clip absent, so the content mask describes the
+                                // silhouette AS IT WOULD RENDER AT UNRESTRICTED
+                                // BUDGET (spec v4) instead of the post-clip alpha —
+                                // which is a function of the budget the runtime
+                                // published, and therefore oscillates against it.
+                                // Armed on exactly the condition the mask block
+                                // below chains on, and armed regardless of whether
+                                // clipFar is currently nonzero: a source that
+                                // switched rasterisation when the clip engaged
+                                // would jitter on its own. beginFrame() disarms.
+                                const bool wantContentMask =
+                                    g_hasDepthBudgetExt && g_depthBudgetExtVersion >= 3 &&
+                                    zonesFrame;
+                                g_modelRenderer.beginContentMaskFrame(wantContentMask);
+
                                 UpdateSilhouette(vkDevice, physDevice, graphicsQueue, renderCmdPool,
                                     targetW, targetH, windowW, windowH,
                                     viewMat, projMat, clipFar, (uint32_t)eyeCount);
 
-                                // XR_DXR_depth_budget v3 (#81 §6): reduce the SAME
-                                // per-frame coverage UpdateSilhouette just published to
-                                // g_silCoverage — no second GPU readback — to the
-                                // extension's content-occupancy grid. g_silCoverage
-                                // spans the WHOLE window at coverage resolution, but the
-                                // avatar is only ever drawn into its bottom-75%
-                                // sub-image (UpdateSilhouette's silAvY/silAvH split, the
-                                // same fraction tigerZone.rect derives from windowH), so
-                                // that sub-rect IS the zone's coverage; ContentMaskFromCoverage's
-                                // srcRectPx (tigerZone.rect, window client px) places it
-                                // back into the WINDOW-normalised grid, leaving cells
-                                // outside the zone at 0. Gated on the RUNTIME's reported
+                                // XR_DXR_depth_budget v3 (#81 §6), as amended by
+                                // runtime#1470: reduce the frame's silhouette to the
+                                // extension's content-occupancy grid, chained at
+                                // xrEndFrame below. Gated on the RUNTIME's reported
                                 // extensionVersion, never this app's vendored
                                 // SPEC_VERSION — a v2 runtime must never be handed a v3
                                 // chain it was not written to parse.
+                                //
+                                // The source is the renderer's UNCLIPPED coverage pass,
+                                // NOT g_silCoverage. The click-through region
+                                // legitimately wants the post-clip alpha (it is a visual
+                                // clip, and the window must not be drawn or clickable
+                                // where nothing was rendered); the budget mask must not,
+                                // because pbr.frag's far discard makes that alpha a
+                                // function of the budget the runtime published — mask
+                                // shrinks when clipped, grows when open, and the two
+                                // drive a ~0.6-1.1 s open/close cycle the runtime's
+                                // dwell/grace hysteresis cannot damp (runtime#1470). The
+                                // two artefacts diverge here, deliberately.
+                                //
+                                // Placement is unchanged: the coverage raster is the
+                                // avatar's own view NDC, which maps 1:1 onto the tiger
+                                // zone (the bottom-75% sub-rect the zone-framed views
+                                // and UpdateSilhouette's silAvY/silAvH split both use),
+                                // so ContentMaskFromCoverage's srcRectPx
+                                // (tigerZone.rect, window client px) places it into the
+                                // WINDOW-normalised grid with cells outside the zone
+                                // left at 0.
                                 if (g_hasDepthBudgetExt && g_depthBudgetExtVersion >= 3 && zonesFrame) {
                                     std::vector<uint8_t> maskCells;
                                     bool haveMask = false;
                                     {
-                                        std::lock_guard<std::mutex> covLock(g_silCoverage.mtx);
-                                        if (g_silCoverage.ready && g_silCoverage.covW > 0 &&
-                                            g_silCoverage.covH > 0) {
-                                            const int covW = g_silCoverage.covW;
-                                            const int covH = g_silCoverage.covH;
-                                            const int zoneCovH = (covH * 3) / 4;
-                                            const int zoneCovY = covH - zoneCovH;
-                                            if (zoneCovH > 0) {
-                                                const uint8_t* zoneSrc = g_silCoverage.bits.data() +
-                                                    (size_t)zoneCovY * (size_t)covW;
-                                                haveMask = dxr::ContentMaskFromCoverage(
-                                                    zoneSrc, (uint32_t)covW, (uint32_t)zoneCovH,
-                                                    (uint32_t)covW, windowW, windowH, &tigerZone.rect,
-                                                    kContentMaskGridCells, kContentMaskGridCells,
-                                                    maskCells);
-                                            }
+                                        // Null until the first armed frame has been read
+                                        // back (the coverage is one frame pipelined, like
+                                        // the click-through readback it replaces), or if
+                                        // the pass could not be created. Chain nothing
+                                        // rather than fall back to the clipped alpha:
+                                        // with no mask the runtime uses the v2 bounds,
+                                        // which are clip-independent by construction (a
+                                        // projected model-space AABB) — a coarser ROI,
+                                        // never an oscillating one.
+                                        const uint8_t* cov = g_modelRenderer.contentMaskCoverage();
+                                        if (cov != nullptr) {
+                                            haveMask = dxr::ContentMaskFromCoverage(
+                                                cov, ModelRenderer::kContentMaskCovW,
+                                                ModelRenderer::kContentMaskCovH,
+                                                ModelRenderer::kContentMaskCovW,
+                                                windowW, windowH, &tigerZone.rect,
+                                                kContentMaskGridCells, kContentMaskGridCells,
+                                                maskCells);
                                         }
                                     }
                                     const uint32_t occupied =
