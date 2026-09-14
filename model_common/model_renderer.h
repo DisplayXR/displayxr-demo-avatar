@@ -140,6 +140,62 @@ struct ModelRenderer {
                    float clipFarViewSpace = 0.0f,
                    float edgeFadePx = 0.0f);
 
+    // ── Unclipped-silhouette coverage (displayxr-runtime#1470) ──────────────
+    //
+    // The `XR_DXR_depth_budget` content mask must describe the silhouette the
+    // content WOULD have at an unrestricted rear budget (spec v4). The
+    // rendered alpha cannot: pbr.frag discards everything past
+    // `clipFarViewSpace`, so a mask derived from it is a function of the
+    // budget the runtime published, and the two feed each other into a
+    // ~0.6-1.1 s open/close oscillation whenever the avatar straddles a
+    // text/blank border (runtime#1470).
+    //
+    // So the mask gets its own source. `beginContentMaskFrame(true)` arms a
+    // coverage-only pass — same vertex shader, same skinning, same push
+    // constants, same view/projection, same viewport convention, into a small
+    // R8 target with shaders/coverage.frag, which has no far-clip discard
+    // because it has no code at all. Every renderEye() that follows unions its
+    // view's silhouette into the accumulator. The click-through window region
+    // keeps using the rendered (clipped) alpha — that one IS a visual clip and
+    // must stay one.
+    //
+    // **Arming is scoped, not per-frame** (this is where the avatar diverges
+    // from modelviewer PR #128, which arms once per frame for every view).
+    // The avatar's mask has only ever described the silhouette pass's two
+    // outermost views — the same pair `UpdateSilhouette()` renders for the
+    // click-through region — so the caller arms immediately before that pair
+    // and nothing else pays for the extra draw. `beginFrame()` disarms, so a
+    // frame that never arms never records.
+    //
+    // The readback is ONE FRAME PIPELINED, matching the click-through
+    // coverage: the pass rides on renderEye's own ring submission (which
+    // deliberately does not drain the queue), so the bytes are consumed in the
+    // next `beginFrame()`, after the fence wait that already guards the ring.
+    // `contentMaskCoverage()` therefore returns the PREVIOUS armed frame's
+    // union, and returns nullptr until the first one has landed.
+
+    //! Coverage raster dimensions. Fixed, not aspect-matched to the zone: the
+    //! grid is mapped onto a window-client rect by normalised position
+    //! (dxr::ContentMaskFromCoverage's `srcRectPx` — the tiger zone's rect for
+    //! this app), so a different aspect is a pure linear stretch of the
+    //! sampling lattice, not a displacement of the silhouette — and the
+    //! runtime dilates the mask by its own disparity band before it measures
+    //! anything, which is far coarser than the difference.
+    static constexpr uint32_t kContentMaskCovW = 256;
+    static constexpr uint32_t kContentMaskCovH = 144;
+
+    //! Arm (or disarm) the coverage pass. Call immediately BEFORE the
+    //! renderEye() calls whose silhouette should feed the mask; beginFrame()
+    //! disarms again. Resets the per-frame slot counter.
+    void beginContentMaskFrame(bool enable);
+
+    //! The union-over-views unclipped coverage for the last armed frame: one
+    //! byte per texel, nonzero = covered, row-major, top-left origin, tightly
+    //! packed at kContentMaskCovW x kContentMaskCovH. nullptr when the pass is
+    //! disarmed, unavailable (creation failed), or no armed frame has been
+    //! read back yet. Valid until the next beginFrame().
+    const uint8_t* contentMaskCoverage() const;
+
     void cleanup();
     ~ModelRenderer();
 
@@ -221,6 +277,54 @@ private:
     VkSampleCountFlagBits msaaSamples_ = VK_SAMPLE_COUNT_2_BIT;
     VkRenderPass renderPass_ = VK_NULL_HANDLE;
     VkFramebuffer framebuffer_ = VK_NULL_HANDLE;
+
+    // ── Unclipped-silhouette coverage pass (runtime#1470) ───────────────────
+    // Created lazily on the first armed frame — an opaque-mode session never
+    // pays for it. No depth attachment and no depth test: the artefact wanted
+    // is the UNION of where geometry lands, for which occlusion is irrelevant,
+    // and leaving depth out removes the only reason this pass would have to
+    // track the main pass's sample count or target size.
+    //
+    // One image PER SLOT, and one readback buffer carved into per-slot
+    // regions. renderEye does not drain the queue, so two armed views are in
+    // flight at once; sharing a single image would let the second view's CLEAR
+    // land on top of the first view's copy-to-buffer. kMaskSlots is 4 rather
+    // than the 2 the shipping path uses so that the DXR_AVATAR_MASKPASS_TEST
+    // leg (which arms every view) has headroom; beyond it recording is skipped
+    // rather than allowed to overwrite.
+    static constexpr uint32_t kMaskSlots = 4;
+    VkRenderPass  maskRenderPass_ = VK_NULL_HANDLE;
+    VkPipeline    maskPipeline_ = VK_NULL_HANDLE;
+    ModelImage    maskImage_[kMaskSlots];
+    VkFramebuffer maskFramebuffer_[kMaskSlots] = {};
+    ModelBuffer   maskReadback_;              // host-visible, kMaskSlots regions
+    void*         maskMapped_ = nullptr;      // persistently mapped
+    VkFence       maskFence_[kMaskSlots] = {};   // the RING fence each slot rode on
+    bool          maskPending_[kMaskSlots] = {}; // written, not yet read back
+    std::vector<uint8_t> maskCoverage_;       // CPU accumulator, OR-ed per view
+    uint32_t maskSlotCount_ = 0;              // slots recorded since the arm
+    bool maskArmed_ = false;                  // record on the next renderEye
+    bool maskFailed_ = false;                 // creation failed once; never retry
+    bool maskHasCoverage_ = false;            // maskCoverage_ holds a real union
+    // DXR_AVATAR_MASKPASS_TEST=1 — arm the coverage pass unconditionally, wait
+    // on each view's fence inline and log the covered-texel count every ~60
+    // frames. The pass is otherwise reachable only from the Windows
+    // transparent/borderless leg, which is the one leg that cannot be
+    // exercised on a macOS or Linux box; this makes the Vulkan objects, the
+    // draw and the readback testable everywhere the renderer runs at all. Like
+    // gpuTimeOn_ it serialises a path the shipping build pipelines, so do not
+    // read frame rates off a MASKPASS_TEST run. Diagnostics only — it changes
+    // no output.
+    bool maskTestForce_ = false;
+    uint32_t maskTestFrames_ = 0;
+    bool ensureMaskPass();
+    void recordMaskPass(VkCommandBuffer cmd, uint32_t slot, uint32_t uboDynOffset);
+    //! Fold every pending slot into maskCoverage_. `waitFences` waits on each
+    //! slot's ring fence first (the MASKPASS_TEST path, which cannot rely on
+    //! beginFrame's wait); the shipping path passes false because beginFrame
+    //! has already waited on the whole ring.
+    void consumeMaskReadbacks(bool waitFences);
+    void destroyMaskPass();
 
     // Target sizing is driven by the largest VIEWPORT any caller has asked for
     // recently, not by the swapchain — the zone swapchain is pre-sized to the

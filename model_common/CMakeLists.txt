@@ -107,6 +107,7 @@ set(SHADER_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/shaders")
 set(SHADER_SOURCES
     shaders/pbr.vert
     shaders/pbr.frag
+    shaders/coverage.frag
     shaders/skybox.frag
     shaders/fullscreen.vert
     shaders/brdf_lut.frag
