@@ -51,7 +51,10 @@ if(NOT GLSLANGVALIDATOR_COMMAND)
     message(FATAL_ERROR "glslangValidator required — install the Vulkan SDK on the build host")
 endif()
 set(SHADER_DIR "${MODEL_COMMON}/shaders")
-set(MV_SHADERS pbr.vert pbr.frag skybox.frag fullscreen.vert
+# NOTE: this list is SEPARATE from model_common/CMakeLists.txt's SHADER_SOURCES
+# (the Android build curates its own). A shader added there must be added here
+# too or model_renderer.cpp fails on the missing generated header.
+set(MV_SHADERS pbr.vert pbr.frag coverage.frag skybox.frag fullscreen.vert
     brdf_lut.frag irradiance.frag prefilter.frag edge_fade.frag edge_soften.frag)
 set(SHADER_HEADERS "")
 foreach(S ${MV_SHADERS})
