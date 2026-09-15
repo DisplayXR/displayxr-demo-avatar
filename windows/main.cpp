@@ -1303,6 +1303,74 @@ static SilhouetteCoverage g_silCoverage;
 // the runtime's ROI go stale. Render-thread-owned (this whole loop is one
 // thread) — no lock needed, unlike g_silCoverage which WM_NCHITTEST also reads.
 static std::vector<uint8_t> g_contentMaskCells;
+
+// DXR_AVATAR_MASKPASS_REFRESH=1 — Windows port of the macOS probe (runtime#1470
+// follow-up): on the SHIPPING path, right where the frame's coverage is read
+// back and reduced to the XrContentMaskDXR grid, count covered texels and keep
+// the built cells, then compare against the sample kMaskRefreshLag frames ago.
+// The cells are the verdict — they are what the runtime diffs (mask_gen) to
+// decide whether to re-analyse the budget. Prints via the app log AND stdout.
+static bool MaskRefreshTest() {
+    static const bool on = [] {
+        char buf[8] = {0};
+        const DWORD n = GetEnvironmentVariableA("DXR_AVATAR_MASKPASS_REFRESH", buf, sizeof(buf));
+        return n == 1 && buf[0] == '1';
+    }();
+    return on;
+}
+static constexpr uint32_t kMaskRefreshLag = 30;
+static void MaskRefreshSample(const uint8_t* cov, bool haveMask, const std::vector<uint8_t>& cells) {
+    static uint32_t frame = 0;
+    static std::vector<size_t> histCount;
+    static std::vector<std::vector<uint8_t>> histCells;
+    static uint32_t checks = 0, failCount = 0, failCells = 0;
+    if (cov == nullptr) {
+        LOG_INFO("[maskpass-refresh] frame %u: coverage is NULL (pass not armed, or no readback folded yet)", frame);
+        printf("[maskpass-refresh] frame %u: coverage is NULL\n", frame); fflush(stdout);
+        frame++;
+        return;
+    }
+    const size_t n = size_t(ModelRenderer::kContentMaskCovW) * ModelRenderer::kContentMaskCovH;
+    size_t covered = 0;
+    for (size_t i = 0; i < n; ++i) covered += (cov[i] != 0) ? 1u : 0u;
+    size_t occupied = 0;
+    for (uint8_t c : cells) occupied += (c != 0) ? 1u : 0u;
+    histCount.push_back(covered);
+    histCells.push_back(haveMask ? cells : std::vector<uint8_t>());
+    if (frame >= kMaskRefreshLag) {
+        const size_t prevIdx = size_t(frame - kMaskRefreshLag);
+        const bool countMoved = (histCount[prevIdx] != covered);
+        const bool cellsMoved = (histCells[prevIdx] != histCells.back());
+        checks++;
+        if (!countMoved) failCount++;
+        if (!cellsMoved) failCells++;
+        if ((frame % kMaskRefreshLag) == 0) {
+            LOG_INFO("[maskpass-refresh] frame %u: covered=%zu (frame %zu: %zu) cells-occupied=%zu "
+                     "count-moved=%s cells-moved=%s",
+                     frame, covered, prevIdx, histCount[prevIdx], occupied,
+                     countMoved ? "yes" : "NO", cellsMoved ? "yes" : "NO");
+            printf("[maskpass-refresh] frame %u: covered=%zu (frame %zu: %zu) cells-occupied=%zu "
+                   "count-moved=%s cells-moved=%s\n",
+                   frame, covered, prevIdx, histCount[prevIdx], occupied,
+                   countMoved ? "yes" : "NO", cellsMoved ? "yes" : "NO");
+            fflush(stdout);
+        }
+    } else if ((frame % 10) == 0) {
+        LOG_INFO("[maskpass-refresh] frame %u: covered=%zu cells-occupied=%zu (warm-up)", frame, covered, occupied);
+    }
+    if (checks == 240u) {
+        const bool pass = (failCells == 0);
+        LOG_INFO("[maskpass-refresh] %s - %u comparisons, %u with unchanged cells (fail), "
+                 "%u with an unchanged texel count (informational) (lag=%u frames, cells=%zu)",
+                 pass ? "PASS" : "FAIL", checks, failCells, failCount, kMaskRefreshLag,
+                 cells.size());
+        printf("[maskpass-refresh] %s - %u comparisons, %u unchanged cells, %u unchanged count\n",
+               pass ? "PASS" : "FAIL", checks, failCells, failCount);
+        fflush(stdout);
+        checks++;
+    }
+    frame++;
+}
 static uint32_t g_contentMaskW = 0, g_contentMaskH = 0;
 static bool g_contentMaskChaining = false;  // one-time LOG_INFO on start/stop, never per frame
 // Grid resolution for the chained mask: well under the extension's 512 cap and
@@ -3655,6 +3723,9 @@ static void RenderThreadFunc(
                                                 kContentMaskGridCells, kContentMaskGridCells,
                                                 maskCells);
                                         }
+                                    }
+                                    if (MaskRefreshTest()) {
+                                        MaskRefreshSample(g_modelRenderer.contentMaskCoverage(), haveMask, maskCells);
                                     }
                                     const uint32_t occupied =
                                         haveMask ? dxr::ContentMaskCoverageCells(maskCells) : 0;
