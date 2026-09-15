@@ -906,7 +906,11 @@ bool ModelRenderer::createPipeline() {
         uboStride_ = sizeof(UniformBlock);
         if (align > 0) uboStride_ = ((uboStride_ + align - 1) / align) * align;
     }
-    uniformBuffer_ = modelCreateBuffer(device_, physDevice_, uboStride_ * kRingSlots,
+    // kRingSlots render slots + kMaskSlots slots owned by the content-mask
+    // coverage pass. The mask pass needs its OWN viewProj (an unrestricted far
+    // plane, runtime#1470) and therefore cannot share the view's slot.
+    uniformBuffer_ = modelCreateBuffer(device_, physDevice_,
+        uboStride_ * (kRingSlots + kMaskSlots),
         VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
     if (uniformBuffer_.buffer == VK_NULL_HANDLE) return false;
@@ -1408,7 +1412,7 @@ float ModelRenderer::findBestYaw(const float[3], const float[3], uint32_t) const
 }
 
 void ModelRenderer::updateUniforms(const float viewMatrix[16], const float projMatrix[16],
-                                   float clipFar) {
+                                   float clipFar, uint32_t uboSlot) {
     // Legacy convention (default): flip world Y at the view stage (right-
     // multiply by diag(1,-1,1,1) → negate view column 1) so the model is
     // upright with the demo's Y-mirrored display-pose contract.
@@ -1458,9 +1462,9 @@ void ModelRenderer::updateUniforms(const float viewMatrix[16], const float projM
     ub.lightDir[0] = lx / ln; ub.lightDir[1] = ly / ln; ub.lightDir[2] = lz / ln;
     ub.lightDir[3] = (clipFar > 0.0f) ? clipFar : 0.0f;  // foreground clip (view-space)
 
-    // Write this view's own slot; the dynamic descriptor offset in renderEye
+    // Write the caller's slot; the dynamic descriptor offset in renderEye
     // points the shader at it.
-    const VkDeviceSize off = (VkDeviceSize)ringSlot_ * uboStride_;
+    const VkDeviceSize off = (VkDeviceSize)uboSlot * uboStride_;
     void* mapped = nullptr;
     vkMapMemory(device_, uniformBuffer_.memory, off, sizeof(UniformBlock), 0, &mapped);
     std::memcpy(mapped, &ub, sizeof(UniformBlock));
@@ -2311,6 +2315,8 @@ void ModelRenderer::consumeMaskReadbacks(bool waitFences) {
 
     const size_t n = maskCoverage_.size();
     std::fill(maskCoverage_.begin(), maskCoverage_.end(), uint8_t(0));
+    for (uint32_t i = 0; i < kMaskProbeCount; i++) { maskProbeCovered_[i] = 0; maskProbeSeen_[i] = false; }
+    bool anyRealProbe = false;
     for (uint32_t s = 0; s < kMaskSlots; s++) {
         if (!maskPending_[s]) continue;
         maskPending_[s] = false;
@@ -2318,13 +2324,28 @@ void ModelRenderer::consumeMaskReadbacks(bool waitFences) {
             vkWaitForFences(device_, 1, &maskFence_[s], VK_TRUE, UINT64_MAX);
         maskFence_[s] = VK_NULL_HANDLE;
         const uint8_t* px = static_cast<const uint8_t*>(maskMapped_) + n * s;
+        const uint32_t probe = maskSlotProbe_[s] < kMaskProbeCount ? maskSlotProbe_[s] : 0u;
+        maskProbeSeen_[probe] = true;
         // The attachment only ever holds the clear (0) or coverage.frag's 1.0
         // (255), so any nonzero is coverage. OR, not overwrite: the accumulator
         // is the union over the frame's views, which is what the extension asks
         // for and what the click-through region does for its own two slices.
-        for (size_t i = 0; i < n; ++i) maskCoverage_[i] |= (px[i] != 0) ? uint8_t(1) : uint8_t(0);
+        // Only probe 0 is the published mask; the MASKPASS_TEST probes are
+        // counted and discarded (they must never reach XrContentMaskDXR).
+        size_t covered = 0;
+        if (probe == kMaskProbeMask) {
+            anyRealProbe = true;
+            for (size_t i = 0; i < n; ++i) {
+                const uint8_t c = (px[i] != 0) ? uint8_t(1) : uint8_t(0);
+                maskCoverage_[i] |= c;
+                covered += c;
+            }
+        } else {
+            for (size_t i = 0; i < n; ++i) covered += (px[i] != 0) ? 1u : 0u;
+        }
+        maskProbeCovered_[probe] += covered;
     }
-    maskHasCoverage_ = true;
+    if (anyRealProbe) maskHasCoverage_ = true;
 
     if (maskTestForce_ && (maskTestFrames_++ % 60u) == 0u) {
         size_t covered = 0, minX = kContentMaskCovW, maxX = 0, minY = kContentMaskCovH, maxY = 0;
@@ -2344,6 +2365,35 @@ void ModelRenderer::consumeMaskReadbacks(bool waitFences) {
                     covered, kContentMaskCovW * kContentMaskCovH,
                     100.0 * (double)covered / (double)(kContentMaskCovW * kContentMaskCovH),
                     minX, maxX, minY, maxY);
+
+        // runtime#1470 MUTATION TEST. Three coverage renders of the SAME
+        // skinned pose in the same frame:
+        //   unrestricted — what the fixed shipping path feeds the mask
+        //                  (ez + 1000*vH far).
+        //   real-restricted — the REAL pass's projection with an artificially
+        //                  restricted far that slices the character. This is
+        //                  literally what the pre-fix code fed the mask, so a
+        //                  strictly smaller count here is what gives the test
+        //                  its power: if it matched, the far plane would not be
+        //                  cutting anything and the test would prove nothing.
+        //   real-unrestricted — the real pass's projection rebuilt at
+        //                  farOffsetVH = 1000, i.e. "far = unrestricted".
+        // PASS = unrestricted == real-unrestricted (the mask does not move with
+        // the real pass's far plane) AND real-restricted < real-unrestricted.
+        if (maskProbeSeen_[kMaskProbeTestRestricted] || maskProbeSeen_[kMaskProbeTestBaseline]) {
+            const size_t u = maskProbeCovered_[kMaskProbeMask];
+            const size_t r = maskProbeCovered_[kMaskProbeTestRestricted];
+            const size_t b = maskProbeCovered_[kMaskProbeTestBaseline];
+            const bool invariant = (u == b);
+            const bool bites = (r < b);
+            std::printf("ModelRenderer: [maskpass-mutation] unrestricted=%zu "
+                        "real-restricted=%zu real-unrestricted=%zu -> %s "
+                        "(invariant=%s, restriction-bites=%s)\n",
+                        u, r, b,
+                        (invariant && bites) ? "PASS" : "FAIL",
+                        invariant ? "yes" : "NO",
+                        bites ? "yes" : "NO");
+        }
         // One ASCII dump, on the first report only: a covered-texel count can
         // be right for a silhouette that is upside down, and the vertical flip
         // is the one thing about this pass that is easy to get wrong.
@@ -2373,7 +2423,9 @@ void ModelRenderer::destroyMaskPass() {
         if (maskImage_[i].image != VK_NULL_HANDLE) modelDestroyImage(device_, maskImage_[i]);
         maskFence_[i] = VK_NULL_HANDLE;
         maskPending_[i] = false;
+        maskSlotProbe_[i] = 0;
     }
+    for (uint32_t i = 0; i < kMaskProbeCount; i++) { maskProbeCovered_[i] = 0; maskProbeSeen_[i] = false; }
     if (maskRenderPass_ != VK_NULL_HANDLE) { vkDestroyRenderPass(device_, maskRenderPass_, nullptr); maskRenderPass_ = VK_NULL_HANDLE; }
     if (maskReadback_.buffer != VK_NULL_HANDLE) {
         if (maskMapped_ != nullptr) { vkUnmapMemory(device_, maskReadback_.memory); maskMapped_ = nullptr; }
@@ -2411,7 +2463,8 @@ void ModelRenderer::renderEye(VkImage swapchainImage,
                               const float projMatrix[16],
                               bool transparentBg,
                               float clipFarViewSpace,
-                              float edgeFadePx) {
+                              float edgeFadePx,
+                              const MaskProjections *maskProj) {
     if (!initialized_ || !modelLoaded_) return;
 
     // Size the internal targets to the VIEWPORT, not the swapchain. Everything
@@ -2489,7 +2542,7 @@ void ModelRenderer::renderEye(VkImage swapchainImage,
 
     // AFTER the slot is settled: updateUniforms writes into slot `ringSlot_`, so
     // the fallback above must not be able to move the slot out from under it.
-    updateUniforms(viewMatrix, projMatrix, clipFarViewSpace);
+    updateUniforms(viewMatrix, projMatrix, clipFarViewSpace, slot);
 
     VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
@@ -2705,10 +2758,37 @@ void ModelRenderer::renderEye(VkImage swapchainImage,
     // Armed by beginContentMaskFrame(); slots are never reused within an armed
     // batch, so a batch longer than kMaskSlots simply stops recording rather
     // than clobbering an in-flight copy.
-    uint32_t maskSlot = UINT32_MAX;
-    if ((maskArmed_ || maskTestForce_) && maskSlotCount_ < kMaskSlots && ensureMaskPass()) {
-        maskSlot = maskSlotCount_++;
-        recordMaskPass(cmd, maskSlot, (uint32_t)((VkDeviceSize)slot * uboStride_));
+    //
+    // TWO CLIPS, not one. PR #91 removed pbr.frag's far discard, but the
+    // coverage pass reused THIS view's UniformBlock — whose viewProj carries
+    // the rear-depth-budget far plane — so the GPU's fixed-function clipper
+    // still removed everything past NDC z = 1 before a fragment could run, and
+    // the mask stayed a function of the budget (runtime#1470, proven on a
+    // Windows panel with the runtime ratchet disabled). The pass therefore gets
+    // its OWN UniformBlock, written from maskProj->unrestricted (same fov, same
+    // near, far = ResolveClipPlanes at farOffsetVH = 1000) with clipFar forced
+    // to 0. nullptr keeps the old behaviour for callers that have not been
+    // taught the unrestricted matrix yet.
+    const uint32_t maskSlotFirst = maskSlotCount_;
+    const float *maskUnres = (maskProj && maskProj->unrestricted) ? maskProj->unrestricted : projMatrix;
+    if ((maskArmed_ || maskTestForce_) && ensureMaskPass()) {
+        // Probe 0 is the real mask. Probes 1/2 are the MASKPASS_TEST mutation
+        // control + baseline, recorded in the SAME frame off the same skinned
+        // pose so the three counts are comparable without freezing animation.
+        const float *probeProj[kMaskProbeCount] = {maskUnres, nullptr, nullptr};
+        if (maskTestForce_ && maskProj) {
+            probeProj[kMaskProbeTestRestricted] = maskProj->testRestricted;
+            probeProj[kMaskProbeTestBaseline] = maskProj->testUnrestrictedReal;
+        }
+        for (uint32_t probe = 0; probe < kMaskProbeCount; probe++) {
+            if (probeProj[probe] == nullptr) continue;
+            if (maskSlotCount_ >= kMaskSlots) break;
+            const uint32_t ms = maskSlotCount_++;
+            const uint32_t uboSlot = kRingSlots + ms;
+            updateUniforms(viewMatrix, probeProj[probe], /*clipFar=*/0.0f, uboSlot);
+            recordMaskPass(cmd, ms, (uint32_t)((VkDeviceSize)uboSlot * uboStride_));
+            maskSlotProbe_[ms] = (uint8_t)probe;
+        }
     }
 
     // Swapchain → TRANSFER_DST. First view of the image (top-left tile):
@@ -2778,9 +2858,11 @@ void ModelRenderer::renderEye(VkImage swapchainImage,
     // on macOS/Linux where nothing chains a mask) instead waits inline and
     // reports per view, which is a deliberate serialisation — same bargain the
     // DXR_AVATAR_GPUTIME path makes.
-    if (maskSlot != UINT32_MAX) {
-        maskFence_[maskSlot] = ringFence_[slot];
-        maskPending_[maskSlot] = true;
+    if (maskSlotCount_ > maskSlotFirst) {
+        for (uint32_t ms = maskSlotFirst; ms < maskSlotCount_; ms++) {
+            maskFence_[ms] = ringFence_[slot];
+            maskPending_[ms] = true;
+        }
         if (maskTestForce_ && !maskArmed_) {
             consumeMaskReadbacks(/*waitFences=*/true);
             maskSlotCount_ = 0;

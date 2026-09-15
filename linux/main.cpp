@@ -1652,6 +1652,16 @@ static bool RenderTigerZone(AppXrSession& xr, const XrFrameState& frameState,
         float farZ = (ez > 0.02f) ? ez : 100.0f;
         mat4_from_xr_fov(projMat, zoneViews[i].fov, 0.01f, farZ);
         convert_projection_gl_to_zero_to_one(projMat);
+        // runtime#1470: the content-mask coverage pass gets its own projection
+        // with the far plane unrestricted — the rasterizer's NDC z > 1 clip is
+        // a second, budget-dependent clip the fragment shader cannot see.
+        float projMatUnres[16];
+        mat4_from_xr_fov(projMatUnres, zoneViews[i].fov, 0.01f, 100.0f);
+        convert_projection_gl_to_zero_to_one(projMatUnres);
+        ModelRenderer::MaskProjections mp;
+        mp.unrestricted = projMatUnres;
+        mp.testRestricted = projMat;
+        mp.testUnrestrictedReal = projMatUnres;
         if (i == 0) {
             memcpy(silView, viewMat, 16 * sizeof(float));
             memcpy(silProj, projMat, 16 * sizeof(float));
@@ -1662,7 +1672,8 @@ static bool RenderTigerZone(AppXrSession& xr, const XrFrameState& frameState,
             g_zoneImages[imageIndex].image, (VkFormat)xr.swapchain.format,
             g_zoneSwW, g_zoneSwH,
             i * tileW, 0, tileW, tileH,
-            viewMat, projMat, /*transparentBg*/ true);
+            viewMat, projMat, /*transparentBg*/ true,
+            /*clipFarViewSpace=*/0.0f, /*edgeFadePx=*/0.0f, &mp);
 
         projViews[i].type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
         projViews[i].subImage.swapchain = g_zoneSwapchain;
@@ -1980,6 +1991,15 @@ int main(int argc, char** argv) {
                             // (invisible windowed). displayxr-common shared fn,
                             // exactly like cube_handle_vk_linux + the win/mac peers.
                             convert_projection_gl_to_zero_to_one(projMat);
+                            // runtime#1470: unrestricted-far projection for the
+                            // content-mask coverage pass (see MaskProjections).
+                            float projMatUnres[16];
+                            mat4_from_xr_fov(projMatUnres, views[i].fov, 0.01f, 100.0f);
+                            convert_projection_gl_to_zero_to_one(projMatUnres);
+                            ModelRenderer::MaskProjections mp;
+                            mp.unrestricted = projMatUnres;
+                            mp.testRestricted = projMat;
+                            mp.testUnrestrictedReal = projMatUnres;
                             if (i == 0) { // view 0 drives the click-through silhouette
                                 memcpy(silView, viewMat, sizeof(silView));
                                 memcpy(silProj, projMat, sizeof(silProj));
@@ -1992,7 +2012,8 @@ int main(int argc, char** argv) {
                                 xr.swapchain.width, xr.swapchain.height,
                                 i * eyeW, 0, eyeW, eyeH,
                                 viewMat, projMat,
-                                /*transparentBg*/ true);
+                                /*transparentBg*/ true,
+                                /*clipFarViewSpace=*/0.0f, /*edgeFadePx=*/0.0f, &mp);
 
                             projViews[i].type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
                             projViews[i].subImage.swapchain = xr.swapchain.swapchain;

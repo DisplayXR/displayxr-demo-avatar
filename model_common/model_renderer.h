@@ -122,6 +122,31 @@ struct ModelRenderer {
     void setEdgeSoftenEnabled(bool e) { edgeSoftenEnabled_.store(e); }
     bool edgeSoftenEnabled() const { return edgeSoftenEnabled_.load(); }
 
+    // Projections for the content-mask coverage pass (runtime#1470). The
+    // coverage pass must NOT reuse the real pass's projection: the app's far
+    // plane carries the runtime's rear depth budget, and the GPU's
+    // fixed-function clipper removes everything past NDC z = 1 before any
+    // fragment runs. Dropping pbr.frag's far discard (PR #91) removed only ONE
+    // of the two clips; this struct removes the other.
+    //
+    //   unrestricted — REQUIRED for a correct mask: the same fov and near as
+    //                  the real pass, far = the value dxr::ResolveClipPlanes
+    //                  yields at farOffsetVH = 1000 (ez + 1000·vH). nullptr
+    //                  falls back to the real pass's projection, i.e. the
+    //                  pre-fix (clip-dependent) behaviour.
+    //   testRestricted / testUnrestrictedReal — DXR_AVATAR_MASKPASS_TEST only.
+    //                  Two extra coverage probes recorded in the SAME frame:
+    //                  the real-pass projection mutated to an artificially
+    //                  restricted far (the pre-fix source), and the real-pass
+    //                  projection at far = unrestricted (the baseline). The
+    //                  mutation test asserts probe(unrestricted) ==
+    //                  probe(baseline) and probe(restricted) < probe(baseline).
+    struct MaskProjections {
+        const float *unrestricted = nullptr;
+        const float *testRestricted = nullptr;
+        const float *testUnrestrictedReal = nullptr;
+    };
+
     // edgeFadePx > 0 fades the rendered CONTENT alpha (premultiplied: RGB and
     // A together) to 0 over that many pixels at the viewport edges — the
     // per-zone soft boundary of ADR-027 rule 4 (the union wish mask cannot
@@ -138,7 +163,8 @@ struct ModelRenderer {
                    const float projMatrix[16],
                    bool transparentBg = false,
                    float clipFarViewSpace = 0.0f,
-                   float edgeFadePx = 0.0f);
+                   float edgeFadePx = 0.0f,
+                   const MaskProjections *maskProj = nullptr);
 
     // ── Unclipped-silhouette coverage (displayxr-runtime#1470) ──────────────
     //
@@ -237,7 +263,12 @@ private:
     // vertex buffer using each owning node's current weights. No-op without morph.
     // trackAnchor → also accumulate the morphed verts' world centroid (rig bind).
     void blendMorphs(bool trackAnchor = false);
-    void updateUniforms(const float viewMatrix[16], const float projMatrix[16], float clipFar);
+    //! Write one UniformBlock into `uboSlot` of uniformBuffer_. Slots
+    //! [0, kRingSlots) are the per-view render ring; slots [kRingSlots,
+    //! kRingSlots + kMaskSlots) belong to the content-mask coverage pass,
+    //! which needs its own viewProj (see MaskProjections).
+    void updateUniforms(const float viewMatrix[16], const float projMatrix[16], float clipFar,
+                        uint32_t uboSlot);
     void cleanupModel();
 
     // ── Core Vulkan handles (not owned, from OpenXR runtime) ─────────────
@@ -293,6 +324,16 @@ private:
     // leg (which arms every view) has headroom; beyond it recording is skipped
     // rather than allowed to overwrite.
     static constexpr uint32_t kMaskSlots = 4;
+    //! Probe identity of each recorded slot. Probe 0 is the shipping mask (the
+    //! one that feeds maskCoverage_ and therefore XrContentMaskDXR); probes 1
+    //! and 2 exist only under DXR_AVATAR_MASKPASS_TEST and are counted, never
+    //! published. See MaskProjections.
+    enum MaskProbe : uint8_t {
+        kMaskProbeMask = 0,          //!< unrestricted far — the shipping source
+        kMaskProbeTestRestricted,    //!< real-pass proj, artificially restricted far
+        kMaskProbeTestBaseline,      //!< real-pass proj at far = unrestricted
+        kMaskProbeCount
+    };
     VkRenderPass  maskRenderPass_ = VK_NULL_HANDLE;
     VkPipeline    maskPipeline_ = VK_NULL_HANDLE;
     ModelImage    maskImage_[kMaskSlots];
@@ -317,6 +358,9 @@ private:
     // no output.
     bool maskTestForce_ = false;
     uint32_t maskTestFrames_ = 0;
+    uint8_t maskSlotProbe_[kMaskSlots] = {};      //!< which probe each recorded slot is
+    size_t  maskProbeCovered_[kMaskProbeCount] = {};  //!< covered texels, per probe
+    bool    maskProbeSeen_[kMaskProbeCount] = {};     //!< probe recorded this consume
     bool ensureMaskPass();
     void recordMaskPass(VkCommandBuffer cmd, uint32_t slot, uint32_t uboDynOffset);
     //! Fold every pending slot into maskCoverage_. `waitFences` waits on each

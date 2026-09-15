@@ -37,6 +37,7 @@
 #include <atomic>
 #include <csignal>
 #include <cstdio>
+#include <cstdlib>   // getenv / strtof — DXR_AVATAR_MASKPASS_MUTATE_VH
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -2230,6 +2231,43 @@ static bool EnsureSilhouetteTargets(VkDevice dev, VkPhysicalDevice phys, uint32_
     return g_silMapped != nullptr;
 }
 
+// runtime#1470 mutation test. With DXR_AVATAR_MASKPASS_TEST=1, setting
+// DXR_AVATAR_MASKPASS_MUTATE_VH=<offset> overrides the REAL pass's far offset
+// with an artificially restricted one (far = ez + <offset>*vH) chosen to SLICE
+// the character, so the coverage probe fed by the real pass's projection — the
+// pre-fix source — can be measured against the unrestricted one in the same
+// frame, off the same skinned pose.
+//
+// The offset is in vH units and MAY BE NEGATIVE: it has to be, to prove
+// anything. A whole-body avatar is shallow next to the virtual display height,
+// so a far plane at or just behind the ZDP (+0.05 vH, the obvious first guess)
+// removes only the few texels where the tail/hind legs stick out past the
+// chest in the union silhouette — 0.1 %, and on some animation frames exactly
+// zero, which would make the test report a spurious FAIL. A plane IN FRONT of
+// the ZDP cuts the body itself. -0.1 is the default ("1" is accepted as that
+// shorthand); it must stay > -1 because near = ez - vH.
+// Unset = off; any parsable float, including 0, is used verbatim.
+struct MaskMutationCfg {
+    bool  active = false;
+    float farOffsetVH = 0.0f;
+};
+static const MaskMutationCfg &MaskMutation() {
+    static const MaskMutationCfg cfg = [] {
+        MaskMutationCfg m;
+        const char *e = std::getenv("DXR_AVATAR_MASKPASS_MUTATE_VH");
+        if (e != nullptr && e[0] != '\0') {
+            char *end = nullptr;
+            const float v = std::strtof(e, &end);
+            if (end != e) {
+                m.active = true;
+                m.farOffsetVH = (v == 1.0f) ? -0.1f : v;
+            }
+        }
+        return m;
+    }();
+    return cfg;
+}
+
 // Render the avatar silhouette into the scratch image and publish the coverage
 // bitmap. Cheap (downscaled ~1/3); called every other frame. imgW/imgH must
 // equal the dims the main eye render used so the renderer's internal targets
@@ -2238,6 +2276,7 @@ static bool EnsureSilhouetteTargets(VkDevice dev, VkPhysicalDevice phys, uint32_
 static void UpdateSilhouette(VkDevice dev, VkPhysicalDevice phys, VkQueue queue, VkCommandPool pool,
                             uint32_t imgW, uint32_t imgH, uint32_t winW, uint32_t winH,
                             const float (*viewMats)[16], const float (*projMats)[16],
+                            const float (*projMatsUnres)[16],
                             const float* clipFars, uint32_t numViews, float canvasFrac) {
     if (winW == 0 || winH == 0 || numViews == 0) return;
     if (!g_modelRenderer.hasModel()) return;
@@ -2255,9 +2294,18 @@ static void UpdateSilhouette(VkDevice dev, VkPhysicalDevice phys, VkQueue queue,
         // mask matches the on-screen avatar's bottom-canvas confinement.
         uint32_t silAvH = (uint32_t)((float)h * canvasFrac); if (silAvH == 0) silAvH = 1;
         uint32_t silAvY = h - silAvH;
+        // runtime#1470: the coverage pass projects with an unrestricted far
+        // plane, never this view's rear-budget one (see MaskProjections).
+        // The two test probes (recorded only under DXR_AVATAR_MASKPASS_TEST) are
+        // the REAL pass's projection — exactly what the pre-fix code fed the
+        // coverage pass — and that same rig rebuilt at far = unrestricted.
+        ModelRenderer::MaskProjections mp;
+        mp.unrestricted = projMatsUnres ? projMatsUnres[v] : nullptr;
+        mp.testRestricted = MaskMutation().active ? projMats[v] : nullptr;
+        mp.testUnrestrictedReal = MaskMutation().active ? mp.unrestricted : nullptr;
         g_modelRenderer.renderEye(g_silImage.image, VK_FORMAT_R8G8B8A8_UNORM,
             imgW, imgH, 0, silAvY, w, silAvH, viewMats[v], projMats[v], /*transparentBg=*/true,
-            clipFars[v]);
+            clipFars[v], /*edgeFadePx=*/0.0f, &mp);
         // renderEye leaves the scratch image in COLOR_ATTACHMENT_OPTIMAL → copy to host.
         VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
         ai.commandPool = pool; ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; ai.commandBufferCount = 1;
@@ -2885,6 +2933,15 @@ int main(int argc, char** argv) {
                         // Per-view Kooima pose + projection — one entry per view in this
                         // multiview mode (1 for mono, 2 for stereo, 4 for quad, etc.).
                         std::vector<Display3DView> eyeViews((size_t)eyeCount);
+                        // runtime#1470: the XR_DXR_depth_budget content-mask coverage
+                        // pass must project with an UNRESTRICTED far plane. It cannot
+                        // reuse eyeViews[] — those carry the rear-budget far plane, and
+                        // the GPU's fixed-function clipper drops everything past NDC
+                        // z = 1 before a fragment can run, which is the SECOND of the
+                        // two clips PR #91 left in place. eyeViewsUnres is the same fov
+                        // and near with far_offset = 1000*vH (ResolveClipPlanes'
+                        // unrestricted value).
+                        std::vector<Display3DView> eyeViewsUnres((size_t)eyeCount);
                         bool hasKooima = (xr.displayWidthM > 0 && xr.displayHeightM > 0);
                         if (hasKooima) {
                             float dispPxW = xr.displayPixelWidth > 0 ? (float)xr.displayPixelWidth : (float)xr.swapchain.width;
@@ -2941,17 +2998,33 @@ int main(int argc, char** argv) {
                             // recede band. Mirrors windows/main.cpp.
                             const float vH = tunables.virtual_display_height;
                             const float near_offset = vH;
-                            const float far_offset  = g_transparentBg.load() ? 0.0f : 1000.0f * vH;
+                            float far_offset  = g_transparentBg.load() ? 0.0f : 1000.0f * vH;
+                            // runtime#1470 mutation test: give the REAL pass an
+                            // artificially restricted far plane that slices the
+                            // character, so the coverage probe fed by the real pass's
+                            // projection (the pre-fix source) can be compared against
+                            // the unrestricted one in the same frame.
+                            if (MaskMutation().active) far_offset = MaskMutation().farOffsetVH * vH;
 
                             display3d_compute_views(
                                 rawEyePos.data(), (uint32_t)eyeCount, &nominalViewer,
                                 &screen, &tunables, &cameraPose,
                                 near_offset, far_offset, /*vulkan_flip_y=*/0, eyeViews.data());
+                            // runtime#1470: the same rig at the UNRESTRICTED far offset.
+                            // Only projection_matrix differs — display3d_compute_view
+                            // puts far_offset in the projection alone — so this is pure
+                            // CPU matrix math, no extra draw.
+                            display3d_compute_views(
+                                rawEyePos.data(), (uint32_t)eyeCount, &nominalViewer,
+                                &screen, &tunables, &cameraPose,
+                                near_offset, 1000.0f * vH, /*vulkan_flip_y=*/0, eyeViewsUnres.data());
                             // displayxr::math emits a GL ([-1,1] clip-z) projection; this is a
                             // Vulkan renderer, so remap each per-view projection to [0,1]
                             // (reproduces modelviewer's prior direct-[0,1] output). [#396 W3]
-                            for (uint32_t _v = 0; _v < (uint32_t)eyeCount; _v++)
+                            for (uint32_t _v = 0; _v < (uint32_t)eyeCount; _v++) {
                                 convert_projection_gl_to_zero_to_one(eyeViews[_v].projection_matrix);
+                                convert_projection_gl_to_zero_to_one(eyeViewsUnres[_v].projection_matrix);
+                            }
                         }
 
                         // Double-click focus: ray from CENTER physical eyes through the
@@ -3050,6 +3123,10 @@ int main(int argc, char** argv) {
                             projectionViews.assign((size_t)eyeCount, {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW});
                             std::vector<std::array<float, 16>> viewMat((size_t)eyeCount);
                             std::vector<std::array<float, 16>> projMat((size_t)eyeCount);
+                            // runtime#1470: the content mask's own projection (far =
+                            // unrestricted). Falls back to the real one when there is no
+                            // Kooima rig (then they are identical anyway).
+                            std::vector<std::array<float, 16>> projMatUnres((size_t)eyeCount);
                             std::vector<std::pair<uint32_t, uint32_t>> tileOffsets((size_t)eyeCount);
                             std::vector<float> clipFars((size_t)eyeCount, 0.0f);  // per-eye, for the silhouette pass
                             for (int eye = 0; eye < eyeCount; eye++) {
@@ -3057,11 +3134,13 @@ int main(int argc, char** argv) {
                                 if (hasKooima) {
                                     memcpy(viewMat[eye].data(), eyeViews[eye].view_matrix, sizeof(float) * 16);
                                     memcpy(projMat[eye].data(), eyeViews[eye].projection_matrix, sizeof(float) * 16);
+                                    memcpy(projMatUnres[eye].data(), eyeViewsUnres[eye].projection_matrix, sizeof(float) * 16);
                                     views[srcView].pose.position = eyeViews[eye].eye_world;
                                     views[srcView].pose.orientation = cameraPose.orientation;
                                 } else {
                                     mat4_view_from_xr_pose(viewMat[eye].data(), views[srcView].pose);
                                     mat4_from_xr_fov(projMat[eye].data(), views[srcView].fov, 0.01f, 100.0f);
+                                    projMatUnres[eye] = projMat[eye];
                                 }
 
                                 // Tile-aware viewport: row-major eye layout in the atlas.
@@ -3107,13 +3186,17 @@ int main(int argc, char** argv) {
                                     uint32_t avH = (uint32_t)((float)renderH * canvasFrac);
                                     if (avH == 0) avH = 1;
                                     uint32_t avY = tileOffsets[eye].second + (renderH - avH);
+                                    ModelRenderer::MaskProjections mp;
+                                    mp.unrestricted = projMatUnres[eye].data();
+                                    mp.testRestricted = MaskMutation().active ? projMat[eye].data() : nullptr;
+                                    mp.testUnrestrictedReal = MaskMutation().active ? projMatUnres[eye].data() : nullptr;
                                     g_modelRenderer.renderEye(
                                         targetImage, swapFormat,
                                         xr.swapchain.width, xr.swapchain.height,
                                         tileOffsets[eye].first, avY,
                                         renderW, avH,
                                         viewMat[eye].data(), projMat[eye].data(),
-                                        tbg, clipFars[eye]);
+                                        tbg, clipFars[eye], /*edgeFadePx=*/0.0f, &mp);
                                 }
                             } else {
                                 RenderPlaceholder(vkDevice, graphicsQueue, cmdPool,
@@ -3181,6 +3264,7 @@ int main(int argc, char** argv) {
                                     xr.swapchain.width, xr.swapchain.height, g_windowW, g_windowH,
                                     (const float(*)[16])viewMat.data(),
                                     (const float(*)[16])projMat.data(),
+                                    (const float(*)[16])projMatUnres.data(),
                                     clipFars.data(), (uint32_t)eyeCount, canvasFrac);
                         } else {
                             rendered = false;

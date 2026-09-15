@@ -1853,9 +1853,47 @@ static uint32_t SilEnvUInt(const char* name, uint32_t def, uint32_t lo, uint32_t
     return (uint32_t)v;
 }
 
+// runtime#1470 mutation test. With DXR_AVATAR_MASKPASS_TEST=1, setting
+// DXR_AVATAR_MASKPASS_MUTATE_VH=<offset> overrides the REAL pass's far offset
+// with an artificially restricted one (far = ez + <offset>*vH) chosen to SLICE
+// the character, so the coverage probe fed by the real pass's projection — the
+// pre-fix source — can be measured against the unrestricted one in the same
+// frame, off the same skinned pose.
+//
+// The offset is in vH units and MAY BE NEGATIVE: it has to be, to prove
+// anything. A whole-body avatar is shallow next to the virtual display height,
+// so a far plane at or just behind the ZDP (+0.05 vH, the obvious first guess)
+// removes only the few texels where the tail/hind legs stick out past the
+// chest in the union silhouette — 0.1 %, and on some animation frames exactly
+// zero, which would make the test report a spurious FAIL. A plane IN FRONT of
+// the ZDP cuts the body itself. -0.1 is the default ("1" is accepted as that
+// shorthand); it must stay > -1 because near = ez - vH.
+// Unset = off; any parsable float, including 0, is used verbatim.
+struct MaskMutationCfg {
+    bool  active = false;
+    float farOffsetVH = 0.0f;
+};
+static const MaskMutationCfg &MaskMutation() {
+    static const MaskMutationCfg cfg = [] {
+        MaskMutationCfg m;
+        const char *e = std::getenv("DXR_AVATAR_MASKPASS_MUTATE_VH");
+        if (e != nullptr && e[0] != '\0') {
+            char *end = nullptr;
+            const float v = std::strtof(e, &end);
+            if (end != e) {
+                m.active = true;
+                m.farOffsetVH = (v == 1.0f) ? -0.1f : v;
+            }
+        }
+        return m;
+    }();
+    return cfg;
+}
+
 static void UpdateSilhouette(VkDevice dev, VkPhysicalDevice phys, VkQueue queue, VkCommandPool pool,
                             uint32_t imgW, uint32_t imgH, uint32_t winW, uint32_t winH,
                             const float (*viewMats)[16], const float (*projMats)[16],
+                            const float (*projMatsUnres)[16],
                             const float* clipFars, uint32_t numViews) {
     if (winW == 0 || winH == 0 || numViews == 0) return;
     // Coverage resolution tracks the window instead of sitting at a fixed cap.
@@ -2005,15 +2043,28 @@ static void UpdateSilhouette(VkDevice dev, VkPhysicalDevice phys, VkQueue queue,
         // region).
         const uint32_t silAvH = (h * 3u) / 4u;
         const uint32_t silAvY = h - silAvH;
+        // runtime#1470: the coverage pass armed around this pair must project
+        // with an UNRESTRICTED far plane — reusing projMats[] leaves the GPU's
+        // fixed-function clipper as a second, budget-dependent clip (see
+        // ModelRenderer::MaskProjections). The two test probes are recorded
+        // only under DXR_AVATAR_MASKPASS_TEST.
+        ModelRenderer::MaskProjections mpFirst;
+        mpFirst.unrestricted = projMatsUnres ? projMatsUnres[vFirst] : nullptr;
+        mpFirst.testRestricted = MaskMutation().active ? projMats[vFirst] : nullptr;
+        mpFirst.testUnrestrictedReal = MaskMutation().active ? mpFirst.unrestricted : nullptr;
         g_modelRenderer.renderEye(g_silImage.image, VK_FORMAT_R8G8B8A8_UNORM,
             imgW, imgH,
             0, silAvY, w, silAvH, viewMats[vFirst], projMats[vFirst], /*transparentBg=*/true,
-            clipFars[vFirst]);
+            clipFars[vFirst], /*edgeFadePx=*/0.0f, &mpFirst);
         if (twoViews) {
+            ModelRenderer::MaskProjections mpLast;
+            mpLast.unrestricted = projMatsUnres ? projMatsUnres[vLast] : nullptr;
+            mpLast.testRestricted = MaskMutation().active ? projMats[vLast] : nullptr;
+            mpLast.testUnrestrictedReal = MaskMutation().active ? mpLast.unrestricted : nullptr;
             g_modelRenderer.renderEye(g_silImage2.image, VK_FORMAT_R8G8B8A8_UNORM,
                 imgW, imgH,
                 0, silAvY, w, silAvH, viewMats[vLast], projMats[vLast], /*transparentBg=*/true,
-                clipFars[vLast]);
+                clipFars[vLast], /*edgeFadePx=*/0.0f, &mpLast);
         }
     }
     // renderEye leaves the scratch image in COLOR_ATTACHMENT_OPTIMAL → copy to host.
@@ -3168,6 +3219,13 @@ static void RenderThreadFunc(
                         // Build per-eye view/projection matrices (column-major float[16]).
                         // Sized to the runtime's max view count so Quad mode (4 views) fits.
                         float viewMat[8][16], projMat[8][16];
+                        // runtime#1470: the content-mask coverage pass's OWN projection
+                        // — same fov, same near, far = ResolveClipPlanes at
+                        // farOffsetVH = 1000. The mask must describe the silhouette at
+                        // an unrestricted rear budget (spec v4), and the rasterizer's
+                        // NDC z > 1 clip is a second clip that PR #91's fragment-discard
+                        // removal did not touch.
+                        float projMatUnres[8][16];
                         float clipFar[8] = {0};  // per-eye view-space far cull (0 = off)
                         for (int eye = 0; eye < eyeCount; eye++) {
                             if (zonesFrame) {
@@ -3195,12 +3253,32 @@ static void RenderThreadFunc(
                                 // clipFar — see PR for the narrow behavior note.
                                 const XrRearDepthBudgetDXR* budget =
                                     (zoneBudget.type == XR_TYPE_REAR_DEPTH_BUDGET_DXR) ? &zoneBudget : nullptr;
-                                const dxr::ClipPlanes clip = dxr::ResolveClipPlanes(
+                                dxr::ClipPlanes clip = dxr::ResolveClipPlanes(
                                     ez, vH, budget, g_transparentBg.load(), standalone);
+                                // runtime#1470 mutation test: slice the character with
+                                // the REAL pass's far plane so the pre-fix coverage
+                                // source can be measured against the unrestricted one.
+                                if (MaskMutation().active) {
+                                    clip.farOffsetVH = MaskMutation().farOffsetVH;
+                                    clip.far_z = ez + MaskMutation().farOffsetVH * vH;
+                                    if (clip.far_z < clip.near_z + 1.0e-4f)
+                                        clip.far_z = clip.near_z + 1.0e-4f;
+                                    // Keep the shader's fragment cull in step so the
+                                    // real pass on screen shows the same slice.
+                                    if (clip.clipFar > 0.0f) clip.clipFar = clip.far_z;
+                                }
+                                // The mask's far offset is ALWAYS the unrestricted one:
+                                // transparent=false is how ResolveClipPlanes spells
+                                // farOffsetVH = 1000 (it is the one expression for
+                                // "unrestricted" in the shared policy header).
+                                const dxr::ClipPlanes clipUnres = dxr::ResolveClipPlanes(
+                                    ez, vH, /*budget=*/nullptr, /*transparent=*/false, standalone);
                                 mat4_view_from_xr_pose(viewMat[eye], zv.pose);
                                 mat4_from_xr_fov(projMat[eye], zv.fov, clip.near_z, clip.far_z);
+                                mat4_from_xr_fov(projMatUnres[eye], zv.fov, clipUnres.near_z, clipUnres.far_z);
                                 // GL ([-1,1] clip-z) -> Vulkan [0,1].
                                 convert_projection_gl_to_zero_to_one(projMat[eye]);
+                                convert_projection_gl_to_zero_to_one(projMatUnres[eye]);
                                 // ez = eye->display-plane forward distance, same world
                                 // units as the shader's p_view.z (ex eye_display.z).
                                 clipFar[eye] = clip.clipFar;  // 0 = no cull; never cull at/behind near (helper's ez>0.2f guard)
@@ -3216,6 +3294,9 @@ static void RenderThreadFunc(
                                 XMMATRIX pT = XMMatrixTranspose(p);
                                 XMStoreFloat4x4((XMFLOAT4X4*)viewMat[eye], vT);
                                 XMStoreFloat4x4((XMFLOAT4X4*)projMat[eye], pT);
+                                // Fallback path never gets the budget's far plane, so
+                                // its projection already IS the unrestricted one.
+                                std::memcpy(projMatUnres[eye], projMat[eye], sizeof(projMat[eye]));
                             }
                         }
 
@@ -3336,6 +3417,13 @@ static void RenderThreadFunc(
                                             std::fflush(stdout);
                                         }
                                     }
+                                    // runtime#1470: the mask is armed around the
+                                    // silhouette pass, not here — but MASKPASS_TEST arms
+                                    // every view, so hand the probes down anyway.
+                                    ModelRenderer::MaskProjections mpEye;
+                                    mpEye.unrestricted = projMatUnres[eye];
+                                    mpEye.testRestricted = MaskMutation().active ? projMat[eye] : nullptr;
+                                    mpEye.testUnrestrictedReal = MaskMutation().active ? projMatUnres[eye] : nullptr;
                                     if (zonesFrame) {
                                         // Full tile + content-alpha edge feather
                                         // (ADR-027 rule 4 — the wish mask can't
@@ -3346,7 +3434,7 @@ static void RenderThreadFunc(
                                             col * tileW, row * tileH, tileW, tileH,
                                             viewMat[eye], projMat[eye],
                                             g_transparentBg.load(), clipFar[eye],
-                                            s_fadePx);
+                                            s_fadePx, &mpEye);
                                     } else {
                                         uint32_t vpX = col * renderW;
                                         uint32_t vpY = row * renderH;
@@ -3362,7 +3450,8 @@ static void RenderThreadFunc(
                                             targetW, targetH,
                                             vpX, avY, renderW, avH,
                                             viewMat[eye], projMat[eye],
-                                            g_transparentBg.load(), clipFar[eye]);
+                                            g_transparentBg.load(), clipFar[eye],
+                                            /*edgeFadePx=*/0.0f, &mpEye);
                                     }
                                 }
                             } else {
@@ -3513,7 +3602,7 @@ static void RenderThreadFunc(
 
                                 UpdateSilhouette(vkDevice, physDevice, graphicsQueue, renderCmdPool,
                                     targetW, targetH, windowW, windowH,
-                                    viewMat, projMat, clipFar, (uint32_t)eyeCount);
+                                    viewMat, projMat, projMatUnres, clipFar, (uint32_t)eyeCount);
 
                                 // XR_DXR_depth_budget v3 (#81 §6), as amended by
                                 // runtime#1470: reduce the frame's silhouette to the
