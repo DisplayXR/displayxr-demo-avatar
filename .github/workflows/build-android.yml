@@ -94,6 +94,8 @@ jobs:
       - name: Set up Android SDK
         if: needs.DetectChanges.outputs.docs_only != 'true'
         uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
 
       - name: Install glslangValidator (shader compile)
         if: needs.DetectChanges.outputs.docs_only != 'true'
