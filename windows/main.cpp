@@ -1517,6 +1517,20 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             g_inputState.cycleRenderingModeRequested = true;
             return 0;
         }
+        // N / K = next animation clip / play-pause. The render loop already
+        // consumes cycleClipRequested / playPauseRequested (cycleAnimation,
+        // togglePaused + the clip toast) but nothing ever set them, so the
+        // documented keys were dead. Same request-flag route as V, applied
+        // on the render thread next frame.
+        if (wParam == 'N' || wParam == 'K') {
+            std::lock_guard<std::mutex> lock(g_inputMutex);
+            if (wParam == 'N') {
+                g_inputState.cycleClipRequested = true;
+            } else {
+                g_inputState.playPauseRequested = true;
+            }
+            return 0;
+        }
         // I key = capture multi-view atlas
         if (wParam == 'I' || wParam == 'i') {
             g_captureAtlasRequested.store(true);
