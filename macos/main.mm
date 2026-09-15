@@ -58,6 +58,7 @@
 #include "display3d_view.h"
 #include "camera3d_view.h"
 #include "projection_depth.h"
+#include "content_mask.h"  // dxr::ContentMaskFromCoverage - mask-refresh self-test (runtime#1474)
 #include "auto_fit.h"    // dxr::AutoFitVHeight — shared load-time framing rule
 #include "model_renderer.h"
 #include "model_vulkan_utils.h"   // scratch image/buffer for the click-through silhouette
@@ -2268,6 +2269,104 @@ static const MaskMutationCfg &MaskMutation() {
     return cfg;
 }
 
+// ── Content-mask REFRESH self-test (runtime#1474) ───────────────────────────
+//
+// DXR_AVATAR_MASKPASS_TEST proves the coverage pass draws the right pixels; it
+// does NOT prove the published mask still changes once the app has been running
+// a while, because on macOS the test leg consumes each readback INLINE
+// (renderEye's `maskTestForce_ && !maskArmed_` branch waits the fence and folds
+// immediately). The shipping Windows path does the opposite: it ARMS the pass
+// with beginContentMaskFrame() and relies on beginFrame() to fold the pending
+// slots one frame later. Those are different code paths, and only the second
+// one ships — so a frozen mask (the runtime re-analyses the budget only when the
+// published XrContentMaskDXR cells CHANGE, so a viewer that republishes the same
+// cells forever pins the verdict to its first analysed frame) is invisible to
+// the existing test.
+//
+// DXR_AVATAR_MASKPASS_REFRESH=1 drives the SHIPPING sequence on macOS/MoltenVK:
+// beginFrame() per frame, beginContentMaskFrame(true) around the silhouette
+// views, contentMaskCoverage() read right after — then asserts that both the
+// raw coverage AND the 64x64 XrContentMaskDXR cells built from it differ
+// between frame N and frame N+kRefreshLag while the animation plays.
+static bool MaskRefreshTest() {
+    static const bool on = [] {
+        const char *e = std::getenv("DXR_AVATAR_MASKPASS_REFRESH");
+        return e != nullptr && e[0] == '1' && e[1] == '\0';
+    }();
+    return on;
+}
+
+//! Frames between the two samples the assertion compares. Big enough that an
+//! idle clip has visibly moved, small enough to report inside a short run.
+static constexpr uint32_t kMaskRefreshLag = 30;
+static constexpr uint32_t kMaskRefreshGridCells = 64;   // == windows/main.cpp
+
+// Feed one frame's published coverage to the assertion. Counts covered texels,
+// rebuilds the extension cell grid exactly as the Windows call site does, and
+// compares against the sample kMaskRefreshLag frames ago.
+static void MaskRefreshSample(const uint8_t *cov, uint32_t winW, uint32_t winH) {
+    static uint32_t frame = 0;
+    static std::vector<size_t>  histCount;
+    static std::vector<std::vector<uint8_t>> histCells;
+    static uint32_t checks = 0, failCount = 0, failCells = 0;
+
+    if (cov == nullptr) {
+        std::printf("ModelRenderer: [maskpass-refresh] frame %u: coverage is NULL "
+                    "(pass not armed, or no readback folded yet)\n", frame);
+        std::fflush(stdout);
+        frame++;
+        return;
+    }
+
+    const size_t n = size_t(ModelRenderer::kContentMaskCovW) * ModelRenderer::kContentMaskCovH;
+    size_t covered = 0;
+    for (size_t i = 0; i < n; ++i) covered += (cov[i] != 0) ? 1u : 0u;
+
+    std::vector<uint8_t> cells;
+    dxr::ContentMaskFromCoverage(cov, ModelRenderer::kContentMaskCovW,
+                                 ModelRenderer::kContentMaskCovH,
+                                 ModelRenderer::kContentMaskCovW,
+                                 winW, winH, nullptr,
+                                 kMaskRefreshGridCells, kMaskRefreshGridCells, cells);
+
+    histCount.push_back(covered);
+    histCells.push_back(cells);
+
+    if (frame >= kMaskRefreshLag) {
+        const size_t prevIdx = size_t(frame - kMaskRefreshLag);
+        const bool countMoved = (histCount[prevIdx] != covered);
+        const bool cellsMoved = (histCells[prevIdx] != cells);
+        checks++;
+        if (!countMoved) failCount++;
+        if (!cellsMoved) failCells++;
+        if ((frame % kMaskRefreshLag) == 0) {
+            std::printf("ModelRenderer: [maskpass-refresh] frame %u: covered=%zu "
+                        "(frame %zu: %zu) count-moved=%s cells-moved=%s\n",
+                        frame, covered, prevIdx, histCount[prevIdx],
+                        countMoved ? "yes" : "NO", cellsMoved ? "yes" : "NO");
+            std::fflush(stdout);
+        }
+    }
+
+    // Verdict once, after a run long enough to be meaningful.
+    if (checks == 240u) {
+        // The CELLS are the verdict: they are what the runtime diffs to decide
+        // whether to re-analyse the budget, so an unchanged grid is the actual
+        // freeze. An unchanged texel COUNT is reported but does not fail - two
+        // different silhouettes can cover the same number of texels, and on an
+        // idle clip that happens a few times in every few hundred frames.
+        const bool pass = (failCells == 0);
+        std::printf("ModelRenderer: [maskpass-refresh] %s - %u comparisons, "
+                    "%u with unchanged cells (fail), %u with an unchanged texel "
+                    "count (informational) (lag=%u frames, grid=%ux%u)\n",
+                    pass ? "PASS" : "FAIL", checks, failCells, failCount,
+                    kMaskRefreshLag, kMaskRefreshGridCells, kMaskRefreshGridCells);
+        std::fflush(stdout);
+        checks++;   // report once
+    }
+    frame++;
+}
+
 // Render the avatar silhouette into the scratch image and publish the coverage
 // bitmap. Cheap (downscaled ~1/3); called every other frame. imgW/imgH must
 // equal the dims the main eye render used so the renderer's internal targets
@@ -2287,6 +2386,12 @@ static void UpdateSilhouette(VkDevice dev, VkPhysicalDevice phys, VkQueue queue,
     const uint32_t silIdx[2] = {0, numViews - 1};
     const uint32_t silPasses = (numViews > 1) ? 2u : 1u;
     std::vector<uint8_t> unionAlpha((size_t)w * h, 0);
+
+    // runtime#1474 refresh self-test: arm the coverage pass around exactly the
+    // views the Windows shipping path arms it around, so the deferred
+    // beginFrame() fold (not the inline MASKPASS_TEST one) is what produces the
+    // coverage this run reads back.
+    if (MaskRefreshTest()) g_modelRenderer.beginContentMaskFrame(true);
 
     for (uint32_t p = 0; p < silPasses; ++p) {
         const uint32_t v = silIdx[p];
@@ -2357,6 +2462,14 @@ static void UpdateSilhouette(VkDevice dev, VkPhysicalDevice phys, VkQueue queue,
     static int s_dbg = 0;
     if (s_dumpSil && (s_dbg++ % 60) == 0)
         stbi_write_png("/tmp/avatar_silhouette.png", (int)w, (int)h, 1, unionAlpha.data(), (int)w);
+
+    // runtime#1474: read the published mask exactly where windows/main.cpp reads
+    // it - same frame, right after the armed silhouette views, while the pass is
+    // still armed (contentMaskCoverage() returns nullptr once beginFrame()
+    // disarms). The value is one frame pipelined by design; what the assertion
+    // checks is that it MOVES.
+    if (MaskRefreshTest())
+        MaskRefreshSample(g_modelRenderer.contentMaskCoverage(), winW, winH);
 }
 
 // True if the cursor is over an interactive region (avatar silhouette, the top
@@ -2735,6 +2848,13 @@ int main(int argc, char** argv) {
             if (g_input.playPauseRequested) { g_input.playPauseRequested = false; g_modelRenderer.togglePaused(); }
             UpdateAnimButton();   // refresh label (clip name ↔ "Paused")
         }
+        // runtime#1474: the shipping Windows path opens every frame with
+        // beginFrame() - it is what waits the ring and FOLDS the content-mask
+        // readbacks recorded last frame. macOS does not normally call it (the
+        // ring recycles itself via renderEye's vkQueueWaitIdle fallback), so the
+        // refresh self-test has to drive it to exercise the real sequence. Same
+        // placement as Windows: before updateAnimation rewrites the joint SSBO.
+        if (MaskRefreshTest()) g_modelRenderer.beginFrame();
         // Advance node/TRS animation once per frame (no-op for static models).
         g_modelRenderer.updateAnimation(deltaTime);
 
