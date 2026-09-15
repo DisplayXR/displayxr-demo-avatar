@@ -2494,8 +2494,13 @@ static void RenderThreadFunc(
                 } else {
                     ToastF("%s  %s", playing ? "Playing" : "Paused", clip.c_str());
                 }
+                // One line per keypress, so a log alone proves the key landed
+                // (the toast is on-panel only).
+                LOG_INFO("Clip playback: %s '%s' (%d/%d) via %s", playing ? "playing" : "paused",
+                         clip.c_str(), ci + 1, cn, cycleClip ? "N" : "K");
             } else {
                 ToastF("No animation in this model");
+                LOG_INFO("Clip playback: no animation clips in this model (%s ignored)", cycleClip ? "N" : "K");
             }
         }
         // Advance node/TRS animation once per frame (no-op for static models).
