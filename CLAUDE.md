@@ -47,10 +47,26 @@ at startup.
   pass's two views and read back one frame later in `beginFrame()`. The v2
   `XrContentBoundsDXR` bounds were always clip-independent (a projected
   model-space AABB) and stay chained as the runtime's fallback.
+  **TWO clips, not one (runtime#1470).** Removing `pbr.frag`'s far discard was
+  only half of it: the coverage pass reused the view's `UniformBlock`, whose
+  `viewProj` carries the rear-budget far plane, so the rasterizer's NDC z > 1
+  clip still cut the rear half before a fragment ran and the mask stayed
+  budget-dependent. The pass therefore gets its OWN uniform slot, written from
+  an **unrestricted** projection (same fov, same near, far =
+  `dxr::ResolveClipPlanes` at `farOffsetVH = 1000`) — `renderEye`'s
+  `MaskProjections` argument. Never use `depthClampEnable` for this.
   `DXR_AVATAR_MASKPASS_TEST=1` arms the pass on every platform and logs a
   covered-texel count + one ASCII silhouette dump, so the Vulkan objects, the
   draw and the flip are exercisable on macOS/MoltenVK where nothing chains a
-  mask.
+  mask. Adding `DXR_AVATAR_MASKPASS_MUTATE_VH=<offset in vH>` (`1` = the -0.1
+  default) makes it a **mutation test**: the REAL pass gets an artificially
+  restricted far plane that slices the character, and the renderer records two
+  extra coverage probes in the same frame — the real-pass projection (the
+  pre-fix source) and that rig at far = unrestricted — then asserts
+  `unrestricted == real-unrestricted` and `real-restricted < real-unrestricted`.
+  The offset must be NEGATIVE to prove anything: the avatar is shallow next to
+  vH, so +0.05 vH cuts ~0.1 % of the silhouette and on some animation frames
+  exactly nothing.
 - **Face-the-viewer billboard** — yaw tracks the tracked head centre (from
   `rawEyes`), time-based smoothing, gated on `xr->isEyeTracking`. Pitch is
   implemented but disabled (`FACE_PITCH_SIGN`). LMB-drag overrides it.

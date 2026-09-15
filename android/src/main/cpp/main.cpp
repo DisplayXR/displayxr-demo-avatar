@@ -2158,6 +2158,11 @@ render_frame()
 					Mat4 viewM = view_matrix_from_pose(views[i].pose);
 					Mat4 evM = mat4_mul(viewM, splat_model);  // apply splat model
 					Mat4 projM;
+					// runtime#1470: the content-mask coverage pass's own
+					// projection — same fov/near, far unrestricted. Reusing
+					// projM leaves the rasterizer's NDC z > 1 clip as a second,
+					// budget-dependent clip on the mask.
+					Mat4 projM_unres;
 					// Foreground-only clip (windows/main.cpp:1640-1668): in transparent
 					// mode cull geometry behind the virtual display plane (ZDP) so only
 					// popping-out content shows. clipFar rides in the renderer UBO
@@ -2202,9 +2207,12 @@ render_frame()
 							}
 						}
 						projM = projection_matrix_from_fov(eff_fov, -1.0f, near_z, far_z);
+						projM_unres = projection_matrix_from_fov(
+						    eff_fov, -1.0f, near_z, ez + 1000.0f * rig_vh);
 					} else {
 						const float aspect = (float)tile_w / (float)tile_h;
 						projM = projection_matrix_from_fov(views[i].fov, aspect, 0.01f, 100.0f);
+						projM_unres = projM;
 					}
 					sil_evM[i] = evM;
 					sil_projM[i] = projM;
@@ -2216,12 +2224,17 @@ render_frame()
 					// around the avatar is transparent. The runtime's alpha-gate
 					// (Leia DP) / sim passthrough carries that alpha to the
 					// translucent SurfaceView → the live screen shows through.
+					ModelRenderer::MaskProjections mp;
+					mp.unrestricted = projM_unres.m;
+					mp.testRestricted = projM.m;
+					mp.testUnrestrictedReal = projM_unres.m;
 					g_model.renderEye(
 					    g_views[0].images[img_idx].image, g_swapchain_format,
 					    g_views[0].width, g_views[0].height,
 					    tile_x, tile_y, tile_w, tile_h,
 					    evM.m, projM.m,
-					    /*transparentBg*/ true, /*clipFarViewSpace*/ clip_far);
+					    /*transparentBg*/ true, /*clipFarViewSpace*/ clip_far,
+					    /*edgeFadePx*/ 0.0f, &mp);
 
 					projection_views[i].type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
 					projection_views[i].pose = views[i].pose;
