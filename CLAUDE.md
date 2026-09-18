@@ -160,6 +160,28 @@ every later `xrBeginFrame` returns `XR_FRAME_DISCARDED`. The Linux leg is
 stereo-fixed (2 tiles, no mode enumeration) and opts in anyway for uniformity;
 the clamp is what actually protects it.
 
+**ADOPT the runtime's active mode; never request one at startup.** macOS and
+Linux read `XrDisplayRenderingModeInfoDXR::isActive` (display_info v13) once
+after `xrCreateSession` and take it (`Adopting runtime's active rendering mode:
+N` in the log). macOS used to fire an unconditional
+`xrRequestDisplayRenderingModeDXR(1)` for its hardcoded Anaglyph default — which
+made the 4-view Quad and 1-view 2D paths **unreachable from outside the
+process**: `SIM_DISPLAY_OUTPUT=quad` logged `Rendering mode changed 4 -> 1` a
+moment after startup. A pre-v13 runtime names no active mode; the app then keeps
+its own default and still issues no request.
+
+**Exercising N-view headlessly (macOS).** `SIM_DISPLAY_OUTPUT` picks the
+sim_display mode for BOTH the runtime and the app's pre-session hint, and the
+indices must match `sim_display_device.c`: `2d`/`passthrough`=0, `anaglyph`=1,
+`sbs`=2, `squeezed`=3, `quad`=4. Keys `0`–`4` select a mode directly, `V`
+cycles. Check the runtime's `Atlas blit: view_count=…, eff_tiles=…,
+layer_view_count=…` WARN to confirm what actually reached the compositor.
+
+**Linux is the exception:** it renders a FIXED 2-tile horizontal atlas, so it
+adopts the active mode's count but `DxrClampSubmitViewCount` cuts a 4-view mode
+back to 2 and logs once. It honours a 1-view mode correctly; rendering Quad
+there needs the tile layout generalised to the mode's `cols × rows` grid first.
+
 Lint any leg with
 `python3 <runtime>/scripts/check_displayxr_app.py <leg-dir>` — it recognises
 `DxrSelectViewConfigType` as the opt-in (INV-3.1).
