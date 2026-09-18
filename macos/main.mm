@@ -32,6 +32,8 @@
 #include <openxr/XR_DXR_atlas_capture.h>
 #include <openxr/XR_DXR_mcp_tools.h>
 #include <openxr/XR_DXR_local_3d_zone.h>   // XrCompositionLayerLocal2DDXR (speech bubble)
+#include "dxr_view_config.h"               // DxrSelectViewConfigType (runtime #1486)
+#include "dxr_submit_views.h"              // DxrClampSubmitViewCount — INV-3.1 submit gate
 
 #include <cmath>
 #include <atomic>
@@ -1195,6 +1197,17 @@ static bool InitializeOpenXR(AppXrSession& xr) {
     XrSystemGetInfo si = {XR_TYPE_SYSTEM_GET_INFO};
     si.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
     XR_CHECK(xrGetSystem(xr.instance, &si, &xr.systemId));
+
+    // #1486/#1500 — pick the view configuration right after xrGetSystem and
+    // BEFORE the first typed call (CreateSwapchains' xrEnumerateViewConfiguration-
+    // Views, xrBeginSession's primaryViewConfigurationType, every xrLocateViews).
+    // This app's per-frame view count comes from the ACTIVE DXR rendering mode,
+    // so it must run on the configuration that reports the device MAX:
+    // PRIMARY_STEREO now reports exactly 2 and xrEndFrame rejects a projection
+    // layer carrying more. Degrades to PRIMARY_STEREO on a runtime that does not
+    // enumerate the DXR type, so it is unconditional.
+    xr.viewConfigType = DxrSelectViewConfigType(xr.instance, xr.systemId);
+    LOG_INFO("View configuration type: %s", DxrViewConfigTypeName(xr.viewConfigType));
 
     { XrSystemProperties sp = {XR_TYPE_SYSTEM_PROPERTIES};
       xrGetSystemProperties(xr.instance, xr.systemId, &sp);
@@ -2826,7 +2839,7 @@ int main(int argc, char** argv) {
                         uint32_t modeViewCount = (xr.renderingModeCount > 0 && g_input.currentRenderingMode < xr.renderingModeCount)
                             ? xr.renderingModeViewCounts[g_input.currentRenderingMode] : 2u;
                         if (modeViewCount < 1) modeViewCount = 1;
-                        if (modeViewCount > runtimeViewCount) modeViewCount = runtimeViewCount;
+                        const uint32_t wantedViewCount = modeViewCount;
                         bool display3D = (xr.renderingModeCount > 0)
                             ? xr.renderingModeDisplay3D[g_input.currentRenderingMode] : true;
                         bool monoMode = !display3D;
@@ -2836,6 +2849,36 @@ int main(int argc, char** argv) {
                         uint32_t tileRows = (xr.renderingModeCount > 0 && xr.renderingModeTileRows[g_input.currentRenderingMode] > 0)
                             ? xr.renderingModeTileRows[g_input.currentRenderingMode]
                             : 1u;
+
+                        // #1486/#1500 — what we may SUBMIT is the min of the active
+                        // mode's count, the views xrLocateViews actually returned,
+                        // and the atlas tile grid (arraySize is 1 here; the
+                        // cols×rows sub-rect grid is the array-slice analogue).
+                        // projectionViews.size() is eyeCount, and that vector is
+                        // what xrEndFrame sees — so clamping here IS the submit
+                        // gate. Any of the three can move under the app (a mode
+                        // transition in flight, a short locate), and a layer that
+                        // claims a view the app never rendered now fails
+                        // xrEndFrame instead of merely looking wrong.
+                        {
+                            int disagreed = 0;
+                            modeViewCount = DxrClampSubmitViewCount(
+                                wantedViewCount, runtimeViewCount, tileColumns * tileRows, &disagreed);
+                            if (disagreed) {
+                                static bool s_warnedViewClamp = false;
+                                if (!s_warnedViewClamp) {
+                                    s_warnedViewClamp = true;
+                                    LOG_WARN("View-count clamp: mode=%u located=%u tiles=%ux%u -> submitting %u",
+                                             wantedViewCount, runtimeViewCount, tileColumns, tileRows,
+                                             modeViewCount);
+                                }
+                            }
+                            // Unreachable in practice — this block only runs on a
+                            // SUCCEEDED locate (runtimeViewCount >= 1) and the tile
+                            // grid is at least 1x1 — but eyeCount must never be 0:
+                            // a projection layer with viewCount 0 is itself invalid.
+                            if (modeViewCount < 1) modeViewCount = 1;
+                        }
 
                         int eyeCount = monoMode ? 1 : (int)modeViewCount;
 

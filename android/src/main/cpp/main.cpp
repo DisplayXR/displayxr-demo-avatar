@@ -39,6 +39,14 @@
 // declared (ifndef-guarded) in the window-binding headers; the cocoa one is
 // plain C with no platform deps, so it serves as the decl source on Android.
 #include <openxr/XR_DXR_cocoa_window_binding.h>
+// Runtime #1486/#1500: PRIMARY_STEREO reports exactly 2 views and xrEndFrame
+// rejects a projection layer that carries more. DxrSelectViewConfigType picks
+// XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR when the runtime advertises
+// it; DxrClampSubmitViewCount is the INV-3.1 submit gate. (Both come from
+// <repo>/common, which android/src/main/cpp/CMakeLists.txt puts on the include
+// path alongside the other legs.)
+#include "dxr_view_config.h"
+#include "dxr_submit_views.h"
 
 #include <atomic>
 #include <vector>
@@ -104,6 +112,11 @@ log_xr_result(const char *what, XrResult r)
 
 XrInstance g_instance = XR_NULL_HANDLE;
 XrSystemId g_system_id = XR_NULL_SYSTEM_ID;
+// #1486/#1500: the session's view configuration. Seeded by
+// DxrSelectViewConfigType in query_system_and_graphics_reqs() and fed to EVERY
+// view-configuration-typed call. PRIMARY_STEREO is the fallback initialiser —
+// it is also what the helper returns on a runtime without the DXR type.
+XrViewConfigurationType g_view_config_type = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
 XrVersion g_required_vk_version = XR_MAKE_VERSION(1, 1, 0);
 
 VkInstance g_vk_instance = VK_NULL_HANDLE;
@@ -964,6 +977,18 @@ query_system_and_graphics_reqs()
 		}
 	}
 
+	// #1486/#1500 — pick the view configuration right after xrGetSystem and
+	// BEFORE the first typed call (create_swapchains' xrEnumerateViewConfiguration-
+	// Views, xrBeginSession's primaryViewConfigurationType, the per-frame
+	// xrLocateViews). This app's submitted view count comes from the ACTIVE DXR
+	// rendering mode (g_rmode_vc), so it must run on the configuration that
+	// reports the device MAX: PRIMARY_STEREO now reports exactly 2 and
+	// xrEndFrame rejects a projection layer carrying more. The helper degrades
+	// to PRIMARY_STEREO on a runtime that does not enumerate the DXR type, so
+	// it is unconditional and safe against an older runtime.
+	g_view_config_type = DxrSelectViewConfigType(g_instance, g_system_id);
+	LOGI("View configuration type: %s", DxrViewConfigTypeName(g_view_config_type));
+
 	PFN_xrGetVulkanGraphicsRequirements2KHR get_reqs = nullptr;
 	res = xrGetInstanceProcAddr(
 	    g_instance, "xrGetVulkanGraphicsRequirements2KHR",
@@ -1335,7 +1360,7 @@ create_swapchains()
 {
 	uint32_t expected_view_count = 0;
 	XrResult res = xrEnumerateViewConfigurationViews(
-	    g_instance, g_system_id, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO,
+	    g_instance, g_system_id, g_view_config_type,
 	    0, &expected_view_count, nullptr);
 	// Accept any view count the runtime advertises, up to our worst-case
 	// capacity (kViewCount). The active rendering mode picks the actual tile
@@ -1349,7 +1374,7 @@ create_swapchains()
 		view_configs[i].type = XR_TYPE_VIEW_CONFIGURATION_VIEW;
 	}
 	res = xrEnumerateViewConfigurationViews(
-	    g_instance, g_system_id, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO,
+	    g_instance, g_system_id, g_view_config_type,
 	    kViewCount, &expected_view_count, view_configs);
 	if (res != XR_SUCCESS) {
 		log_xr_result("xrEnumerateViewConfigurationViews", res);
@@ -1700,7 +1725,7 @@ handle_session_state(XrSessionState new_state)
 	case XR_SESSION_STATE_READY: {
 		XrSessionBeginInfo begin = {};
 		begin.type = XR_TYPE_SESSION_BEGIN_INFO;
-		begin.primaryViewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+		begin.primaryViewConfigurationType = g_view_config_type;
 		XrResult res = xrBeginSession(g_session, &begin);
 		log_xr_result("xrBeginSession", res);
 		if (res == XR_SUCCESS) {
@@ -1795,7 +1820,16 @@ render_frame()
 
 	XrCompositionLayerProjectionView projection_views[kViewCount] = {};
 	bool rendered = false;
-	uint32_t submitted_view_count = kViewCount;
+	// #1486/#1500 — start at 0, NOT kViewCount.
+	//
+	// This used to be initialised to kViewCount (4, the atlas worst case) and
+	// was only overwritten on a SUCCESSFUL locate, so every path that skipped
+	// the locate reached xrEndFrame still claiming four views. Today `rendered`
+	// happens to gate layerCount to 0 on those paths, which is the only reason
+	// it never fired — a latent count that is wrong by construction and stays
+	// correct by accident. 0 means "nothing submittable", and the submit below
+	// checks it explicitly.
+	uint32_t submitted_view_count = 0;
 	// Display-zones framing (#568): the SAME zone chains on the zone-scoped
 	// locate AND the submitted projection layer. Declared at frame scope so the
 	// submit can reference it; populated in the locate block when zones are live.
@@ -1806,7 +1840,7 @@ render_frame()
 		view_state.type = XR_TYPE_VIEW_STATE;
 		XrViewLocateInfo locate_info = {};
 		locate_info.type = XR_TYPE_VIEW_LOCATE_INFO;
-		locate_info.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+		locate_info.viewConfigurationType = g_view_config_type;
 		locate_info.displayTime = frame_state.predictedDisplayTime;
 		locate_info.space = g_app_space;
 
@@ -1964,12 +1998,33 @@ render_frame()
 		// size (display × view_scale; computed below once g_win_px is fresh) into a
 		// sub-rect of the worst-case swapchain, and submitted as subImage.imageRect.
 		// The runtime z-fix (displayxr-runtime#538) keeps the 2D eye distance right.
-		uint32_t view_count = located < kViewCount ? located : kViewCount;
+		//
+		// #1486/#1500 made that a hard gate: submit min(active mode count,
+		// located count, atlas tile capacity). `located` is 0 when the locate
+		// failed, and the helper then returns 0 — which is the point, because
+		// the old code left submitted_view_count at its kViewCount initialiser
+		// on exactly that path.
+		uint32_t view_count;
 		{
 			const uint32_t mode = g_rmode_current.load(std::memory_order_relaxed);
-			const uint32_t mvc = (mode < 8 && g_rmode_vc[mode] > 0) ? g_rmode_vc[mode] : view_count;
-			if (mvc < view_count)
-				view_count = mvc;
+			const uint32_t mvc = (mode < 8 && g_rmode_vc[mode] > 0) ? g_rmode_vc[mode] : kViewCount;
+			// Tile capacity of the one worst-case atlas: the mode's cols×rows
+			// grid, never more slots than the atlas was sized for.
+			uint32_t grid = (mode < 8 && g_rmode_cols[mode] > 0 ? g_rmode_cols[mode] : 1u) *
+			                (mode < 8 && g_rmode_rows[mode] > 0 ? g_rmode_rows[mode] : 1u);
+			if (grid > kViewCount) {
+				grid = kViewCount;
+			}
+			int disagreed = 0;
+			view_count = DxrClampSubmitViewCount(mvc, located, grid, &disagreed);
+			if (disagreed) {
+				static bool warned_view_clamp = false;
+				if (!warned_view_clamp) {
+					warned_view_clamp = true;
+					LOGW("View-count clamp: mode=%u located=%u tiles=%u -> submitting %u",
+					     mvc, located, grid, view_count);
+				}
+			}
 		}
 		if (res == XR_SUCCESS && view_count >= 1) {
 			DXR_HW_DBG_ONCE("first xrLocateViews success");
@@ -2380,8 +2435,14 @@ render_frame()
 	end_info.type = XR_TYPE_FRAME_END_INFO;
 	end_info.displayTime = frame_state.predictedDisplayTime;
 	end_info.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
-	end_info.layerCount = rendered ? base_count : 0;
-	end_info.layers = rendered ? layers : nullptr;
+	// #1486/#1500: the projection layer is only legal when the render path
+	// actually filled `submitted_view_count` views — a layer describing views
+	// the app never located fails xrEndFrame, and a rejected frame is never
+	// ended, so every later xrBeginFrame returns XR_FRAME_DISCARDED and the app
+	// wedges black. Both conditions, not just `rendered`.
+	const bool submit_layers = rendered && submitted_view_count > 0;
+	end_info.layerCount = submit_layers ? base_count : 0;
+	end_info.layers = submit_layers ? layers : nullptr;
 	res = xrEndFrame(g_session, &end_info);
 	if (res != XR_SUCCESS) {
 		log_xr_result("xrEndFrame", res);

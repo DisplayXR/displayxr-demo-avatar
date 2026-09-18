@@ -127,9 +127,42 @@ model_common/                     — the renderer (vendor-neutral, analog of
                                     fullscreen.vert, brdf_lut/irradiance/
                                     prefilter.frag, sky.glsl + ibl_common.glsl
 common/                           — Kooima view math (display3d_view.*),
-                                    camera3d_view (unused), input, HUD, stb
+                                    camera3d_view (unused), input, HUD, stb;
+                                    dxr_view_config.h (vendored #1486 helper) +
+                                    dxr_submit_views.h (submit clamp), shared by
+                                    ALL FOUR legs
 openxr_includes/                  — vendored OpenXR + DisplayXR ext headers
 ```
+
+### View configuration — this is an N-view app on every leg (runtime #1486/#1500)
+`XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO` reports **exactly 2** views and
+`xrEndFrame` rejects a projection layer that carries more, so an app whose
+per-frame view count comes from the active DXR rendering mode must begin its
+session with `XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR` — otherwise it
+goes black in sim_display's 4-view Quad mode (reachable with V / 4 / 5 on any dev
+box). Every leg therefore calls **`DxrSelectViewConfigType(instance, systemId)`
+once, right after `xrGetSystem` and before the first view-configuration-typed
+call**, and feeds that one variable to `xrEnumerateViewConfigurationViews`,
+`XrSessionBeginInfo::primaryViewConfigurationType` and
+`XrViewLocateInfo::viewConfigurationType` (Windows: `xr.viewConfigType` on
+displayxr-common's `XrSessionManager`, set in `windows/xr_session.cpp`; macOS /
+Linux: the same field on their own `AppXrSession`; Android:
+`g_view_config_type`). It degrades to `PRIMARY_STEREO` on an older runtime, so
+it is unconditional.
+
+**The count that reaches `xrEndFrame` comes from the render path, never from the
+mode.** `DxrClampSubmitViewCount` (common/dxr_submit_views.h) returns
+`min(active mode count, located count, atlas tile capacity)` and logs once when
+the three disagree; 0 means submit no projection layer at all. Recomputing the
+mode's count at submit time is what #1500 turned from "looks wrong" into "fails
+`xrEndFrame`, which wedges the session" — a rejected frame is never ended, so
+every later `xrBeginFrame` returns `XR_FRAME_DISCARDED`. The Linux leg is
+stereo-fixed (2 tiles, no mode enumeration) and opts in anyway for uniformity;
+the clamp is what actually protects it.
+
+Lint any leg with
+`python3 <runtime>/scripts/check_displayxr_app.py <leg-dir>` — it recognises
+`DxrSelectViewConfigType` as the opt-in (INV-3.1).
 
 ### Renderer conventions (important)
 - **Internal target sized to the swapchain** (not per-eye); recreated only on

@@ -10,6 +10,7 @@
 #include <openxr/XR_DXR_local_3d_zone.h>   // Local2D speech-bubble layer
 #include <openxr/XR_DXR_view_rig.h>        // XR_DXR_VIEW_RIG_EXTENSION_NAME
 #include <openxr/XR_DXR_depth_budget.h>    // XR_DXR_DEPTH_BUDGET_EXTENSION_NAME
+#include "dxr_view_config.h"               // DxrSelectViewConfigType (runtime #1486)
 #include <cstring>
 
 // App-side availability flag (XrSessionManager carries no app-named fields).
@@ -306,6 +307,25 @@ bool InitializeOpenXR(XrSessionManager& xr) {
     } else {
         LOG_INFO("XR_DXR_mcp_tools: not advertised by runtime");
     }
+
+    // #1486/#1500 — pick the view configuration BEFORE the first typed call.
+    //
+    // This app's per-frame view count comes from the ACTIVE DXR rendering mode
+    // (see `activeViewCount` / `submitViewCount` in main.cpp), so it is exactly
+    // the class of app that must begin its session with
+    // PRIMARY_MULTIVIEW_DXR: PRIMARY_STEREO now reports exactly 2 views and
+    // xrEndFrame rejects a projection layer carrying more, which would take the
+    // avatar black every frame in sim_display's 4-view Quad mode (reachable on
+    // any dev box with the V / 4 / 5 keys).
+    //
+    // `xr.viewConfigType` is an XrSessionManager field, so setting it here also
+    // feeds displayxr-common's xrBeginSession
+    // (XrSessionBeginInfo::primaryViewConfigurationType) and its xrLocateViews;
+    // main.cpp's own locate calls read the same field. The helper degrades to
+    // PRIMARY_STEREO on a runtime that does not enumerate the DXR type, so this
+    // is unconditional and safe against an older runtime.
+    xr.viewConfigType = DxrSelectViewConfigType(xr.instance, xr.systemId);
+    LOG_INFO("View configuration type: %s", DxrViewConfigTypeName(xr.viewConfigType));
 
     uint32_t viewCount = 0;
     XR_CHECK(xrEnumerateViewConfigurationViews(xr.instance, xr.systemId, xr.viewConfigType, 0, &viewCount, nullptr));

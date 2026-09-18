@@ -66,6 +66,12 @@
 // top 25% band, composited post-weave so the avatar keeps weaving in the bottom
 // 75%. Mirrors the macOS/Windows peers' speech-bubble layer.
 #include <openxr/XR_DXR_local_3d_zone.h>
+// Runtime #1486/#1500: PRIMARY_STEREO reports exactly 2 views and xrEndFrame
+// rejects a projection layer that carries more. DxrSelectViewConfigType picks
+// XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR when the runtime advertises
+// it; DxrClampSubmitViewCount is the INV-3.1 submit gate.
+#include "dxr_view_config.h"
+#include "dxr_submit_views.h"
 // Display zones (ADR-027): the tiger-zone. The 3D avatar renders rig-framed INTO
 // one bottom-75% zone rect (no squish, 3D content kept out of the top band); the
 // speech bubble is the Local2D layer in the top 25%. XrDisplayZoneDXR is chained
@@ -808,6 +814,22 @@ static bool InitializeOpenXR(AppXrSession& xr) {
     XrSystemGetInfo systemInfo = {XR_TYPE_SYSTEM_GET_INFO};
     systemInfo.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
     XR_CHECK(xrGetSystem(xr.instance, &systemInfo, &xr.systemId));
+
+    // #1486/#1500 — pick the view configuration right after xrGetSystem and
+    // BEFORE the first typed call (xrEnumerateViewConfigurationViews below,
+    // xrBeginSession's primaryViewConfigurationType, both xrLocateViews sites).
+    //
+    // This leg is stereo-FIXED today (it enumerates no rendering modes and
+    // renders a fixed 2-tile atlas), so PRIMARY_STEREO would also work — the
+    // runtime's permissive rule accepts a 2-view layer under either type. It
+    // opts in anyway for two reasons: every leg of this demo then begins the
+    // same way, which is one less per-platform difference to remember; and the
+    // submit clamp below becomes meaningful the day this leg grows mode
+    // switching, instead of needing the opt-in retro-fitted with it. The helper
+    // degrades to PRIMARY_STEREO on a runtime that does not enumerate the DXR
+    // type.
+    xr.viewConfigType = DxrSelectViewConfigType(xr.instance, xr.systemId);
+    LOG_INFO("View configuration type: %s", DxrViewConfigTypeName(xr.viewConfigType));
 
     // Query XR_DXR_display_info: physical panel dims (m2v anchor), pixel dims,
     // per-view recommended scale (window×scale tiling), and the 3D-panel desktop
@@ -1629,7 +1651,22 @@ static bool RenderTigerZone(AppXrSession& xr, const XrFrameState& frameState,
         if (!s_warned) { s_warned = true; LOG_WARN("[zones] zone-scoped xrLocateViews failed — full-tile fallback"); }
         return false;
     }
-    const uint32_t n = viewCountOut < eyeCount ? viewCountOut : eyeCount;
+    // #1486/#1500 — submit min(app's fixed count, located, tiles). The zone
+    // atlas is exactly `eyeCount` tiles wide (see the g_zoneSwW/eyeCount clamp
+    // above), so the tile term is eyeCount; the term that actually bites is the
+    // located count, which is what the runtime is willing to describe this
+    // frame. Never submit a view we did not locate.
+    int zoneDisagreed = 0;
+    const uint32_t n = DxrClampSubmitViewCount(eyeCount, viewCountOut, eyeCount, &zoneDisagreed);
+    if (zoneDisagreed) {
+        static bool s_warnedZoneClamp = false;
+        if (!s_warnedZoneClamp) {
+            s_warnedZoneClamp = true;
+            LOG_WARN("[zones] view-count clamp: app=%u located=%u tiles=%u -> submitting %u",
+                     eyeCount, viewCountOut, eyeCount, n);
+        }
+    }
+    if (n == 0) return false;  // nothing submittable — fall back to the full-tile path
 
     XrSwapchainImageAcquireInfo ai = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
     uint32_t imageIndex = 0;
@@ -1932,7 +1969,33 @@ int main(int argc, char** argv) {
                     swWait.timeout = XR_INFINITE_DURATION;
                     if (XR_SUCCEEDED(xrWaitSwapchainImage(xr.swapchain.swapchain, &swWait))) {
                         rendered = true;
-                        uint32_t eyeCount = 2;
+                        // #1486/#1500 — this leg is stereo-fixed (2 tiles, no
+                        // rendering-mode enumeration), so 2 is the app's wanted
+                        // count. What it may SUBMIT is still min(2, located,
+                        // tiles): the located count is the runtime's answer for
+                        // this frame, and the SBS atlas holds exactly 2 tiles
+                        // (see the swapchain.width/eyeCount clamp below). A layer
+                        // that claims a view the app never located fails
+                        // xrEndFrame, which wedges the session rather than
+                        // dropping a frame.
+                        uint32_t eyeCount;
+                        {
+                            int disagreed = 0;
+                            eyeCount = DxrClampSubmitViewCount(2u, viewCount, 2u, &disagreed);
+                            if (disagreed) {
+                                static bool s_warnedViewClamp = false;
+                                if (!s_warnedViewClamp) {
+                                    s_warnedViewClamp = true;
+                                    LOG_WARN("View-count clamp: app=2 located=%u tiles=2 -> submitting %u",
+                                             viewCount, eyeCount);
+                                }
+                            }
+                        }
+                        // Unreachable on this path (the two-call above guarantees
+                        // viewCount >= 1 whenever the locate succeeded), but a
+                        // projection layer with viewCount 0 is itself invalid, so
+                        // never let the render loop degenerate.
+                        if (eyeCount == 0) eyeCount = 1;
                         // Per-eye RENDER TILE = window × recommendedViewScale
                         // (docs/specs/runtime/multiview-tiling.md + ADR-010/030):
                         // the swapchain is the worst-case display×scale envelope,
