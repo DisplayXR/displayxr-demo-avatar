@@ -410,6 +410,18 @@ struct AppXrSession {
     float viewScaleY = 1.0f;           // init to identity — only ever the extension's value
     int32_t displayScreenLeft = 0;     // 3D-panel top-left in virtual-desktop px (INV-1.3)
     int32_t displayScreenTop = 0;
+
+    // Display rendering modes (XR_DXR_display_info). This leg does not offer a
+    // mode-switch UI — it enumerates ONCE after xrCreateSession purely to learn
+    // which mode the panel is already in, so the submitted view count follows
+    // the runtime instead of a hardcoded 2. Mirrors the macOS leg's adoption.
+    PFN_xrEnumerateDisplayRenderingModesDXR pfnEnumerateRenderingModes = nullptr;
+    uint32_t renderingModeCount = 0;
+    uint32_t renderingModeViewCounts[8] = {};
+    // Index of the mode the runtime reports as active
+    // (XrDisplayRenderingModeInfoDXR::isActive, display_info v13).
+    // UINT32_MAX = the runtime named none (pre-v13, or the enumerate failed).
+    uint32_t activeRenderingMode = UINT32_MAX;
 };
 
 // Default portrait client size (Windows parity: windows/main.cpp g_windowWidth ×
@@ -1065,7 +1077,68 @@ static bool CreateSession(AppXrSession& xr, VkInstance vkInstance, VkPhysicalDev
              useAppWindow ? (wantTransparent ? "app-owned window, transparent overlay (default)"
                                              : "app-owned window, opaque handle app (AVATAR_TRANSPARENT=0)")
                           : "hosted-NULL: runtime self-creates the window");
+
+    // ADOPT the runtime's active rendering mode (display_info v13). This leg has
+    // no mode-switch UI and never REQUESTS a mode — it only reads which one the
+    // panel is already in, so the submitted view count follows the runtime
+    // instead of the hardcoded 2 it used to assume. That matters as soon as the
+    // panel boots into a 1-view mode (SIM_DISPLAY_OUTPUT=2d): the app used to
+    // submit two views into a one-tile atlas.
+    if (xr.hasDisplayInfo) {
+        xrGetInstanceProcAddr(xr.instance, "xrEnumerateDisplayRenderingModesDXR",
+                              (PFN_xrVoidFunction*)&xr.pfnEnumerateRenderingModes);
+    }
+    if (xr.pfnEnumerateRenderingModes != nullptr) {
+        uint32_t modeCount = 0;
+        if (XR_SUCCEEDED(xr.pfnEnumerateRenderingModes(xr.session, 0, &modeCount, nullptr)) &&
+            modeCount > 0) {
+            std::vector<XrDisplayRenderingModeInfoDXR> modes(modeCount);
+            for (uint32_t i = 0; i < modeCount; i++) {
+                modes[i].type = XR_TYPE_DISPLAY_RENDERING_MODE_INFO_DXR;
+                modes[i].next = nullptr;
+            }
+            if (XR_SUCCEEDED(xr.pfnEnumerateRenderingModes(xr.session, modeCount, &modeCount,
+                                                           modes.data()))) {
+                xr.renderingModeCount = modeCount > 8 ? 8 : modeCount;
+                LOG_INFO("Display rendering modes (%u):", modeCount);
+                for (uint32_t i = 0; i < xr.renderingModeCount; i++) {
+                    xr.renderingModeViewCounts[i] = modes[i].viewCount;
+                    if (modes[i].isActive == XR_TRUE) xr.activeRenderingMode = i;
+                    LOG_INFO("  [%u] %s (views=%u, tiles=%ux%u, 3D=%d%s)",
+                             modes[i].modeIndex, modes[i].modeName, modes[i].viewCount,
+                             modes[i].tileColumns ? modes[i].tileColumns : 1u,
+                             modes[i].tileRows ? modes[i].tileRows : 1u,
+                             modes[i].hardwareDisplay3D,
+                             modes[i].isActive == XR_TRUE ? ", ACTIVE" : "");
+                }
+            }
+        }
+    }
+    if (xr.activeRenderingMode != UINT32_MAX && xr.activeRenderingMode < xr.renderingModeCount) {
+        LOG_INFO("Adopting runtime's active rendering mode: %u (views=%u)",
+                 xr.activeRenderingMode, xr.renderingModeViewCounts[xr.activeRenderingMode]);
+    } else {
+        LOG_INFO("Runtime named no active rendering mode — assuming the 2-view default");
+    }
     return true;
+}
+
+/*!
+ * Views the ACTIVE rendering mode wants, or 2 when the runtime named no mode.
+ *
+ * This leg renders a FIXED 2-tile horizontal atlas, so it can honour a 1-view
+ * mode (submit one tile) but not a 4-view one — the caller's
+ * DxrClampSubmitViewCount() cuts the wanted count down to the 2 tiles that
+ * exist and logs the disagreement once, which is the honest outcome until the
+ * tile layout is generalised to the mode's cols x rows grid.
+ */
+static uint32_t ActiveModeViewCount(const AppXrSession& xr) {
+    if (xr.activeRenderingMode != UINT32_MAX &&
+        xr.activeRenderingMode < xr.renderingModeCount &&
+        xr.renderingModeViewCounts[xr.activeRenderingMode] > 0) {
+        return xr.renderingModeViewCounts[xr.activeRenderingMode];
+    }
+    return 2u;
 }
 
 static bool CreateSpaces(AppXrSession& xr) {
@@ -1651,19 +1724,20 @@ static bool RenderTigerZone(AppXrSession& xr, const XrFrameState& frameState,
         if (!s_warned) { s_warned = true; LOG_WARN("[zones] zone-scoped xrLocateViews failed — full-tile fallback"); }
         return false;
     }
-    // #1486/#1500 — submit min(app's fixed count, located, tiles). The zone
+    // #1486/#1500 — submit min(active mode count, located, tiles). The zone
     // atlas is exactly `eyeCount` tiles wide (see the g_zoneSwW/eyeCount clamp
-    // above), so the tile term is eyeCount; the term that actually bites is the
-    // located count, which is what the runtime is willing to describe this
-    // frame. Never submit a view we did not locate.
+    // above), so the tile term is eyeCount; the wanted term is the ADOPTED
+    // rendering mode's view count, so a 1-view mode submits one tile instead of
+    // two. Never submit a view we did not locate.
     int zoneDisagreed = 0;
-    const uint32_t n = DxrClampSubmitViewCount(eyeCount, viewCountOut, eyeCount, &zoneDisagreed);
+    const uint32_t zoneWanted = ActiveModeViewCount(xr);
+    const uint32_t n = DxrClampSubmitViewCount(zoneWanted, viewCountOut, eyeCount, &zoneDisagreed);
     if (zoneDisagreed) {
         static bool s_warnedZoneClamp = false;
         if (!s_warnedZoneClamp) {
             s_warnedZoneClamp = true;
-            LOG_WARN("[zones] view-count clamp: app=%u located=%u tiles=%u -> submitting %u",
-                     eyeCount, viewCountOut, eyeCount, n);
+            LOG_WARN("[zones] view-count clamp: mode=%u located=%u tiles=%u -> submitting %u",
+                     zoneWanted, viewCountOut, eyeCount, n);
         }
     }
     if (n == 0) return false;  // nothing submittable — fall back to the full-tile path
@@ -1969,25 +2043,26 @@ int main(int argc, char** argv) {
                     swWait.timeout = XR_INFINITE_DURATION;
                     if (XR_SUCCEEDED(xrWaitSwapchainImage(xr.swapchain.swapchain, &swWait))) {
                         rendered = true;
-                        // #1486/#1500 — this leg is stereo-fixed (2 tiles, no
-                        // rendering-mode enumeration), so 2 is the app's wanted
-                        // count. What it may SUBMIT is still min(2, located,
-                        // tiles): the located count is the runtime's answer for
-                        // this frame, and the SBS atlas holds exactly 2 tiles
-                        // (see the swapchain.width/eyeCount clamp below). A layer
-                        // that claims a view the app never located fails
-                        // xrEndFrame, which wedges the session rather than
-                        // dropping a frame.
+                        // #1486/#1500 — submit min(active mode count, located,
+                        // tiles). The wanted count is the ADOPTED rendering
+                        // mode's (see ActiveModeViewCount), not a hardcoded 2:
+                        // in a 1-view mode this leg used to submit two views
+                        // into a one-tile atlas. The atlas is a fixed 2-tile
+                        // horizontal split (see the swapchain.width/eyeCount
+                        // clamp below), so a 4-view mode clamps back to 2 and
+                        // logs once — this leg cannot render Quad until the tile
+                        // layout follows the mode's cols x rows grid.
                         uint32_t eyeCount;
                         {
+                            const uint32_t wanted = ActiveModeViewCount(xr);
                             int disagreed = 0;
-                            eyeCount = DxrClampSubmitViewCount(2u, viewCount, 2u, &disagreed);
+                            eyeCount = DxrClampSubmitViewCount(wanted, viewCount, 2u, &disagreed);
                             if (disagreed) {
                                 static bool s_warnedViewClamp = false;
                                 if (!s_warnedViewClamp) {
                                     s_warnedViewClamp = true;
-                                    LOG_WARN("View-count clamp: app=2 located=%u tiles=2 -> submitting %u",
-                                             viewCount, eyeCount);
+                                    LOG_WARN("View-count clamp: mode=%u located=%u tiles=2 -> submitting %u",
+                                             wanted, viewCount, eyeCount);
                                 }
                             }
                         }
