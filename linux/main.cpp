@@ -70,7 +70,7 @@
 // rejects a projection layer that carries more. DxrSelectViewConfigType picks
 // XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR when the runtime advertises
 // it; DxrClampSubmitViewCount is the INV-3.1 submit gate.
-#include "dxr_view_config.h"
+#include "../common/dxr_view_config.h"
 #include "dxr_submit_views.h"
 // Display zones (ADR-027): the tiger-zone. The 3D avatar renders rig-framed INTO
 // one bottom-75% zone rect (no squish, 3D content kept out of the top band); the

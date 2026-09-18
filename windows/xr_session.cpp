@@ -10,7 +10,10 @@
 #include <openxr/XR_DXR_local_3d_zone.h>   // Local2D speech-bubble layer
 #include <openxr/XR_DXR_view_rig.h>        // XR_DXR_VIEW_RIG_EXTENSION_NAME
 #include <openxr/XR_DXR_depth_budget.h>    // XR_DXR_DEPTH_BUDGET_EXTENSION_NAME
-#include "dxr_view_config.h"               // DxrSelectViewConfigType (runtime #1486)
+// Explicit relative path on purpose: displayxr-common v2.14.0 ships an
+// identical dxr_view_config.h via displayxr::rules, so a bare include is
+// ambiguous once displayxr::common is on the include path.
+#include "../common/dxr_view_config.h"   // DxrSelectViewConfigType (runtime #1486)
 #include <cstring>
 
 // App-side availability flag (XrSessionManager carries no app-named fields).

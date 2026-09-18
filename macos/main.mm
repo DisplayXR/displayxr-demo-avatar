@@ -32,7 +32,7 @@
 #include <openxr/XR_DXR_atlas_capture.h>
 #include <openxr/XR_DXR_mcp_tools.h>
 #include <openxr/XR_DXR_local_3d_zone.h>   // XrCompositionLayerLocal2DDXR (speech bubble)
-#include "dxr_view_config.h"               // DxrSelectViewConfigType (runtime #1486)
+#include "../common/dxr_view_config.h"   // DxrSelectViewConfigType (runtime #1486)
 #include "dxr_submit_views.h"              // DxrClampSubmitViewCount — INV-3.1 submit gate
 
 #include <cmath>
