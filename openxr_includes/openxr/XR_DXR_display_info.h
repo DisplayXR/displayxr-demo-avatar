@@ -6,7 +6,8 @@
 // Khronos OpenXR registry: extension numbers and XrStructureType values sit
 // in a provisional experimental block (1004999xxx) pending official
 // assignment. Extension names are expected to be stable; numeric values are
-// not. SPEC_VERSION restarted at 1 on the XR_EXT_* -> XR_DXR_* rename.
+// not. SPEC_VERSION continues the pre-rename XR_EXT_* numbering (the
+// interface history did not restart with the name).
 // See GOVERNANCE.md.
 //
 /*!
@@ -31,11 +32,30 @@ extern "C" {
 #endif
 
 #define XR_DXR_display_info 1
-#define XR_DXR_display_info_SPEC_VERSION 1
+#define XR_DXR_display_info_SPEC_VERSION 19
 #define XR_DXR_DISPLAY_INFO_EXTENSION_NAME "XR_DXR_display_info"
 
 // Reuse the type value from the deleted XR_EXT_dynamic_render_resolution
 #define XR_TYPE_DISPLAY_INFO_DXR ((XrStructureType)1004999003)
+
+/*!
+ * @brief N-view primary view configuration (spec v19, #1486 / #80).
+ *
+ * Advertised by xrEnumerateViewConfigurations ONLY when this extension is
+ * enabled on the instance, alongside a conformant
+ * XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO (which always reports exactly 2
+ * views). Under this type xrEnumerateViewConfigurationViews and xrLocateViews
+ * report the device's MAXIMUM view count across all rendering modes (e.g. 4
+ * on a display with a quad mode; 2 on a stereo-only display), fixed for the
+ * instance lifetime; xrEndFrame accepts a projection layer whose viewCount
+ * matches any rendering mode's view count. An app that renders N-view modes
+ * begins its session with this type; a stereo-fixed app stays on
+ * PRIMARY_STEREO and is never handed more than 2 views.
+ *
+ * Value: 1004999212 (display_info's 210-219 decade — see README.md registry).
+ * Cast-defined because C cannot extend the core enum; not visible to -Wswitch.
+ */
+#define XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR ((XrViewConfigurationType)1004999212)
 
 /*!
  * @brief Display information returned by xrGetSystemProperties.
@@ -91,6 +111,112 @@ typedef struct XrDisplayDesktopPositionDXR {
     int32_t                     left;       //!< Panel left edge in virtual-desktop pixels
     int32_t                     top;        //!< Panel top edge in virtual-desktop pixels
 } XrDisplayDesktopPositionDXR;
+
+// ---- v18: Full panel desktop rect + stable device name (#1301) ----
+
+#define XR_TYPE_DISPLAY_DESKTOP_INFO_DXR ((XrStructureType)1004999211)
+
+//! Size of XrDisplayDesktopInfoDXR::deviceName, in bytes, including the NUL.
+#define XR_MAX_DISPLAY_DEVICE_NAME_SIZE_DXR 128
+
+/*!
+ * @brief Desktop geometry and stable identity of the monitor the 3D panel is
+ * on, returned by xrGetSystemProperties (v18 addition).
+ *
+ * Supersedes XrDisplayDesktopPositionDXR, which carries only the origin. That
+ * struct keeps working unchanged — this is a SEPARATE chained struct rather
+ * than extra fields on it, because the runtime writes chained output structs
+ * with its own compiled layout and appending to a published struct would write
+ * past an app allocation compiled against v16.
+ *
+ * ## What it is for
+ *
+ * Nothing else in the wire protocol says WHERE the panel is, so a client that
+ * creates its own window has to guess, and typically lands on the OS primary
+ * monitor (see displayxr-unity#266). Matching displayPixelWidth/Height against
+ * the OS monitor list is ambiguous the moment two monitors share a resolution.
+ * Chain this struct instead, then place the window inside @ref desktopRect.
+ *
+ * ## Coordinate contract — read this before using desktopRect
+ *
+ * @ref desktopRect is in THE COORDINATE SPACE THE OS PLACES WINDOWS IN, which
+ * is what a client needs and which differs per platform:
+ *
+ * - Windows: physical virtual-screen pixels (what a per-monitor-DPI-aware-v2
+ *   process sees). The runtime pins a per-monitor-v2 DPI context while
+ *   resolving, so the value is physical regardless of the host process's own
+ *   DPI awareness.
+ * - macOS: POINTS in the global display space, NOT backing pixels — a Retina
+ *   panel's backing store is 2x this. Read displayPixelWidth/Height for pixels.
+ * - Linux/X11: device pixels in root-window coordinates.
+ *
+ * All three are TOP-DOWN with the origin at the primary/main display's
+ * top-left, and monitors left of or above it have NEGATIVE offsets. On macOS
+ * that is deliberately the CoreGraphics convention, not Cocoa's — an app
+ * placing an NSWindow must flip into NSScreen's bottom-up space itself, and one
+ * that forgets will mirror its position vertically on any multi-display setup.
+ *
+ * A consumer MUST act in that same space. A DPI-UNAWARE process that passes
+ * these coordinates to SetWindowPos (or any managed wrapper over it) is handed
+ * virtualised coordinates by the OS and will place the window wrong by the
+ * ratio of the two monitors' scale factors — correct on a single-monitor box,
+ * wrong on exactly the mixed-DPI multi-monitor rigs this struct exists to
+ * serve. Either declare per-monitor-v2 awareness for the process, or wrap the
+ * placement call in SetThreadDpiAwarenessContext(PER_MONITOR_AWARE_V2).
+ *
+ * ## desktopRect is not displayPixelWidth/Height
+ *
+ * XrDisplayInfoDXR::displayPixelWidth/Height are the panel's NATIVE
+ * resolution. @ref desktopRect.extent is the monitor's CURRENT desktop mode.
+ * They differ whenever the user runs a non-native mode. Use @ref desktopRect
+ * for placement and displayPixel* for render sizing.
+ *
+ * @extends XrSystemProperties
+ */
+typedef struct XrDisplayDesktopInfoDXR {
+    XrStructureType             type;       //!< Must be XR_TYPE_DISPLAY_DESKTOP_INFO_DXR
+    void* XR_MAY_ALIAS          next;       //!< Pointer to next structure in chain
+    /*!
+     * The panel monitor's full desktop rect in physical virtual-desktop
+     * pixels. `offset` is the signed top-left; `extent` is the current desktop
+     * mode's size. An all-zero rect means the runtime could not resolve it —
+     * treat the geometry as unknown and fall back to your previous placement.
+     */
+    XrRect2Di                   desktopRect;
+    /*!
+     * Stable OS device name of the panel's monitor, NUL-terminated UTF-8, for
+     * re-resolving the monitor after a hotplug or arrangement change (feed it
+     * to EnumDisplayDevices, or match it against DXGI_OUTPUT_DESC::DeviceName).
+     *
+     * Windows: the GDI name, e.g. `\\.\DISPLAY1`.
+     * macOS: the display UUID — deliberately not the CGDirectDisplayID, which
+     * is reassigned across reboots and replug and so cannot survive the very
+     * event this field exists for. Linux/X11: the RandR output name, e.g.
+     * `HDMI-1`. Empty string when the runtime could not resolve one.
+     */
+    char                        deviceName[XR_MAX_DISPLAY_DEVICE_NAME_SIZE_DXR];
+    /*!
+     * XR_TRUE when the panel's monitor is the desktop's primary monitor, in
+     * which case a client that only wants "open on the panel" can skip moving
+     * its window entirely. Common in the field: making the 3D panel the
+     * Windows primary is the standing workaround for the absence of this
+     * struct, so machines that already worked around it report XR_TRUE.
+     */
+    XrBool32                    isPrimary;
+    /*!
+     * XR_TRUE when the resolved monitor's current mode matches the panel's
+     * reported native resolution — i.e. the runtime genuinely located the 3D
+     * panel.
+     *
+     * XR_FALSE means the display processor expressed no position and the
+     * runtime fell back to the primary monitor. That happens with
+     * `sim_display` (hardware-free development) and on the platforms whose
+     * panel-origin plumbing is still open (#715). The rect is still a valid,
+     * placeable monitor rect — it is just not evidence that a 3D panel is
+     * there, so a client may prefer to leave its window where it is.
+     */
+    XrBool32                    isPanelConfirmed;
+} XrDisplayDesktopInfoDXR;
 
 /*!
  * @brief Hardware display state for xrRequestDisplayModeDXR (v15 repurpose).
@@ -430,6 +556,56 @@ typedef struct XrEventDataEyeTrackingStateChangedDXR {
     XrBool32                    isTracking; //!< New state
     XrEyeTrackingModeDXR        activeMode; //!< Session's MANAGED/MANUAL preference at edge time
 } XrEventDataEyeTrackingStateChangedDXR;
+
+// ---- v17: Display-mode request denial (panel lease, ADR-035 D2 / #961) ----
+
+#define XR_TYPE_EVENT_DATA_DISPLAY_MODE_REQUEST_DENIED_DXR ((XrStructureType)1004999014)
+
+//! Sentinel for XrEventDataDisplayModeRequestDeniedDXR::requestedModeIndex when
+//! the denied request carried no content mode (a pure xrRequestDisplayModeDXR).
+#define XR_DISPLAY_MODE_INDEX_NONE_DXR 0xFFFFFFFFu
+
+/*!
+ * @brief Why a display-mode request was denied.
+ *
+ * The runtime holds a single PANEL LEASE: while a workspace controller is
+ * active it owns the display mode; otherwise the built-in policy grants it to
+ * the focused session. A request from any other session is not applied and is
+ * NOT queued for later — this event is the only answer it gets. A request that
+ * the display hardware itself refuses (DISPLAY_PROCESSOR_REJECTED) leaves the
+ * runtime's reported mode unchanged.
+ */
+typedef enum XrDisplayModeDenialReasonDXR {
+    XR_DISPLAY_MODE_DENIAL_REASON_NONE_DXR = 0,
+    XR_DISPLAY_MODE_DENIAL_REASON_WORKSPACE_OWNS_MODE_DXR = 1,        //!< a workspace controller owns the panel
+    XR_DISPLAY_MODE_DENIAL_REASON_NOT_FOCUSED_DXR = 2,                //!< no controller; only the focused session may request
+    XR_DISPLAY_MODE_DENIAL_REASON_NO_DISPLAY_PROCESSOR_DXR = 3,       //!< nothing to apply the request to
+    XR_DISPLAY_MODE_DENIAL_REASON_DISPLAY_PROCESSOR_REJECTED_DXR = 4, //!< the display hardware refused the state
+    XR_DISPLAY_MODE_DENIAL_REASON_RELAY_OWNS_MODE_DXR = 5,            //!< a relay owns this session's mode (mechanism reserved; no relay ships today)
+    XR_DISPLAY_MODE_DENIAL_REASON_MAX_ENUM_DXR = 0x7FFFFFFF
+} XrDisplayModeDenialReasonDXR;
+
+/*!
+ * @brief Event delivered to the requesting session when its
+ * xrRequestDisplayRenderingModeDXR / xrRequestDisplayModeDXR call was denied.
+ *
+ * Both entry points return XR_SUCCESS at call time (the request is forwarded
+ * to the runtime's mode owner); this event, or a
+ * XrEventDataRenderingModeChangedDXR / XrEventDataHardwareDisplayStateChangedDXR,
+ * is the outcome. requestedModeIndex is XR_DISPLAY_MODE_INDEX_NONE_DXR when the
+ * request carried no content mode; requestedHardware3D is -1 when it carried no
+ * hardware state, else 0 (2D) / 1 (3D).
+ *
+ * @extends XrEventDataBaseHeader
+ */
+typedef struct XrEventDataDisplayModeRequestDeniedDXR {
+    XrStructureType               type;       //!< Must be XR_TYPE_EVENT_DATA_DISPLAY_MODE_REQUEST_DENIED_DXR
+    const void* XR_MAY_ALIAS      next;
+    XrSession                     session;
+    uint32_t                      requestedModeIndex;
+    int32_t                       requestedHardware3D;
+    XrDisplayModeDenialReasonDXR  reason;
+} XrEventDataDisplayModeRequestDeniedDXR;
 
 #ifdef __cplusplus
 }

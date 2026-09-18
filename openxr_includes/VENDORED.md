@@ -33,7 +33,8 @@ Pins in force:
 | Runtime commit | Headers |
 |---|---|
 | `220e9393511aab23c1ef2c6bb796d452f4fe3060`<br>220e93935 (2026-09-07) feat(android): XR_DXR_android_surface_binding v2 — mini-window layout hint (#1396) (#1398) | `XR_DXR_depth_budget.h`, `XR_DXR_display_zones.h`, `XR_DXR_xlib_window_binding.h`, `XR_MNDX_ball_on_a_stick_controller.h`, `XR_MNDX_blubur_s1.h`, `XR_MNDX_hydra.h`, `XR_MNDX_oculus_remote.h`, `XR_MNDX_system_buttons.h`, `XR_MNDX_xdev_space.h`, `openxr.h`, `openxr_extension_helpers.h`, `openxr_loader_negotiation.h`, `openxr_platform.h`, `openxr_platform_defines.h`, `openxr_reflection.h`, `openxr_reflection_parent_structs.h`, `openxr_reflection_structs.h` |
-| `a71979a4d1385841a224eccd64ae973385300b1f`<br>a71979a4d (2026-07-12) feat(#734): fold planned XR_EXT_android_surface_binding → XR_DXR_ (docs/comments); post-rename-safe map regen | `XR_DXR_atlas_capture.h`, `XR_DXR_cocoa_window_binding.h`, `XR_DXR_display_info.h`, `XR_DXR_local_3d_zone.h`, `XR_DXR_macos_gl_binding.h`, `XR_DXR_mcp_tools.h`, `XR_DXR_spatial_workspace.h`, `XR_DXR_view_rig.h`, `XR_DXR_weave.h`, `XR_DXR_win32_window_binding.h`, `XR_DXR_workspace_file_dialog.h` |
+| `a71979a4d1385841a224eccd64ae973385300b1f`<br>a71979a4d (2026-07-12) feat(#734): fold planned XR_EXT_android_surface_binding → XR_DXR_ (docs/comments); post-rename-safe map regen | `XR_DXR_atlas_capture.h`, `XR_DXR_cocoa_window_binding.h`, `XR_DXR_local_3d_zone.h`, `XR_DXR_macos_gl_binding.h`, `XR_DXR_mcp_tools.h`, `XR_DXR_spatial_workspace.h`, `XR_DXR_view_rig.h`, `XR_DXR_weave.h`, `XR_DXR_win32_window_binding.h`, `XR_DXR_workspace_file_dialog.h` |
+| `c1e4fe00da0f189122eca14e61e9faaa88e4b38e`<br>c1e4fe00d (2026-09-18) chore(cts): drop the by-name exclusion of xrLocateSpace_xrLocateViews — #1502 landed | `XR_DXR_display_info.h` |
 | `344825131c2a7443a3916e760be0942f2f1f0732`<br>344825131 (2026-09-06) feat(depth-budget): v3 header draft — XrContentMaskDXR occupancy mask (#1365) | `XR_DXR_android_surface_binding.h` |
 
 ## Known drift vs runtime `main`
@@ -48,7 +49,6 @@ passes over the wire changed shape, so the app is correct as pinned.
 | `XR_DXR_android_surface_binding.h` | spec v1 here; runtime main is v2, which adds `XrEventDataAndroidWindowLayoutHintDXR` (mini-window layout hint, runtime#1396/#1398, first shipped in runtime v2.16.17). Additive event struct. |
 | `XR_DXR_atlas_capture.h` | SPEC_VERSION macro is 1 here; runtime main carries the real number. The demos' copies date from the ~24h window between the `XR_EXT_* → XR_DXR_*` rename (runtime `fefa3d3dc`/`a71979a4d`, 2026-07-12) and `2a87861e2`, which restored the pre-rename SPEC_VERSION values. No struct or enum change. |
 | `XR_DXR_cocoa_window_binding.h` | SPEC_VERSION macro is 1 here; runtime main carries the real number. The demos' copies date from the ~24h window between the `XR_EXT_* → XR_DXR_*` rename (runtime `fefa3d3dc`/`a71979a4d`, 2026-07-12) and `2a87861e2`, which restored the pre-rename SPEC_VERSION values. No struct or enum change. |
-| `XR_DXR_display_info.h` | runtime main is spec v18: adds `XrDisplayDesktopInfoDXR` (panel desktop rect + device name, runtime#1301/#1317). Purely ADDITIVE — a NEW chained struct; `XrDisplayInfoDXR` itself is byte-identical. Nothing this app reads changed. |
 | `XR_DXR_local_3d_zone.h` | SPEC_VERSION macro is 1 here; runtime main carries the real number. The demos' copies date from the ~24h window between the `XR_EXT_* → XR_DXR_*` rename (runtime `fefa3d3dc`/`a71979a4d`, 2026-07-12) and `2a87861e2`, which restored the pre-rename SPEC_VERSION values. No struct or enum change. |
 | `XR_DXR_macos_gl_binding.h` | SPEC_VERSION macro is 1 here; runtime main carries the real number. The demos' copies date from the ~24h window between the `XR_EXT_* → XR_DXR_*` rename (runtime `fefa3d3dc`/`a71979a4d`, 2026-07-12) and `2a87861e2`, which restored the pre-rename SPEC_VERSION values. No struct or enum change. |
 | `XR_DXR_mcp_tools.h` | SPEC_VERSION macro is 1 here; runtime main carries the real number. The demos' copies date from the ~24h window between the `XR_EXT_* → XR_DXR_*` rename (runtime `fefa3d3dc`/`a71979a4d`, 2026-07-12) and `2a87861e2`, which restored the pre-rename SPEC_VERSION values. No struct or enum change. |
@@ -60,6 +60,18 @@ passes over the wire changed shape, so the app is correct as pinned.
 
 `scripts/check_vendored_headers.py --drift` prints this list live (it is
 informational — only a pin *mismatch* fails CI).
+
+**`XR_DXR_display_info.h` was brought forward to spec v19** (runtime #1486 /
+#1500) because this app needs the value it publishes:
+`XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR`. Under the merged runtime
+contract `XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO` reports **exactly 2** views
+and `xrEndFrame` rejects a projection layer carrying more, so an app whose
+per-frame view count comes from the active DXR rendering mode (all four legs of
+this demo) must begin its session with the DXR type or go black in any 4-view
+mode. The v17/v18/v19 delta over the old v1 copy is **purely additive** — two
+new chained structs (`XrDisplayDesktopInfoDXR`,
+`XrEventDataDisplayModeRequestDeniedDXR`), one new enum and one new view
+configuration value; `XrDisplayInfoDXR` itself is byte-identical.
 
 ## Updating
 

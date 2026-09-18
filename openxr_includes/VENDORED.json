@@ -8,7 +8,7 @@
     "XR_DXR_atlas_capture.h": "a71979a4d1385841a224eccd64ae973385300b1f",
     "XR_DXR_cocoa_window_binding.h": "a71979a4d1385841a224eccd64ae973385300b1f",
     "XR_DXR_depth_budget.h": "220e9393511aab23c1ef2c6bb796d452f4fe3060",
-    "XR_DXR_display_info.h": "a71979a4d1385841a224eccd64ae973385300b1f",
+    "XR_DXR_display_info.h": "c1e4fe00da0f189122eca14e61e9faaa88e4b38e",
     "XR_DXR_display_zones.h": "220e9393511aab23c1ef2c6bb796d452f4fe3060",
     "XR_DXR_local_3d_zone.h": "a71979a4d1385841a224eccd64ae973385300b1f",
     "XR_DXR_macos_gl_binding.h": "a71979a4d1385841a224eccd64ae973385300b1f",

@@ -39,6 +39,7 @@
 #include "clip_policy.h"     // dxr::ResolveClipPlanes / ChainRearDepthBudget (#81)
 #include "content_bounds.h"  // dxr::ProjectAabbToWindowBounds / ChainContentBounds (#81 v2; #82 zone rebase)
 #include "content_mask.h"    // dxr::ContentMaskFromCoverage / ChainContentMask (#81 v3 silhouette ROI)
+#include "dxr_submit_views.h" // DxrClampSubmitViewCount — INV-3.1 submit gate (runtime #1486/#1500)
 
 #include "hud_renderer.h"   // HudRenderer + text_overlay (RenderFilledRect/RenderText) — drive the speech bubble
 #include "atlas_capture.h"
@@ -2831,6 +2832,12 @@ static void RenderThreadFunc(
                 // Active mode's view count drives how many slots are actually filled and submitted.
                 XrCompositionLayerProjectionView projectionViews[8] = {};
                 bool rendered = false;
+                // #1486/#1500: how many of those slots were actually FILLED this
+                // frame. The submit reads this, never the rendering mode again —
+                // recomputing the mode count at submit time is how a frame ends
+                // up claiming views it never rendered (and, since #1500, failing
+                // xrEndFrame outright). 0 until the eye loop has run.
+                uint32_t submittedViewCount = 0;
 
                 // Display zones: the SAME XrDisplayZoneDXR instance chains on the
                 // zone-scoped locate (with the rig) AND on the submitted projection
@@ -2892,7 +2899,19 @@ static void RenderThreadFunc(
                         uint32_t viewCount = 8;
                         XrView rawViews[8];
                         for (uint32_t i = 0; i < 8; i++) rawViews[i] = {XR_TYPE_VIEW};
-                        xrLocateViews(xr->session, &locateInfo, &viewState, 8, &viewCount, rawViews);
+                        const XrResult rawLocRes = xrLocateViews(
+                            xr->session, &locateInfo, &viewState, 8, &viewCount, rawViews);
+                        // A failed locate leaves viewCount as whatever it was; force
+                        // it to 0 so the submit clamp below cannot mistake stale
+                        // capacity for "this many views were located".
+                        if (XR_FAILED(rawLocRes)) {
+                            static bool s_rawLocWarned = false;
+                            if (!s_rawLocWarned) {
+                                s_rawLocWarned = true;
+                                LOG_WARN("Raw xrLocateViews failed (0x%x)", (unsigned)rawLocRes);
+                            }
+                            viewCount = 0;
+                        }
 
                         // Idle throttle: the raw located pose is the head/viewer
                         // position the weave depends on. Latch any real motion so
@@ -2921,7 +2940,6 @@ static void RenderThreadFunc(
                             ? xr->renderingModeViewCounts[xr->currentModeIndex] : 2u;
                         if (activeViewCount == 0) activeViewCount = 1u;
                         if (activeViewCount > 8) activeViewCount = 8u;
-                        const int eyeCount = monoMode ? 1 : (int)activeViewCount;
 
                         // Per-view extent driven entirely by the current rendering
                         // mode's view_scale and the live window size. Atlas dims
@@ -2949,6 +2967,39 @@ static void RenderThreadFunc(
                         uint32_t renderH = (uint32_t)((double)windowH * scaleY);
                         if (renderW == 0) renderW = 1;
                         if (renderH == 0) renderH = 1;
+
+                        // #1486/#1500 — the active mode's count is what we WANT;
+                        // what we may actually submit is the min of it, the views
+                        // xrLocateViews returned above, and the atlas tile grid
+                        // (arraySize is 1 on every leg of this demo — the cols×rows
+                        // sub-rect grid is our analogue of array slices). Any of
+                        // the three can move under us (a mode transition in
+                        // flight, a locate that came back short), and submitting a
+                        // view we did not render fails xrEndFrame, which wedges
+                        // the session rather than dropping a frame.
+                        {
+                            int disagreed = 0;
+                            activeViewCount = DxrClampSubmitViewCount(
+                                activeViewCount, viewCount, cols * rows, &disagreed);
+                            if (disagreed) {
+                                static bool s_warnedViewClamp = false;
+                                if (!s_warnedViewClamp) {
+                                    s_warnedViewClamp = true;
+                                    LOG_WARN("View-count clamp: mode=%u located=%u tiles=%ux%u -> submitting %u",
+                                             (xr->renderingModeCount > 0)
+                                                 ? xr->renderingModeViewCounts[xr->currentModeIndex] : 2u,
+                                             viewCount, cols, rows, activeViewCount);
+                                }
+                            }
+                        }
+                        // The RENDER loop keeps a floor of 1 — an eyeCount of 0
+                        // would have to be special-cased at a dozen sites below for
+                        // no benefit. What a failed locate must suppress is the
+                        // SUBMIT, and the clamp after the eye loop does exactly
+                        // that (locatedForSubmit == 0 -> submittedViewCount == 0 ->
+                        // no projection layer).
+                        const int eyeCount = monoMode ? 1
+                                                      : (int)(activeViewCount > 0 ? activeViewCount : 1u);
 
                         // ── Zone-scoped locate (runtime rig replaces the app-side
                         //    Kooima — ADR-027 P6). ONE zone: the tiger, bottom 75%
@@ -3575,6 +3626,26 @@ static void RenderThreadFunc(
                                     projectionViews[eye].fov = monoMode ? rawViews[0].fov : rawViews[eye].fov;
                                 }
                             }
+                            // #1486/#1500 — the authoritative submit count: the
+                            // slots the loop above actually filled, re-clamped
+                            // against the locate that FED them (the zone-scoped
+                            // one on a zones frame, the raw one otherwise) and
+                            // the tile grid. This is the only thing xrEndFrame
+                            // is allowed to read.
+                            {
+                                int disagreed = 0;
+                                const uint32_t locatedForSubmit = zonesFrame ? zoneViewCount : viewCount;
+                                submittedViewCount = DxrClampSubmitViewCount(
+                                    (uint32_t)eyeCount, locatedForSubmit, cols * rows, &disagreed);
+                                if (disagreed) {
+                                    static bool s_warnedSubmitClamp = false;
+                                    if (!s_warnedSubmitClamp) {
+                                        s_warnedSubmitClamp = true;
+                                        LOG_WARN("Submit clamp: rendered=%d located=%u tiles=%ux%u -> submitting %u",
+                                                 eyeCount, locatedForSubmit, cols, rows, submittedViewCount);
+                                    }
+                                }
+                            }
                             if (zonesFrame) ReleaseWindowSpaceImage(g_zoneSwapchain);
                             else            ReleaseSwapchainImage(*xr);
 
@@ -3935,11 +4006,17 @@ static void RenderThreadFunc(
                     }
                 }
 
-                // Submit frame
-                uint32_t submitViewCount = (xr->renderingModeCount > 0 && xr->currentModeIndex < xr->renderingModeCount) ? xr->renderingModeViewCounts[xr->currentModeIndex] : 2;
-                if (submitViewCount == 0) submitViewCount = 1;
-                if (submitViewCount > 8) submitViewCount = 8;  // matches projectionViews[8] sizing
-                if (rendered) {
+                // Submit frame.
+                //
+                // #1486/#1500: this used to recompute the count from the ACTIVE
+                // RENDERING MODE here, independently of what the eye loop had
+                // rendered — so a 4-view mode always claimed 4 views, and under
+                // PRIMARY_STEREO (exactly 2 views) xrEndFrame rejected the layer
+                // with XR_ERROR_VALIDATION_FAILURE every frame. The count now
+                // comes from the render path itself (see submittedViewCount), so
+                // the layer can never describe views that were not drawn.
+                const uint32_t submitViewCount = submittedViewCount;
+                if (rendered && submitViewCount > 0) {
                     // Submit the projection layer (the weaved avatar) plus the
                     // Local2D speech bubble. Hand-built (displayxr-common's helper
                     // has no Local2D path). ALPHA_BLEND: the avatar is always

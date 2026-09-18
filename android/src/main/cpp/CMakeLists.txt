@@ -100,7 +100,11 @@ target_include_directories(avatar_vk_android PRIVATE
     ${tinygltf_SOURCE_DIR}                      # tiny_gltf.h + json.hpp + stb_image.h
     ${glm_SOURCE_DIR}                           # glm/ (header-only)
     ${stb_SOURCE_DIR}                           # stb_truetype.h (button bar)
-    ${REPO_ROOT}/openxr_includes)               # DisplayXR XR_EXT_* headers
+    ${REPO_ROOT}/openxr_includes                 # DisplayXR XR_DXR_* headers
+    ${REPO_ROOT}/common)                        # dxr_view_config.h / dxr_submit_views.h
+                                                # (the other legs get common/ via
+                                                #  sr_common_base or their own
+                                                #  target_include_directories)
 
 set_target_properties(avatar_vk_android PROPERTIES
     LINK_FLAGS "-u ANativeActivity_onCreate")
