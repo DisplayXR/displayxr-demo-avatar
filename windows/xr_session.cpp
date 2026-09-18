@@ -539,6 +539,14 @@ bool CreateVulkanDevice(XrSessionManager& xr, VkPhysicalDevice physDevice, uint3
     return true;
 }
 
+// True once the runtime has named an active rendering mode for this session
+// (XrDisplayRenderingModeInfoDXR::isActive, XR_DXR_display_info v13) during the
+// enumerate in CreateSession. XrSessionManager::currentModeIndex is initialised
+// to 1, so its value alone cannot tell "the runtime reports mode 1" apart from
+// "the runtime reported nothing" — which is exactly what the startup log line
+// has to distinguish. False on a pre-v13 runtime, or when the enumerate failed.
+bool g_runtimeNamedActiveMode = false;
+
 bool CreateSession(XrSessionManager& xr, VkInstance vkInstance, VkPhysicalDevice physDevice,
     VkDevice device, uint32_t queueFamilyIndex, uint32_t queueIndex, HWND hwnd)
 {
@@ -598,16 +606,22 @@ bool CreateSession(XrSessionManager& xr, VkInstance vkInstance, VkPhysicalDevice
                     xr.renderingModeDisplay3D[i] = (modes[i].hardwareDisplay3D == XR_TRUE);
                     xr.renderingModeIsRequestable[i] = modes[i].isRequestable ? true : false;
                     // v13 initial-mode-sync: trust runtime-reported active mode.
+                    // g_runtimeNamedActiveMode records that the runtime named
+                    // ONE at all: currentModeIndex is initialised to 1, so
+                    // without this flag "the runtime says mode 1" and "the
+                    // runtime said nothing" are the same value.
                     if (modes[i].isActive) {
                         xr.currentModeIndex = modes[i].modeIndex;
+                        g_runtimeNamedActiveMode = true;
                     }
                     xr.renderingModeTileColumns[i] = modes[i].tileColumns ? modes[i].tileColumns : 1;
                     xr.renderingModeTileRows[i] = modes[i].tileRows ? modes[i].tileRows : 1;
-                    LOG_INFO("  [%u] %s (views=%u, scale=%.2fx%.2f, tiles=%ux%u, 3D=%d)",
+                    LOG_INFO("  [%u] %s (views=%u, scale=%.2fx%.2f, tiles=%ux%u, 3D=%d%s)",
                         modes[i].modeIndex, modes[i].modeName, modes[i].viewCount,
                         modes[i].viewScaleX, modes[i].viewScaleY,
                         xr.renderingModeTileColumns[i], xr.renderingModeTileRows[i],
-                        modes[i].hardwareDisplay3D);
+                        modes[i].hardwareDisplay3D,
+                        modes[i].isActive ? ", ACTIVE" : "");
                 }
             }
         }

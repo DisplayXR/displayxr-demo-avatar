@@ -93,3 +93,9 @@ bool CreateVulkanDevice(XrSessionManager& xr, VkPhysicalDevice physDevice, uint3
 // Create OpenXR session with Vulkan binding + win32_window_binding
 bool CreateSession(XrSessionManager& xr, VkInstance vkInstance, VkPhysicalDevice physDevice,
     VkDevice device, uint32_t queueFamilyIndex, uint32_t queueIndex, HWND hwnd);
+
+// True when the runtime named an active rendering mode at session create
+// (XrDisplayRenderingModeInfoDXR::isActive, XR_DXR_display_info v13). Set in
+// CreateSession; read by the startup-mode log line in main.cpp. See the
+// definition in xr_session.cpp for why the mode index alone is not enough.
+extern bool g_runtimeNamedActiveMode;

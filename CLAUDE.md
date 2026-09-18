@@ -160,15 +160,22 @@ every later `xrBeginFrame` returns `XR_FRAME_DISCARDED`. The Linux leg is
 stereo-fixed (2 tiles, no mode enumeration) and opts in anyway for uniformity;
 the clamp is what actually protects it.
 
-**ADOPT the runtime's active mode; never request one at startup.** macOS and
-Linux read `XrDisplayRenderingModeInfoDXR::isActive` (display_info v13) once
-after `xrCreateSession` and take it (`Adopting runtime's active rendering mode:
-N` in the log). macOS used to fire an unconditional
-`xrRequestDisplayRenderingModeDXR(1)` for its hardcoded Anaglyph default — which
-made the 4-view Quad and 1-view 2D paths **unreachable from outside the
-process**: `SIM_DISPLAY_OUTPUT=quad` logged `Rendering mode changed 4 -> 1` a
-moment after startup. A pre-v13 runtime names no active mode; the app then keeps
-its own default and still issues no request.
+**ADOPT the runtime's active mode; never force one at startup.** Every leg
+reads `XrDisplayRenderingModeInfoDXR::isActive` (display_info v13) once after
+`xrCreateSession` and takes it; the log line is `Startup rendering mode: N (…)`
+on Windows and `Adopting runtime's active rendering mode: N` on macOS/Linux.
+macOS used to fire an unconditional `xrRequestDisplayRenderingModeDXR(1)` for its
+hardcoded Anaglyph default and Windows seeded the same 1 into
+`absoluteRenderingModeRequested` — which made the 4-view Quad and 1-view 2D paths
+**unreachable from outside the process**: `SIM_DISPLAY_OUTPUT=quad` logged
+`Rendering mode changed 4 -> 1` a moment after startup. A pre-v13 runtime names
+no active mode; the app then keeps its own default and still issues no request.
+
+**Windows gates adoption on the mode being 3D** (`xr.renderingModeDisplay3D`),
+unlike macOS/Linux which adopt verbatim: a real panel commonly reports its 2D
+mode active at startup and stays there until something asks for 3D, so adopting
+that would open this 3D demo in mono. A 2D active mode therefore falls back to
+mode 1, the first 3D mode — and the log line says which branch ran.
 
 **Exercising N-view headlessly (macOS).** `SIM_DISPLAY_OUTPUT` picks the
 sim_display mode for BOTH the runtime and the app's pre-session hint, and the

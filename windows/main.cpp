@@ -4498,10 +4498,39 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     g_inputState.viewParams.virtualDisplayHeight = kFallbackVirtualDisplayHeightM;
     g_inputState.renderingModeCount = xr.renderingModeCount;
-    // Align runtime active rendering mode with app's default (mode 1 = first 3D mode).
-    // The main loop's dispatch picks this up on the first frame and calls
-    // xrRequestDisplayRenderingModeDXR(1); the runtime event drives xr.currentModeIndex.
-    g_inputState.absoluteRenderingModeRequested = 1;
+    // ADOPT the runtime's active rendering mode instead of forcing mode 1.
+    //
+    // This used to set 1 unconditionally, so the first frame's dispatch fired
+    // xrRequestDisplayRenderingModeDXR(1) and OVERRODE whatever the display was
+    // already in. Measured on the Windows box: a panel in Quad logged
+    // `Rendering mode changed 4 -> 1` a moment after startup, so an unpinned
+    // 4-view mode was unreachable from outside the process (only an explicit
+    // SIM_DISPLAY_FORCE_MODE=4 got through, because that pin re-asserts itself).
+    // The runtime already names the live mode
+    // (XrDisplayRenderingModeInfoDXR::isActive, XR_DXR_display_info v13) and
+    // CreateSession read it into xr.currentModeIndex — take that.
+    //
+    // Gated on the active mode being 3D: a display commonly reports its 2D mode
+    // active at startup (it stays 2D until something asks for 3D), and adopting
+    // that verbatim would open this 3D demo in mono. Only then do we fall back
+    // to the old default of mode 1, the first 3D mode. The main loop's dispatch
+    // re-asserts whichever index lands here (a no-op re-request when it is
+    // already active, and it keeps the mode-switch ramp's from-mode in sync);
+    // the runtime event keeps xr.currentModeIndex current from there on.
+    const bool activeModeIs3D =
+        xr.currentModeIndex < xr.renderingModeCount &&
+        xr.renderingModeDisplay3D[xr.currentModeIndex];
+    g_inputState.absoluteRenderingModeRequested =
+        activeModeIs3D ? (int)xr.currentModeIndex : 1;
+    // One-shot, so a log from the box proves which branch ran. There is no
+    // SIM_DISPLAY_OUTPUT map on this leg — the env var is read by the runtime's
+    // sim_display plug-in, and adoption is how it reaches the app.
+    LOG_INFO("Startup rendering mode: %d (%s)",
+             g_inputState.absoluteRenderingModeRequested,
+             !g_runtimeNamedActiveMode
+                 ? "app default; the runtime named no active mode"
+                 : (activeModeIs3D ? "adopted from runtime"
+                                   : "app default; the runtime's active mode is 2D"));
     g_inputState.animateEnabled = false; // no auto-orbit — avatar faces the viewer
     {
         using namespace std::chrono;
