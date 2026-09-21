@@ -2806,8 +2806,16 @@ void ModelRenderer::renderEye(VkImage swapchainImage,
     toDst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     toDst.image = swapchainImage;
     toDst.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                         0, 0, nullptr, 0, nullptr, 1, &toDst);
+    // A preserving entry must WAIT on the prior writer: TOP_OF_PIPE as the
+    // source stage orders nothing, so a COLOR_ATTACHMENT_WRITE srcAccess there
+    // was never made available. COLOR_ATTACHMENT_OUTPUT chains from the prior
+    // tile's exit barrier below (and from any caller that hands the image over
+    // in COLOR_ATTACHMENT_OPTIMAL the same way, e.g. the Windows silhouette
+    // scratch images, avatar#99).
+    vkCmdPipelineBarrier(cmd,
+                         firstViewInImage ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT
+                                          : VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toDst);
 
     // Blit [0,0]-[vpW,vpH] of the internal image into the swapchain viewport
     // (handles RGBA→BGRA format conversion, matching gs_renderer).
