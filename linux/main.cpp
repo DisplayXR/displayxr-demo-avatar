@@ -92,7 +92,7 @@
 // it; DxrClampSubmitViewCount bounds how many views are RENDERED (INV-3.1).
 // ADR-041: the layer still carries every LOCATED view — DxrAliasInactiveViews
 // points the unrendered tail at view 0's subimage (INV-3.4).
-#include "../common/dxr_view_config.h"
+#include "dxr_view_config.h"   // displayxr-common (displayxr::rules) — the one implementation
 #include "dxr_submit_views.h"
 // Display zones (ADR-027): the tiger-zone. The 3D avatar renders rig-framed INTO
 // one bottom-75% zone rect (no squish, 3D content kept out of the top band); the

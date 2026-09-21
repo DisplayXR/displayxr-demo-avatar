@@ -128,9 +128,10 @@ model_common/                     — the renderer (vendor-neutral, analog of
                                     prefilter.frag, sky.glsl + ibl_common.glsl
 common/                           — Kooima view math (display3d_view.*),
                                     camera3d_view (unused), input, HUD, stb;
-                                    dxr_view_config.h (vendored #1486 helper) +
-                                    dxr_submit_views.h (submit clamp), shared by
-                                    ALL FOUR legs
+                                    dxr_submit_views.h (render clamp), shared by
+                                    ALL FOUR legs. dxr_view_config.h is NOT here:
+                                    it comes from displayxr-common (the one
+                                    implementation; Android fetches it too)
 openxr_includes/                  — vendored OpenXR + DisplayXR ext headers
 ```
 
@@ -150,10 +151,19 @@ Linux: the same field on their own `AppXrSession`; Android:
 `g_view_config_type`). It degrades to `PRIMARY_STEREO` on an older runtime, so
 it is unconditional.
 
-**The count that reaches `xrEndFrame` comes from the render path, never from the
+**The count that is RENDERED comes from the render path, never from the
 mode.** `DxrClampSubmitViewCount` (common/dxr_submit_views.h) returns
 `min(active mode count, located count, atlas tile capacity)` and logs once when
-the three disagree; 0 means submit no projection layer at all. Recomputing the
+the three disagree; 0 means submit no projection layer at all.
+
+**The count that reaches `xrEndFrame` is the LOCATED count (ADR-041, runtime
+#1612).** Under `PRIMARY_MULTIVIEW_DXR` a projection layer carrying fewer views
+than `xrLocateViews` returned is rejected with `XR_ERROR_VALIDATION_FAILURE` —
+in a 2D (1-view) mode the whole frame was dropped and the panel froze on the
+last woven 3D frame, a double image. Every leg renders only the active views
+and then calls displayxr-common's **`DxrAliasInactiveViews(projViews, views,
+located, rendered)`**, which points the unrendered tail at view 0's subimage
+(each keeps its own located pose/fov; the runtime ignores those pixels). Recomputing the
 mode's count at submit time is what #1500 turned from "looks wrong" into "fails
 `xrEndFrame`, which wedges the session" — a rejected frame is never ended, so
 every later `xrBeginFrame` returns `XR_FRAME_DISCARDED`. The Linux leg is
