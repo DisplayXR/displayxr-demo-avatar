@@ -229,6 +229,23 @@ static uint32_t g_zoneSwW = 0, g_zoneSwH = 0;
 // DXR_ZONES_VALIDATE=1 chains the strict locate/submit pairing validate bit on
 // xrEndFrame (bring-up diagnostics). Default: nothing chained = AUTO wish
 // (feathered bottom-75%), matching windows/main.cpp + cube_zones_vk_linux.
+//! DXR_ZONES_FADE_PX: the tiger zone's content-alpha edge fade, in px
+//! (ADR-027 rule 4). Default 16, 0 disables — windows/main.cpp's EnvFadePx.
+static float ZonesFadePx() {
+    const char* e = getenv("DXR_ZONES_FADE_PX");
+    return (e != nullptr && e[0] != '\0') ? (float)atof(e) : 16.0f;
+}
+
+//! DXR_ZONE_FEATHER_PX: the runtime-side cosmetic zone-vs-band edge feather
+//! (XrDisplayZoneFeatherDXR, display_zones spec v3), chained on the submitted
+//! zone. Default 16 — the radius the Windows avatar and the Unity
+//! desktop-avatar ship (unity#238); 0 = the runtime's hard edge. The published
+//! hardware wish stays binary either way.
+static float ZoneFeatherPx() {
+    const char* e = getenv("DXR_ZONE_FEATHER_PX");
+    return (e != nullptr && e[0] != '\0') ? (float)atof(e) : 16.0f;
+}
+
 static bool AvatarZonesValidate() {
     static const bool e = []() {
         const char* v = getenv("DXR_ZONES_VALIDATE");
@@ -707,6 +724,11 @@ struct AppXrSession {
     // hardwareDisplay3D per mode. A mode with it false is MONO whatever its
     // viewCount says — windows/main.cpp's `monoMode` renders ONE view there.
     bool renderingModeDisplay3D[8] = {};
+    // Per-mode atlas tile grid (cols x rows). The zone path lays its views out
+    // on the ACTIVE mode's grid, as windows/main.cpp does (a 2x2 Quad fills
+    // four tiles, a 2D mode one).
+    uint32_t renderingModeTileColumns[8] = {};
+    uint32_t renderingModeTileRows[8] = {};
     PFN_xrRequestDisplayRenderingModeDXR pfnRequestRenderingMode = nullptr;
 
     // Eye-tracking mode toggle (T). MANAGED vs MANUAL — see
@@ -2005,6 +2027,8 @@ static void RefreshRenderingModes(AppXrSession& xr, bool logTable) {
         xr.renderingModeViewCounts[i] = modes[i].viewCount;
         xr.renderingModeIsRequestable[i] = (modes[i].isRequestable == XR_TRUE);
         xr.renderingModeDisplay3D[i] = (modes[i].hardwareDisplay3D == XR_TRUE);
+        xr.renderingModeTileColumns[i] = modes[i].tileColumns ? modes[i].tileColumns : 1u;
+        xr.renderingModeTileRows[i] = modes[i].tileRows ? modes[i].tileRows : 1u;
         if (modes[i].isActive == XR_TRUE) xr.activeRenderingMode = i;
         if (logTable) {
             LOG_INFO("  [%u] %s (views=%u, tiles=%ux%u, 3D=%d%s%s)",
@@ -2231,12 +2255,12 @@ static bool CreateSession(AppXrSession& xr, VkInstance vkInstance, VkPhysicalDev
 /*!
  * Views the ACTIVE rendering mode wants, or 2 when the runtime named no mode.
  *
- * This leg renders a FIXED 2-tile horizontal atlas, so it can honour a 1-view
- * mode (render one tile, alias the rest of the located views onto it — ADR-041)
- * but not a 4-view one — the caller's
- * DxrClampSubmitViewCount() cuts the wanted count down to the 2 tiles that
- * exist and logs the disagreement once, which is the honest outcome until the
- * tile layout is generalised to the mode's cols x rows grid.
+ * The tiger-zone path lays views out on the active mode's cols x rows grid
+ * (ActiveModeTileGrid), so it honours 1-, 2- and 4-view modes. The full-tile
+ * FALLBACK path still renders a fixed 2-tile horizontal atlas; its caller's
+ * DxrClampSubmitViewCount() cuts the wanted count to those 2 tiles and logs
+ * the disagreement once. Either way the layer carries every located view,
+ * the unrendered tail aliased (ADR-041).
  */
 static uint32_t ActiveModeViewCount(const AppXrSession& xr) {
     if (xr.activeRenderingMode != UINT32_MAX &&
@@ -2250,6 +2274,20 @@ static uint32_t ActiveModeViewCount(const AppXrSession& xr) {
             return xr.renderingModeViewCounts[xr.activeRenderingMode];
     }
     return 2u;
+}
+
+//! The active mode's atlas tile grid; 2x1 SBS when the runtime named no mode
+//! (windows/main.cpp's legacy default). The tiger-zone path follows it.
+static void ActiveModeTileGrid(const AppXrSession& xr, uint32_t* cols, uint32_t* rows) {
+    if (xr.activeRenderingMode < xr.renderingModeCount) {
+        *cols = xr.renderingModeTileColumns[xr.activeRenderingMode];
+        *rows = xr.renderingModeTileRows[xr.activeRenderingMode];
+    } else {
+        *cols = 2u;
+        *rows = 1u;
+    }
+    if (*cols == 0) *cols = 1u;
+    if (*rows == 0) *rows = 1u;
 }
 
 static bool CreateSpaces(AppXrSession& xr) {
@@ -2747,8 +2785,22 @@ static bool TryActivateTigerZone(AppXrSession& xr) {
         return false;
     }
 
-    g_zoneSwW = xr.swapchain.width;   // atlas envelope: 2 SBS tiles wide
-    g_zoneSwH = xr.swapchain.height;
+    // Fullscreen worst case, windows/main.cpp's TryActivateZones formula: the
+    // widest mode tiling x native panel resolution, height covering the
+    // bottom-75% zone of a fullscreen window. Sized once so a live window
+    // resize or a mode switch only moves the per-frame tile rects (the
+    // recommended zone view size is re-queried every frame below) and never
+    // recreates the swapchain. Panel px are device pixels, as are X11 client
+    // px, so the zone rect and this capacity share one unit.
+    uint32_t maxCols = 2, maxRows = 2;
+    for (uint32_t m = 0; m < xr.renderingModeCount; m++) {
+        if (xr.renderingModeTileColumns[m] > maxCols) maxCols = xr.renderingModeTileColumns[m];
+        if (xr.renderingModeTileRows[m] > maxRows) maxRows = xr.renderingModeTileRows[m];
+    }
+    const uint32_t dispW = xr.displayPixelWidth ? xr.displayPixelWidth : xr.swapchain.width;
+    const uint32_t dispH = xr.displayPixelHeight ? xr.displayPixelHeight : xr.swapchain.height;
+    g_zoneSwW = maxCols * dispW;
+    g_zoneSwH = maxRows * ((dispH * 3u) / 4u);
     XrSwapchainCreateInfo sci = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
     sci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT |
                      XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
@@ -2915,8 +2967,10 @@ static bool RenderTigerZone(AppXrSession& xr, const XrFrameState& frameState,
     outZone.rect.offset = {0, topBand};
     outZone.rect.extent = {(int32_t)winW, (int32_t)winH - topBand};
 
-    // Per-zone recommended view size, clamped to the pre-sized swapchain.
-    const uint32_t eyeCount = 2;
+    // Per-zone recommended view size, clamped to the pre-sized swapchain's
+    // per-tile capacity on the ACTIVE mode's grid (windows/main.cpp parity).
+    uint32_t cols = 2, rows = 1;
+    ActiveModeTileGrid(xr, &cols, &rows);
     uint32_t tileW = 0, tileH = 0;
     XrExtent2Di rec = {};
     if (XR_SUCCEEDED(g_pfnGetZoneViewSize(xr.session, &outZone.rect, &rec)) &&
@@ -2927,8 +2981,8 @@ static bool RenderTigerZone(AppXrSession& xr, const XrFrameState& frameState,
         tileW = (uint32_t)outZone.rect.extent.width;
         tileH = (uint32_t)outZone.rect.extent.height;
     }
-    if (tileW > g_zoneSwW / eyeCount) tileW = g_zoneSwW / eyeCount;
-    if (tileH > g_zoneSwH) tileH = g_zoneSwH;
+    if (tileW * cols > g_zoneSwW) tileW = g_zoneSwW / cols;
+    if (tileH * rows > g_zoneSwH) tileH = g_zoneSwH / rows;
     if (tileW == 0) tileW = 1;
     if (tileH == 0) tileH = 1;
 
@@ -2954,20 +3008,21 @@ static bool RenderTigerZone(AppXrSession& xr, const XrFrameState& frameState,
         if (!s_warned) { s_warned = true; LOG_WARN("[zones] zone-scoped xrLocateViews failed — full-tile fallback"); }
         return false;
     }
-    // #1486/#1500 — submit min(active mode count, located, tiles). The zone
-    // atlas is exactly `eyeCount` tiles wide (see the g_zoneSwW/eyeCount clamp
-    // above), so the tile term is eyeCount; the wanted term is the ADOPTED
-    // rendering mode's view count, so a 1-view mode submits one tile instead of
-    // two. Never submit a view we did not locate.
+    // #1486/#1500 — RENDER min(active mode count, located, tiles). The tile
+    // term is the active grid's cols x rows; the wanted term is the ADOPTED
+    // rendering mode's view count, so a 1-view mode renders one tile. Never
+    // render a view we did not locate. (The layer still carries all located
+    // views — the tail is aliased, ADR-041.)
     int zoneDisagreed = 0;
     const uint32_t zoneWanted = ActiveModeViewCount(xr);
-    const uint32_t n = DxrClampSubmitViewCount(zoneWanted, viewCountOut, eyeCount, &zoneDisagreed);
+    const uint32_t tiles = cols * rows;
+    const uint32_t n = DxrClampSubmitViewCount(zoneWanted, viewCountOut, tiles, &zoneDisagreed);
     if (zoneDisagreed) {
         static bool s_warnedZoneClamp = false;
         if (!s_warnedZoneClamp) {
             s_warnedZoneClamp = true;
-            LOG_WARN("[zones] view-count clamp: mode=%u located=%u tiles=%u -> submitting %u",
-                     zoneWanted, viewCountOut, eyeCount, n);
+            LOG_WARN("[zones] view-count clamp: mode=%u located=%u tiles=%u -> rendering %u",
+                     zoneWanted, viewCountOut, tiles, n);
         }
     }
     if (n == 0) return false;  // nothing submittable — fall back to the full-tile path
@@ -2998,21 +3053,28 @@ static bool RenderTigerZone(AppXrSession& xr, const XrFrameState& frameState,
     // outright — the panel went 2D while still showing the last woven 3D frame.
     const uint32_t located = (viewCountOut < kMaxViews) ? viewCountOut : kMaxViews;
     projViews.assign(located, {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW});
+    static const float s_fadePx = ZonesFadePx();
     for (uint32_t i = 0; i < n; i++) {
+        // Row-major tile placement on the active grid: (0,0)/(tileW,0) for 2x1
+        // SBS, a 2x2 block for Quad, (0,0) alone for 2D.
+        const uint32_t col = i % cols;
+        const uint32_t row = i / cols;
         FillFrameView(fv, i, zoneViews[i], rigPos, vHeight, pBudget, standalone);
         ModelRenderer::MaskProjections mp;
         mp.unrestricted = fv.projUnres[i];
-        // Render the avatar into this eye's tile of the zone swapchain.
+        // Render the avatar into this view's tile of the zone swapchain, with
+        // the content-alpha edge feather (ADR-027 rule 4 — the wish mask can't
+        // carry per-zone fades), exactly as windows/main.cpp does.
         g_modelRenderer.renderEye(
             g_zoneImages[imageIndex].image, (VkFormat)xr.swapchain.format,
             g_zoneSwW, g_zoneSwH,
-            i * tileW, 0, tileW, tileH,
+            col * tileW, row * tileH, tileW, tileH,
             fv.view[i], fv.proj[i], g_transparentBg,
-            fv.clipFar[i], /*edgeFadePx=*/0.0f, &mp);
+            fv.clipFar[i], s_fadePx, &mp);
 
         projViews[i].type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
         projViews[i].subImage.swapchain = g_zoneSwapchain;
-        projViews[i].subImage.imageRect.offset = {(int32_t)(i * tileW), 0};
+        projViews[i].subImage.imageRect.offset = {(int32_t)(col * tileW), (int32_t)(row * tileH)};
         projViews[i].subImage.imageRect.extent = {(int32_t)tileW, (int32_t)tileH};
         projViews[i].subImage.imageArrayIndex = 0;
         projViews[i].pose = zoneViews[i].pose;
@@ -3538,7 +3600,21 @@ int main(int argc, char** argv) {
                 // frame: the runtime weaves the avatar into the bottom-75% rect and
                 // auto-derives the wish (feathered bottom-75%), leaving the top 25%
                 // flat for the Local2D bubble. No mask object.
-                tigerZone.next = nullptr;
+                //
+                // Cosmetic edge feather (XrDisplayZoneFeatherDXR, spec v3),
+                // chained where the rig was: the zone edges are HARD at the
+                // runtime by default, and this demo ships the 16-px soft
+                // zone-vs-band edge the Windows avatar does.
+                static const float s_featherPx = ZoneFeatherPx();
+                static XrDisplayZoneFeatherDXR s_feather = {
+                    (XrStructureType)XR_TYPE_DISPLAY_ZONE_FEATHER_DXR};
+                if (s_featherPx > 0.0f) {
+                    s_feather.next = nullptr;
+                    s_feather.radiusPx = s_featherPx;
+                    tigerZone.next = &s_feather;
+                } else {
+                    tigerZone.next = nullptr;
+                }
                 projLayer.next = &tigerZone;
             }
             layers[layerN++] = (XrCompositionLayerBaseHeader*)&projLayer;
