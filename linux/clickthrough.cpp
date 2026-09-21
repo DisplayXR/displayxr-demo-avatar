@@ -62,20 +62,30 @@ static VkCommandPool g_pool = VK_NULL_HANDLE;
 static VkFence g_silFence = VK_NULL_HANDLE;
 static bool g_silPending = false;
 static uint32_t g_silPendingW = 0, g_silPendingH = 0;
-static uint32_t g_silPendingWinW = 0, g_silPendingWinH = 0;
 static bool g_silPendingTwo = false;
+static uint32_t g_silPendingY0 = 0;   // first raster row the avatar was drawn into
 static VkCommandBuffer g_silPrevCmd = VK_NULL_HANDLE;
 
 // Published coverage: one byte per texel, 1 = avatar present.
 static std::vector<uint8_t> g_covBits;
 static uint32_t g_covW = 0, g_covH = 0;
-static uint32_t g_covWinW = 0, g_covWinH = 0;
+// The first row that was actually rendered. Rows above it are untouched scratch
+// and must be skipped — derived from the SAME avatarY the render used, not
+// recomputed from avatarFrac, because rounding the two independently can differ
+// by a row and expose undefined texels.
+static uint32_t g_covY0 = 0;
 static bool g_covReady = false;
 
 static bool
-EnsureTargets(VkDevice dev, VkPhysicalDevice phys, uint32_t w, uint32_t h)
+EnsureTargets(VkDevice dev, VkPhysicalDevice phys, VkQueue queue, VkCommandPool pool, uint32_t w, uint32_t h)
 {
-	if (g_silImage.image != VK_NULL_HANDLE && g_silImage.width == w && g_silImage.height == h) {
+	// Every handle, not just the first image: a partial failure below used to
+	// leave g_silImage valid and the rest null, and the NEXT call would
+	// short-circuit to "ready" and blit into VK_NULL_HANDLE. An allocation
+	// failure should degrade to "no click-through", never to a crash.
+	if (g_silImage.image != VK_NULL_HANDLE && g_silImage2.image != VK_NULL_HANDLE &&
+	    g_silReadback.buffer != VK_NULL_HANDLE && g_silMapped != nullptr && g_silImage.width == w &&
+	    g_silImage.height == h) {
 		return true;
 	}
 	if (g_silImage.image != VK_NULL_HANDLE) {
@@ -92,11 +102,23 @@ EnsureTargets(VkDevice dev, VkPhysicalDevice phys, uint32_t w, uint32_t h)
 		modelDestroyBuffer(dev, g_silReadback);
 	}
 
-	// TRANSFER_DST because ModelRenderer::renderEye BLITS into its target (it
-	// renders to its own MSAA targets and resolves out) — the old
-	// COLOR_ATTACHMENT|TRANSFER_SRC set omitted the usage the blit needs.
-	// TRANSFER_SRC so the copy-out can read it.
-	const VkImageUsageFlags usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+	// All three usages are load-bearing, and dropping any one is a spec
+	// violation the drivers we happen to run on tolerate:
+	//   TRANSFER_DST  — ModelRenderer::renderEye BLITS into its target (it
+	//                   renders to its own MSAA targets and resolves out).
+	//                   The pre-port set omitted this.
+	//   TRANSFER_SRC  — the copy-out reads it.
+	//   COLOR_ATTACHMENT — renderEye leaves the target in
+	//                   COLOR_ATTACHMENT_OPTIMAL and declares that layout on
+	//                   entry, which requires the usage
+	//                   (VUID-VkImageMemoryBarrier-oldLayout-01197); and
+	//                   modelCreateImage2D unconditionally creates a
+	//                   VkImageView, which a TRANSFER-only image is not
+	//                   compatible with (VUID-VkImageViewCreateInfo-image-04441).
+	//                   windows/main.cpp's EnsureSilhouetteTargets has the same
+	//                   gap and silently logs "failed to create image view".
+	const VkImageUsageFlags usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+	                                VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
 	g_silImage = modelCreateImage2D(dev, phys, w, h, VK_FORMAT_R8G8B8A8_UNORM, usage);
 	if (g_silImage.image == VK_NULL_HANDLE) {
 		return false;
@@ -134,7 +156,47 @@ EnsureTargets(VkDevice dev, VkPhysicalDevice phys, uint32_t w, uint32_t h)
 		g_silMapped = nullptr;
 		return false;
 	}
-	return g_silMapped != nullptr;
+
+	// Put both images into COLOR_ATTACHMENT_OPTIMAL before first use.
+	// renderEye picks its entry layout from
+	// `firstViewInImage = (viewportX == 0 && viewportY == 0)`, and the
+	// silhouette pass renders at a non-zero viewportY (the avatar sits in the
+	// bottom band), so it ALWAYS declares COLOR_ATTACHMENT_OPTIMAL — never
+	// UNDEFINED. Freshly created images are UNDEFINED, so without this the very
+	// first frame's barrier lies about the layout. The copy-out below restores
+	// the same layout on every subsequent frame.
+	VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+	ai.commandPool = pool;
+	ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+	ai.commandBufferCount = 1;
+	VkCommandBuffer cmd = VK_NULL_HANDLE;
+	if (vkAllocateCommandBuffers(dev, &ai, &cmd) != VK_SUCCESS) {
+		return false;
+	}
+	VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+	bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+	vkBeginCommandBuffer(cmd, &bi);
+	VkImageMemoryBarrier init = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+	init.srcAccessMask = 0;
+	init.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+	init.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+	init.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+	init.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	init.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	init.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+	VkImageMemoryBarrier inits[2] = {init, init};
+	inits[0].image = g_silImage.image;
+	inits[1].image = g_silImage2.image;
+	vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+	                     VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr, 2, inits);
+	vkEndCommandBuffer(cmd);
+	VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
+	si.commandBufferCount = 1;
+	si.pCommandBuffers = &cmd;
+	vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE);
+	vkQueueWaitIdle(queue);   // once per (re)size only, not per frame
+	vkFreeCommandBuffers(dev, pool, 1, &cmd);
+	return true;
 }
 
 //! Is XShape present on this server? Queried once; a server without it gets a
@@ -234,8 +296,7 @@ ConsumePendingReadback(VkDevice dev, uint32_t dilate, uint8_t alphaMin)
 	g_covBits.swap(bits);
 	g_covW = cw;
 	g_covH = ch;
-	g_covWinW = g_silPendingWinW;
-	g_covWinH = g_silPendingWinH;
+	g_covY0 = (g_silPendingY0 < ch) ? g_silPendingY0 : 0;
 	g_covReady = true;
 }
 
@@ -244,16 +305,20 @@ ConsumePendingReadback(VkDevice dev, uint32_t dilate, uint8_t alphaMin)
 static void
 ApplyRegion(const ClickthroughParams &p)
 {
-	if (!g_covReady || g_covW == 0 || g_covH == 0 || g_covWinW == 0 || g_covWinH == 0) {
+	if (!g_covReady || g_covW == 0 || g_covH == 0 || p.winW == 0 || p.winH == 0) {
 		return;
 	}
 	std::vector<XRectangle> rects;
 
-	// Skip the top band: nothing is drawn there (the avatar is confined to the
-	// bottom `avatarFrac`), and the bubble rect below covers it explicitly.
+	// Scale against the LIVE window, not the size the coverage was captured at.
+	// The coverage is a normalised silhouette, so mapping it onto the current
+	// rect is the right thing during a resize — and it keeps the runs in the
+	// same frame as the bubble rect unioned in below, which is always current.
 	const int64_t cw = (int64_t)g_covW, ch = (int64_t)g_covH;
-	const int64_t winW = (int64_t)g_covWinW, winH = (int64_t)g_covWinH;
-	int64_t yStart = (int64_t)(ch * (1.0 - (double)p.avatarFrac));
+	const int64_t winW = (int64_t)p.winW, winH = (int64_t)p.winH;
+	// Skip the rows above the rendered band: they are untouched scratch, and
+	// the bubble rect below covers that area explicitly.
+	int64_t yStart = (int64_t)g_covY0;
 	if (yStart < 0) {
 		yStart = 0;
 	}
@@ -395,9 +460,8 @@ ClickthroughUpdate(const ClickthroughParams &p)
 	//    recreate the image/buffer under an in-flight copy.
 	ConsumePendingReadback(p.dev, s_dilate, s_alphaMin);
 
-	if (!EnsureTargets(p.dev, p.phys, w, h)) {
-		return;
-	}
+	// The pool must exist before EnsureTargets — it submits the images' initial
+	// layout transition.
 	if (g_pool == VK_NULL_HANDLE) {
 		VkCommandPoolCreateInfo pci = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
 		pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
@@ -405,6 +469,9 @@ ClickthroughUpdate(const ClickthroughParams &p)
 		if (vkCreateCommandPool(p.dev, &pci, nullptr, &g_pool) != VK_SUCCESS) {
 			return;
 		}
+	}
+	if (!EnsureTargets(p.dev, p.phys, p.queue, g_pool, w, h)) {
+		return;
 	}
 	if (g_silFence == VK_NULL_HANDLE) {
 		VkFenceCreateInfo fci = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
@@ -480,6 +547,25 @@ ClickthroughUpdate(const ClickthroughParams &p)
 		vkCmdCopyImageToBuffer(cmd, g_silImage2.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
 		                       g_silReadback.buffer, 1, &region);
 	}
+	// Hand the images back in COLOR_ATTACHMENT_OPTIMAL. renderEye declares that
+	// as its entry layout for any viewport whose origin is not (0,0) — which is
+	// every silhouette render, since the avatar sits in the bottom band — so
+	// leaving them in TRANSFER_SRC_OPTIMAL would make next frame's barrier
+	// describe a layout the image is not in.
+	VkImageMemoryBarrier back = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+	back.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+	back.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+	back.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+	back.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+	back.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	back.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	back.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+	VkImageMemoryBarrier backs[2] = {back, back};
+	backs[0].image = g_silImage.image;
+	backs[1].image = g_silImage2.image;
+	vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+	                     VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr,
+	                     twoViews ? 2 : 1, backs);
 	vkEndCommandBuffer(cmd);
 
 	VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
@@ -491,8 +577,7 @@ ClickthroughUpdate(const ClickthroughParams &p)
 		g_silPendingTwo = twoViews;
 		g_silPendingW = w;
 		g_silPendingH = h;
-		g_silPendingWinW = p.winW;
-		g_silPendingWinH = p.winH;
+		g_silPendingY0 = avatarY;
 	}
 	// `cmd` is consumed on the NEXT invocation's fence wait; freeing it here
 	// while in flight would be invalid. Free the previous one instead.
