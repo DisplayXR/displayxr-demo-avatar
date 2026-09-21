@@ -2883,7 +2883,7 @@ static void UpdateFaceYaw(const AppXrSession& xr, float dt) {
     if (!g_zoneRawValid || g_zoneRaw.eyeCountOutput == 0) return;   // hold forward
 
     // -1 confirmed by eye on BOTH legs: the Windows avatar, and this Linux leg
-    // on a Leia DS1 (the avatar turns toward the viewer as they step sideways).
+    // on a real 3D panel (the avatar turns toward the viewer as they step sideways).
     static constexpr float FACE_YAW_SIGN = -1.0f;  // viewer-confirmed (Windows + Linux)
 
     float cx, cz;
