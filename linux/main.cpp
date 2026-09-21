@@ -37,7 +37,12 @@
 // the app-owned-window path below.
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
+#include <X11/Xatom.h>
 #include <X11/keysym.h>
+// XkbSetDetectableAutoRepeat: without it X11 synthesises a KeyRelease before
+// every auto-repeat KeyPress, so a held W/A/S/D key stutters between "down" and
+// "up" and the pan crawls. Part of libX11 — no extra link dependency.
+#include <X11/XKBlib.h>
 // Xrandr: query the panel (primary / largest non-eDP output) rect so the
 // portrait window opens centered on the 3D display, not the laptop panel.
 #include <X11/extensions/Xrandr.h>
@@ -79,7 +84,10 @@
 // xrGetDisplayZone{Capabilities,RecommendedViewSize}DXR. Same sequence as
 // windows/main.cpp + the proven cube_zones_vk_linux reference.
 #include <openxr/XR_DXR_display_zones.h>
-
+// Multi-view atlas capture (the I key) — the same runtime-owned snapshot the
+// Windows leg takes, used by /make-app-logos and for eyeballing the tile layout
+// without a 3D panel.
+#include <openxr/XR_DXR_atlas_capture.h>
 #include "clickthrough.h" // XShape silhouette click-through for the overlay
 
 #include <cmath>
@@ -268,9 +276,62 @@ static float g_fitCenter[3] = {0.0f, 0.0f, 0.0f};        // rig pose position (m
 static float g_fitVHeight = kFallbackVHeightM;           // rig virtualDisplayHeight (model height × comfort)
 static bool g_fitValid = false;
 
-// Dynamic-recenter pins. Default X Y (Z off) matches the Windows avatar. Linux
-// has no keyboard pan/dolly, so control is via DXR_RECENTER_PIN=XYZ|XY|Z|- .
+// Dynamic-recenter pins. Default X Y (Z off) matches the Windows avatar; P
+// arms and X/Y/Z toggle an axis (Windows parity), or DXR_RECENTER_PIN=XYZ|XY|Z|-
+// sets them up front.
 static dxr::RecenterControl g_recenter;
+
+// ============================================================================
+// Interactive state — the Windows leg's controls, ported to X11
+// ============================================================================
+// windows/main.cpp keeps these in displayxr-common's InputState, which is a
+// Win32 header (UINT/WPARAM/LPARAM) and cannot be reused here. The X11 pump
+// below (PumpXEvents) writes these directly; the render loop reads them. Single
+// threaded — unlike Windows, there is no separate message-pump thread, so no
+// lock is needed and none is taken.
+
+//! Ctrl+T. Drives renderEye's transparentBg AND dxr::ResolveClipPlanes'
+//! `transparent` (an opaque frame must never be rear-clipped — see clip_policy.h).
+//! The SESSION's transparency is fixed at xrCreateSession and cannot follow this
+//! toggle; what changes is what the app draws, exactly as on Windows.
+static bool g_transparentBg = true;
+
+//! Mouse wheel / SPACE. The rig's virtual display height is divided by this, so
+//! wheel-up (>1) shrinks the virtual display and the avatar grows. Mirrors
+//! windows/main.cpp's `virtualDisplayHeight / viewParams.scaleFactor`.
+static float g_zoomFactor = 1.0f;
+
+//! '-' / '+' (and Shift+wheel). Driven in lockstep into the rig's ipdFactor and
+//! parallaxFactor, the same "one 3D-effect strength knob" the shared Windows
+//! input handler implements.
+static float g_ipdFactor = 1.0f;
+
+//! WASD / QE pan+dolly and the double-click focus target, as an offset from the
+//! auto-fit centre. Added on top of the per-axis recenter anchor in
+//! ComputeRigPosition — identical composition to windows/main.cpp's
+//! (cameraPos - fitCentre) offset.
+static float g_panX = 0.0f, g_panY = 0.0f, g_panZ = 0.0f;
+static bool  g_keyW = false, g_keyA = false, g_keyS = false, g_keyD = false;
+static bool  g_keyQ = false, g_keyE = false;
+
+//! Double-click focus (windows/main.cpp's teleport): ease the pan offset toward
+//! the picked surface point instead of snapping.
+static bool  g_focusActive = false;
+static float g_focusTarget[3] = {0.0f, 0.0f, 0.0f};
+
+//! B / F11 window state. Borderless (undecorated) is the default: a title bar
+//! captures input and defeats the XShape click-through, and it looks wrong for a
+//! floating overlay. Decorating clears the input shape so the whole framed
+//! window is interactive, exactly like the Windows `SetWindowRgn(NULL)` branch.
+static bool g_decorated = false;
+static bool g_fullscreen = false;
+
+//! The virtual display height the rig should use this frame (auto-fit ÷ zoom).
+static float CurrentVHeight() {
+    const float base = g_fitValid ? g_fitVHeight : kFallbackVHeightM;
+    const float z = (g_zoomFactor > 1.0e-3f) ? g_zoomFactor : 1.0e-3f;
+    return base / z;
+}
 
 static void ComputeAutoFit() {
     float center[3], extent[3];
@@ -341,9 +402,11 @@ static void ComputeAutoFit() {
 
 // Rig position for this frame (concept 2, dynamic recenter): a pinned axis tracks
 // the smoothed animated centroid; an unpinned axis stays at the initial fit
-// centre. The Linux avatar has no keyboard pan/dolly, so there is no user offset
-// to add on top (unlike the Windows avatar). Default pins X Y → X,Y track the
-// centroid, Z stays at the framed depth — matching the Windows avatar's default.
+// centre. The user's pan/dolly (A/D → X, Q/E → Y, W/S → Z, plus the double-click
+// focus target) adds on top of both — the exact composition windows/main.cpp
+// performs with (cameraPos - fitCentre), including its kPanSign flip on X so D
+// slides the avatar to the viewer's right. Default pins X Y → X,Y track the
+// centroid, Z stays at the framed depth, matching the Windows avatar.
 static void ComputeRigPosition(float out[3]) {
     out[0] = g_fitCenter[0];
     out[1] = g_fitCenter[1];
@@ -355,6 +418,150 @@ static void ComputeRigPosition(float out[3]) {
         if (pins.y) out[1] = anchor[1];
         if (pins.z) out[2] = anchor[2];
     }
+    static constexpr float kPanSign = -1.0f;  // D = avatar right (windows parity)
+    out[0] += kPanSign * g_panX;
+    out[1] += g_panY;
+    out[2] += g_panZ;
+}
+
+// Advance the keyboard pan/dolly and the double-click focus ease. One call per
+// frame from the main loop. Speed is windows/main.cpp's exactly:
+// 0.1 · m2v / zoom virtual units per second, where m2v converts metres of
+// physical panel into the rig's virtual units — so the gesture feels the same
+// however the model is scaled or the panel sized.
+static void UpdateInteractive(float dt, float displayHeightM) {
+    if (dt <= 0.0f || dt > 0.25f) dt = 0.016f;   // first frame / a stall
+
+    const float baseVH = g_fitValid ? g_fitVHeight : kFallbackVHeightM;
+    float m2v = 1.0f;
+    if (baseVH > 0.0f && displayHeightM > 0.0f) m2v = baseVH / displayHeightM;
+    const float zoom = (g_zoomFactor > 1.0e-3f) ? g_zoomFactor : 1.0e-3f;
+    const float step = 0.1f * m2v / zoom * dt;
+
+    // Identity rig orientation → the movement basis is world-axis-aligned
+    // (forward = -Z, right = +X, up = +Y), which is what the Windows path
+    // reduces to as well: the avatar pins yaw/pitch to 0 before the move.
+    if (g_keyW) g_panZ -= step;
+    if (g_keyS) g_panZ += step;
+    if (g_keyA) g_panX -= step;
+    if (g_keyD) g_panX += step;
+    if (g_keyE) g_panY += step;
+    if (g_keyQ) g_panY -= step;
+
+    // Exponential ease-out, ~90% in 0.23 s — the same curve the shared Windows
+    // teleport animation uses.
+    if (g_focusActive) {
+        const float t = 1.0f - expf(-10.0f * dt);
+        g_panX += (g_focusTarget[0] - g_panX) * t;
+        g_panY += (g_focusTarget[1] - g_panY) * t;
+        g_panZ += (g_focusTarget[2] - g_panZ) * t;
+        const float dx = g_focusTarget[0] - g_panX;
+        const float dy = g_focusTarget[1] - g_panY;
+        const float dz = g_focusTarget[2] - g_panZ;
+        if (dx * dx + dy * dy + dz * dz < 1.0e-8f) g_focusActive = false;
+    }
+}
+
+// SPACE — return to the load-time framing: no pan, no dolly, no zoom, default
+// 3D strength. Deliberately absolute (windows/main.cpp's RigResetToInitial rule)
+// so repeated resets cannot drift.
+static void ResetView() {
+    g_panX = g_panY = g_panZ = 0.0f;
+    g_zoomFactor = 1.0f;
+    g_ipdFactor = 1.0f;
+    g_focusActive = false;
+    LOG_INFO("View reset (SPACE)");
+}
+
+// Auto-incrementing capture prefix under the user's Pictures dir, mirroring the
+// Windows leg's dxr_capture::MakeCaptureAtlasPrefix (whose implementation is
+// Win32/Cocoa-only). The runtime appends the layout suffix.
+static std::string AtlasCapturePrefix() {
+    const char* home = getenv("HOME");
+    std::string dir = (home != nullptr && home[0] != '\0')
+                          ? std::string(home) + "/Pictures/DisplayXR"
+                          : std::string("/tmp");
+    mkdir(dir.c_str(), 0755);   // best effort; a pre-existing dir returns EEXIST
+    static int s_n = 0;
+    char buf[PATH_MAX];
+    snprintf(buf, sizeof(buf), "%s/avatar-%d", dir.c_str(), ++s_n);
+    return std::string(buf);
+}
+
+// ── Double-click focus (windows/main.cpp's teleport pick) ───────────────────
+// The render loop publishes the frame's CENTRE view/projection and the 3D zone
+// rect; the X11 pump turns a double-click into a ray through them and eases the
+// rig onto whatever surface it hits. Published, not recomputed, so the ray uses
+// exactly the matrices the user clicked on.
+static float   g_pickView[16] = {};
+static float   g_pickProj[16] = {};
+static bool    g_pickValid = false;
+static int32_t g_pickZoneX = 0, g_pickZoneY = 0, g_pickZoneW = 0, g_pickZoneH = 0;
+
+/*!
+ * Unproject a client-space point through the published centre view/projection
+ * and re-aim the rig at the surface it hits.
+ *
+ * The mouse maps over the ZONE rect, not the window — a click in the Local2D
+ * speech-bubble band must not pick, exactly as on Windows.
+ *
+ * The ray math is hand-rolled rather than borrowed from displayxr-common's
+ * display3d_unproject_ndc_to_ray, which is DirectXMath-backed and Windows-only.
+ * For the column-major projection mat4_from_xr_fov emits, clip.x = P0·x + P8·z
+ * and clip.w = -z, so at z = -1 the camera-space direction for a given NDC is
+ * ((ndcX + P8)/P0, (ndcY + P9)/P5, -1). The GL→Vulkan depth remap rewrites only
+ * the z row, so those four entries are untouched by it. The view matrix's upper
+ * 3x3 is the INVERSE rig rotation, so its transpose (rows P[0..2], P[4..6],
+ * P[8..10]) rotates camera space back into the world.
+ */
+static bool PickFocus(int clientX, int clientY) {
+    if (!g_pickValid || g_pickZoneW <= 0 || g_pickZoneH <= 0) return false;
+    if (clientY < g_pickZoneY) return false;    // bubble band — never picks
+    const float ndcX = 2.0f * (float)(clientX - g_pickZoneX) / (float)g_pickZoneW - 1.0f;
+    const float ndcY = -(2.0f * (float)(clientY - g_pickZoneY) / (float)g_pickZoneH - 1.0f);
+    if (ndcX < -1.0f || ndcX > 1.0f || ndcY < -1.0f || ndcY > 1.0f) return false;
+
+    const float* P = g_pickProj;
+    const float* V = g_pickView;
+    if (fabsf(P[0]) < 1.0e-8f || fabsf(P[5]) < 1.0e-8f) return false;
+    const float dcx = (ndcX + P[8]) / P[0];
+    const float dcy = (ndcY + P[9]) / P[5];
+    const float dcz = -1.0f;
+
+    float rayDir[3] = {
+        V[0] * dcx + V[1] * dcy + V[2] * dcz,
+        V[4] * dcx + V[5] * dcy + V[6] * dcz,
+        V[8] * dcx + V[9] * dcy + V[10] * dcz,
+    };
+    const float len = sqrtf(rayDir[0] * rayDir[0] + rayDir[1] * rayDir[1] + rayDir[2] * rayDir[2]);
+    if (!(len > 1.0e-8f)) return false;
+    rayDir[0] /= len; rayDir[1] /= len; rayDir[2] /= len;
+
+    // Eye position = -R · t, with t the view matrix's translation column.
+    const float tx = V[12], ty = V[13], tz = V[14];
+    const float rayOrigin[3] = {
+        -(V[0] * tx + V[1] * ty + V[2] * tz),
+        -(V[4] * tx + V[5] * ty + V[6] * tz),
+        -(V[8] * tx + V[9] * ty + V[10] * tz),
+    };
+
+    float hit[3];
+    if (!g_modelRenderer.pickSurface(rayOrigin, rayDir, hit)) {
+        LOG_INFO("Focus: no surface under the cursor");
+        return false;
+    }
+    // Land the RIG on the hit point. ComputeRigPosition applies kPanSign = -1 to
+    // X (so D slides the avatar right), so the X target is pre-negated for the
+    // rig to end up centred on the hit rather than mirrored about the fit
+    // centre. windows/main.cpp routes its teleport through the same kPanSign
+    // without that correction and therefore focuses the mirrored point in X;
+    // this is a deliberate, documented divergence, not an oversight.
+    g_focusTarget[0] = -(hit[0] - g_fitCenter[0]);
+    g_focusTarget[1] =  (hit[1] - g_fitCenter[1]);
+    g_focusTarget[2] =  (hit[2] - g_fitCenter[2]);
+    g_focusActive = true;
+    LOG_INFO("Focus on surface (%.3f, %.3f, %.3f)", hit[0], hit[1], hit[2]);
+    return true;
 }
 
 // ============================================================================
@@ -422,6 +629,23 @@ struct AppXrSession {
     // (XrDisplayRenderingModeInfoDXR::isActive, display_info v13).
     // UINT32_MAX = the runtime named none (pre-v13, or the enumerate failed).
     uint32_t activeRenderingMode = UINT32_MAX;
+    // (v13) Whether THIS session may request each mode. False for a
+    // non-controller session under a workspace, where the controller is the
+    // sole mode authority — so V / 0-8 report "locked" instead of silently
+    // doing nothing, and dxr::ResolveClipPlanes' `standalone` predicate is
+    // derived from it exactly as windows/main.cpp derives its own.
+    bool renderingModeIsRequestable[8] = {};
+    PFN_xrRequestDisplayRenderingModeDXR pfnRequestRenderingMode = nullptr;
+
+    // Eye-tracking mode toggle (T). MANAGED vs MANUAL — see
+    // docs/specs/vendor/eye-tracking-modes.md in displayxr-runtime.
+    PFN_xrRequestEyeTrackingModeDXR pfnRequestEyeTrackingMode = nullptr;
+    XrEyeTrackingModeDXR activeEyeTrackingMode = XR_EYE_TRACKING_MODE_MANAGED_DXR;
+
+    // Multi-view atlas capture (I) — XR_DXR_atlas_capture.
+    bool hasAtlasCapture = false;
+    PFN_xrCaptureAtlasDXR pfnCaptureAtlas = nullptr;
+
 };
 
 // Default portrait client size (Windows parity: windows/main.cpp g_windowWidth ×
@@ -555,6 +779,101 @@ static bool GetPanelRect(Display* dpy, Window root, int& x, int& y, int& w, int&
     return found;
 }
 
+// ============================================================================
+// Window-manager helpers (Motif hints + EWMH) — the X11 analogues of
+// windows/main.cpp's ToggleDecoration / ToggleFullscreen / dxr::RmbWindowDrag
+// ============================================================================
+
+//! _MOTIF_WM_HINTS decorations bit. Every mainstream WM (Mutter, KWin, Xfwm,
+//! i3) honours it; a WM that does not simply keeps its frame, which is a
+//! cosmetic difference rather than a failure.
+static void SetMotifDecorations(Display* dpy, Window win, bool decorated) {
+    struct MotifWmHints { unsigned long flags, functions, decorations; long input_mode; unsigned long status; };
+    MotifWmHints mwm = {2 /* MWM_HINTS_DECORATIONS */, 0, decorated ? 1UL : 0UL, 0, 0};
+    Atom motif = XInternAtom(dpy, "_MOTIF_WM_HINTS", False);
+    if (motif != None) {
+        XChangeProperty(dpy, win, motif, motif, 32, PropModeReplace, (unsigned char*)&mwm, 5);
+    }
+}
+
+//! True when the WM advertises `name` in _NET_SUPPORTED. Cached per atom name
+//! is not worth it — this is called at most a few times per session.
+static bool WmSupports(Display* dpy, const char* name) {
+    Atom want = XInternAtom(dpy, name, True);
+    if (want == None) return false;
+    Atom supported = XInternAtom(dpy, "_NET_SUPPORTED", True);
+    if (supported == None) return false;
+    Atom actualType = None; int actualFormat = 0;
+    unsigned long n = 0, bytesAfter = 0; unsigned char* data = nullptr;
+    if (XGetWindowProperty(dpy, DefaultRootWindow(dpy), supported, 0, 4096, False, XA_ATOM,
+                           &actualType, &actualFormat, &n, &bytesAfter, &data) != Success) {
+        return false;
+    }
+    bool found = false;
+    if (data != nullptr && actualType == XA_ATOM && actualFormat == 32) {
+        const Atom* atoms = (const Atom*)data;
+        for (unsigned long i = 0; i < n; i++) if (atoms[i] == want) { found = true; break; }
+    }
+    if (data != nullptr) XFree(data);
+    return found;
+}
+
+//! Send an EWMH _NET_WM_STATE add/remove/toggle for one state atom.
+static void SetNetWmState(Display* dpy, Window win, const char* stateName, bool on) {
+    Atom stateAtom = XInternAtom(dpy, "_NET_WM_STATE", False);
+    Atom what = XInternAtom(dpy, stateName, False);
+    if (stateAtom == None || what == None) return;
+    XEvent ev = {};
+    ev.type = ClientMessage;
+    ev.xclient.window = win;
+    ev.xclient.message_type = stateAtom;
+    ev.xclient.format = 32;
+    ev.xclient.data.l[0] = on ? 1 : 0;   // _NET_WM_STATE_ADD / _REMOVE
+    ev.xclient.data.l[1] = (long)what;
+    ev.xclient.data.l[2] = 0;
+    ev.xclient.data.l[3] = 1;            // source indication: normal application
+    XSendEvent(dpy, DefaultRootWindow(dpy), False,
+               SubstructureNotifyMask | SubstructureRedirectMask, &ev);
+    XFlush(dpy);
+}
+
+/*!
+ * RIGHT-button drag moves the borderless overlay — the desktop-avatar
+ * convention, matching windows/main.cpp's dxr::RmbWindowDrag (and modelviewer /
+ * gaussiansplat). The gesture is gated on the opaque element for free: a shaped
+ * window never receives a button press outside its XShape input region, so the
+ * transparent area keeps clicking through to the desktop.
+ *
+ * Preferred implementation is the EWMH _NET_WM_MOVERESIZE handoff — the WM runs
+ * its own move loop, which is what an OS title-bar drag does, so any
+ * windowed-weaving phase-snap the compositor keys on a WM move still fires.
+ * Returns false when the WM does not advertise it; the caller then falls back
+ * to tracking the pointer itself.
+ */
+static bool StartWmMove(Display* dpy, Window win, int rootX, int rootY) {
+    if (!WmSupports(dpy, "_NET_WM_MOVERESIZE")) return false;
+    Atom mr = XInternAtom(dpy, "_NET_WM_MOVERESIZE", False);
+    if (mr == None) return false;
+    // The WM takes over the pointer; we must drop our implicit grab first or it
+    // cannot grab, and the drag silently does nothing.
+    XUngrabPointer(dpy, CurrentTime);
+    XFlush(dpy);
+    XEvent ev = {};
+    ev.type = ClientMessage;
+    ev.xclient.window = win;
+    ev.xclient.message_type = mr;
+    ev.xclient.format = 32;
+    ev.xclient.data.l[0] = rootX;
+    ev.xclient.data.l[1] = rootY;
+    ev.xclient.data.l[2] = 8;   // _NET_WM_MOVERESIZE_MOVE
+    ev.xclient.data.l[3] = Button3;
+    ev.xclient.data.l[4] = 1;   // source indication: normal application
+    XSendEvent(dpy, DefaultRootWindow(dpy), False,
+               SubstructureNotifyMask | SubstructureRedirectMask, &ev);
+    XFlush(dpy);
+    return true;
+}
+
 // Create a 32-bit ARGB X11 window for the avatar overlay. Windowed PORTRAIT
 // (811×1421, Windows parity) centered on the 3D panel — NOT fullscreen. Override
 // with AVATAR_WINDOW="WxH+X+Y" (X,Y = absolute virtual-desktop px; parsed like
@@ -584,7 +903,12 @@ static bool CreateAppWindow(AppXrSession& xr) {
     attrs.colormap = cmap;
     attrs.border_pixel = 0;      // required with a non-default colormap (else BadMatch)
     attrs.background_pixel = 0;  // fully-transparent fill
-    attrs.event_mask = StructureNotifyMask | KeyPressMask;
+    // Mouse as well as keyboard: without the Button/Motion bits the X server
+    // never delivers a press to this window at all, which is why the Linux leg
+    // had no RMB window-move, no wheel zoom and no double-click focus.
+    attrs.event_mask = StructureNotifyMask | KeyPressMask | KeyReleaseMask |
+                       ButtonPressMask | ButtonReleaseMask | PointerMotionMask |
+                       LeaveWindowMask;
 
     // Portrait default, centered on the 3D panel (RandR). Fall back to centering
     // on the default screen if Xrandr yields nothing.
@@ -646,17 +970,10 @@ static bool CreateAppWindow(AppXrSession& xr) {
     }
     XStoreName(dpy, win, "DisplayXR Avatar");
 
-    // Borderless: strip the WM decorations (_MOTIF_WM_HINTS, decorations=0). A
-    // decorated title bar/frame captures input and defeats the XShape
-    // click-through, and it looks wrong for a floating overlay.
-    {
-        struct MotifWmHints { unsigned long flags, functions, decorations; long input_mode; unsigned long status; };
-        MotifWmHints mwm = {2 /* MWM_HINTS_DECORATIONS */, 0, 0 /* none */, 0, 0};
-        Atom motif = XInternAtom(dpy, "_MOTIF_WM_HINTS", False);
-        if (motif != None) {
-            XChangeProperty(dpy, win, motif, motif, 32, PropModeReplace, (unsigned char*)&mwm, 5);
-        }
-    }
+    // Borderless by default (see SetMotifDecorations): a decorated title
+    // bar/frame captures input and defeats the XShape click-through, and it
+    // looks wrong for a floating overlay. B toggles it back on.
+    SetMotifDecorations(dpy, win, /*decorated=*/false);
 
     // WM_NORMAL_HINTS with USPosition|PPosition so the WM honors the create-time
     // position instead of auto-placing (GNOME/Mutter auto-places without this).
@@ -670,6 +987,9 @@ static bool CreateAppWindow(AppXrSession& xr) {
 
     XMapWindow(dpy, win);
     XFlush(dpy);
+
+    // Held W/A/S/D must not stutter — see the XKBlib include note.
+    { Bool supported = False; XkbSetDetectableAutoRepeat(dpy, True, &supported); }
 
     // Re-assert the position after mapping — Mutter (and others) ignore the
     // create-time x/y of a freshly-mapped toplevel but honor a post-map move.
@@ -687,23 +1007,330 @@ static bool CreateAppWindow(AppXrSession& xr) {
     return true;
 }
 
-// Pump the app window's X11 events: O / Ctrl+O = open-file dialog (zenity),
-// ConfigureNotify = track the live window size. The window already selects
-// StructureNotifyMask | KeyPressMask at creation; without this pump those
-// events just queued up unread.
+// Forward declarations for the handlers the X11 pump drives.
+static void RefreshRenderingModes(AppXrSession& xr, bool logTable);
+static void RequestRenderingMode(AppXrSession& xr, uint32_t modeIndex, const char* via);
+static void ToggleDecoration(AppXrSession& xr);
+static void ToggleFullscreen(AppXrSession& xr);
+
+/*!
+ * Pump the app window's X11 events.
+ *
+ * This is the Linux counterpart of windows/main.cpp's WindowProc plus the
+ * shared UpdateInputState it delegates to — displayxr-common's input_handler.h
+ * is a Win32 header (UINT/WPARAM/LPARAM) and cannot be reused here, so the key
+ * and button map is reproduced rather than shared.
+ *
+ * Controls, and where each one comes from on the Windows leg:
+ *
+ *   mouse                                      windows/main.cpp
+ *   ------------------------------------------ -------------------------------
+ *   right-drag            move the window      dxr::RmbWindowDrag
+ *   wheel                 zoom (rig vHeight)   UpdateInputState WM_MOUSEWHEEL
+ *   Shift+wheel           3D strength (ipd)    ditto, shift branch
+ *   double-click          focus picked surface WM_LBUTTONDBLCLK -> teleport
+ *   left-drag             (deliberately inert) yaw/pitch pinned to 0 — the
+ *                                              billboard owns the heading
+ *
+ *   keyboard
+ *   ------------------------------------------ -------------------------------
+ *   Esc                   quit                 WM_KEYDOWN VK_ESCAPE
+ *   Ctrl+O                open a model         OpenModelDialog
+ *   Ctrl+T                transparent/opaque   transparentBgToggleRequested
+ *   T                     eye-tracking mode    eyeTrackingModeToggleRequested
+ *   V / 0..8              rendering mode       cycle / absolute
+ *   N / K                 next clip / play     cycleClip / playPause
+ *   Space                 reset the view       resetViewRequested
+ *   W A S D Q E           pan / dolly          UpdateCameraMovement
+ *   - / +                 3D strength          VK_OEM_MINUS / VK_OEM_PLUS
+ *   P then X / Y / Z      recenter pins        dxr::RecenterControl::onKey
+ *   G                     edge softening       setEdgeSoftenEnabled
+ *   B                     window decoration    ToggleDecoration
+ *   F11                   fullscreen           ToggleFullscreen
+ *   I                     capture the atlas    xrCaptureAtlasDXR
+ *
+ * Deliberately NOT ported: Tab (the HUD panel the avatar does not have), C (the
+ * camera/display rig round-trip, which needs displayxr-common's Windows-only
+ * rig converter), M (auto-orbit — the Windows avatar forces it off every reset
+ * because the face-the-viewer billboard owns the heading).
+ */
 static void PumpXEvents(AppXrSession& xr) {
     if (xr.xDisplay == nullptr) return;
+
+    // Manual RMB-drag fallback, used only when the WM does not advertise
+    // _NET_WM_MOVERESIZE (see StartWmMove). Window-thread owned.
+    static bool s_manualDrag = false;
+    static int  s_dragRootX = 0, s_dragRootY = 0;
+    static int  s_dragWinX = 0, s_dragWinY = 0;
+
+    // Double-click detection. X11 has no WM_LBUTTONDBLCLK: the interval is the
+    // conventional 400 ms, and the slop keeps a shaky hand from splitting a
+    // double-click into two singles.
+    static Time s_lastClickTime = 0;
+    static int  s_lastClickX = 0, s_lastClickY = 0;
+    static constexpr unsigned long kDoubleClickMs = 400;
+    static constexpr int kDoubleClickSlopPx = 6;
+
     while (XPending(xr.xDisplay) > 0) {
         XEvent ev;
         XNextEvent(xr.xDisplay, &ev);
         switch (ev.type) {
         case KeyPress: {
-            KeySym sym = XLookupKeysym(&ev.xkey, 0);
-            // Ctrl+O = open a model (uniform across demos + platforms). Strict:
-            // Ctrl must be held (bare O does nothing).
-            if ((sym == XK_o || sym == XK_O) && (ev.xkey.state & ControlMask)) StartFilePicker();
+            const KeySym sym = XLookupKeysym(&ev.xkey, 0);
+            const bool ctrl = (ev.xkey.state & ControlMask) != 0;
+
+            // Ctrl-chords first, so the bare-key handlers below cannot swallow
+            // them (Ctrl+T must not reach the plain-T eye-tracking toggle).
+            if (ctrl) {
+                switch (sym) {
+                case XK_o: case XK_O:
+                    StartFilePicker();
+                    continue;
+                case XK_t: case XK_T:
+                    g_transparentBg = !g_transparentBg;
+                    LOG_INFO("Transparent background: %s (Ctrl+T)", g_transparentBg ? "ON" : "OFF");
+                    continue;
+                default: break;
+                }
+            }
+
+            switch (sym) {
+            case XK_Escape:
+                LOG_INFO("Escape — exiting");
+                if (xr.session != XR_NULL_HANDLE && xr.sessionRunning) {
+                    xrRequestExitSession(xr.session);
+                } else {
+                    g_running = false;
+                }
+                break;
+
+            case XK_F11: ToggleFullscreen(xr); break;
+            case XK_b: case XK_B: ToggleDecoration(xr); break;
+
+            case XK_space: ResetView(); break;
+
+            case XK_w: case XK_W: g_keyW = true; break;
+            case XK_a: case XK_A: g_keyA = true; break;
+            case XK_s: case XK_S: g_keyS = true; break;
+            case XK_d: case XK_D: g_keyD = true; break;
+            case XK_q: case XK_Q: g_keyQ = true; break;
+            case XK_e: case XK_E: g_keyE = true; break;
+
+            case XK_minus: case XK_KP_Subtract: {
+                g_ipdFactor -= 0.1f;
+                if (g_ipdFactor < 0.1f) g_ipdFactor = 0.1f;
+                LOG_INFO("3D strength: %.2f (-)", g_ipdFactor);
+                break;
+            }
+            case XK_plus: case XK_equal: case XK_KP_Add: {
+                g_ipdFactor += 0.1f;
+                if (g_ipdFactor > 1.0f) g_ipdFactor = 1.0f;
+                LOG_INFO("3D strength: %.2f (+)", g_ipdFactor);
+                break;
+            }
+
+            case XK_n: case XK_N:
+            case XK_k: case XK_K: {
+                const bool next = (sym == XK_n || sym == XK_N);
+                if (next) g_modelRenderer.cycleAnimation(); else g_modelRenderer.togglePaused();
+                std::string clip; int ci = 0, cn = 0; float ct = 0.0f, cd = 0.0f; bool playing = false;
+                if (g_modelRenderer.getPlaybackInfo(clip, ci, cn, ct, cd, playing)) {
+                    LOG_INFO("Clip playback: %s '%s' (%d/%d) via %s",
+                             playing ? "playing" : "paused", clip.c_str(), ci + 1, cn,
+                             next ? "N" : "K");
+                } else {
+                    LOG_INFO("Clip playback: no animation clips in this model (%s ignored)",
+                             next ? "N" : "K");
+                }
+                break;
+            }
+
+            case XK_g: case XK_G: {
+                const bool now = !g_modelRenderer.edgeSoftenEnabled();
+                g_modelRenderer.setEdgeSoftenEnabled(now);
+                LOG_INFO("Edge-soften post-pass: %s (G)", now ? "ON" : "OFF");
+                break;
+            }
+
+            case XK_t: case XK_T: {
+                if (xr.pfnRequestEyeTrackingMode == nullptr || xr.session == XR_NULL_HANDLE) {
+                    LOG_INFO("Eye-tracking mode toggle unavailable (no XR_DXR_display_info entry point)");
+                    break;
+                }
+                const XrEyeTrackingModeDXR want =
+                    (xr.activeEyeTrackingMode == XR_EYE_TRACKING_MODE_MANAGED_DXR)
+                        ? XR_EYE_TRACKING_MODE_MANUAL_DXR : XR_EYE_TRACKING_MODE_MANAGED_DXR;
+                const XrResult r = xr.pfnRequestEyeTrackingMode(xr.session, want);
+                if (XR_SUCCEEDED(r)) xr.activeEyeTrackingMode = want;
+                LOG_INFO("Eye tracking mode -> %s (%s)",
+                         want == XR_EYE_TRACKING_MODE_MANUAL_DXR ? "MANUAL" : "MANAGED",
+                         XR_SUCCEEDED(r) ? "OK" : "unsupported");
+                break;
+            }
+
+            case XK_i: case XK_I: {
+                if (!xr.hasAtlasCapture || xr.pfnCaptureAtlas == nullptr) {
+                    LOG_INFO("Atlas capture unavailable (XR_DXR_atlas_capture not enabled)");
+                    break;
+                }
+                XrAtlasCaptureInfoDXR ci = {(XrStructureType)XR_TYPE_ATLAS_CAPTURE_INFO_DXR};
+                ci.stage = XR_ATLAS_CAPTURE_STAGE_POST_COMPOSE_DXR;
+                // The runtime appends "_atlas_<views>_<cols>x<rows>.png", so
+                // pass a bare prefix and never pre-bake the layout.
+                std::string prefix = AtlasCapturePrefix();
+                snprintf(ci.pathPrefix, sizeof(ci.pathPrefix), "%s", prefix.c_str());
+                const XrResult r = xr.pfnCaptureAtlas(xr.session, &ci, nullptr);
+                LOG_INFO("Atlas capture requested (I): %s -> %s%s",
+                         XR_SUCCEEDED(r) ? "OK" : "failed", ci.pathPrefix,
+                         "_atlas_<views>_<cols>x<rows>.png");
+                break;
+            }
+
+            case XK_v: case XK_V: {
+                if (xr.renderingModeCount == 0) {
+                    LOG_INFO("V: the runtime enumerated no rendering modes");
+                    break;
+                }
+                const uint32_t cur = (xr.activeRenderingMode < xr.renderingModeCount)
+                                         ? xr.activeRenderingMode : 0u;
+                RequestRenderingMode(xr, (cur + 1u) % xr.renderingModeCount, "V");
+                break;
+            }
+
+            case XK_0: case XK_1: case XK_2: case XK_3: case XK_4:
+            case XK_5: case XK_6: case XK_7: case XK_8: {
+                const uint32_t want = (uint32_t)(sym - XK_0);
+                if (want >= xr.renderingModeCount) {
+                    LOG_INFO("Mode %u: the runtime offers only %u mode(s)", want, xr.renderingModeCount);
+                    break;
+                }
+                RequestRenderingMode(xr, want, "0-8");
+                break;
+            }
+
+            // Dynamic-recenter pins: P arms, then X/Y/Z toggle that axis' pin.
+            // onKey consumes P (arm) and X/Y/Z (while armed).
+            case XK_p: case XK_P:
+            case XK_x: case XK_X:
+            case XK_y: case XK_Y:
+            case XK_z: case XK_Z: {
+                char c = (char)sym;
+                if (c >= 'a' && c <= 'z') c = (char)(c - 'a' + 'A');
+                if (g_recenter.onKey(c)) {
+                    char lbl[24];
+                    g_recenter.hudLabel(lbl, sizeof(lbl));
+                    LOG_INFO("Recenter: %s", lbl);
+                }
+                break;
+            }
+
+            default: break;
+            }
             break;
         }
+
+        case KeyRelease: {
+            // XkbSetDetectableAutoRepeat is on, so a KeyRelease is a real
+            // release, not the front half of an auto-repeat.
+            const KeySym sym = XLookupKeysym(&ev.xkey, 0);
+            switch (sym) {
+            case XK_w: case XK_W: g_keyW = false; break;
+            case XK_a: case XK_A: g_keyA = false; break;
+            case XK_s: case XK_S: g_keyS = false; break;
+            case XK_d: case XK_D: g_keyD = false; break;
+            case XK_q: case XK_Q: g_keyQ = false; break;
+            case XK_e: case XK_E: g_keyE = false; break;
+            default: break;
+            }
+            break;
+        }
+
+        case ButtonPress: {
+            switch (ev.xbutton.button) {
+            case Button1: {
+                // Double-click = focus. A single left press is deliberately
+                // inert: the avatar faces the viewer via the yaw billboard, so
+                // a drag must not rotate it — windows/main.cpp pins the
+                // drag-accumulated yaw and pitch to 0 for the same reason.
+                const unsigned long dt = (unsigned long)(ev.xbutton.time - s_lastClickTime);
+                const bool near = abs(ev.xbutton.x - s_lastClickX) <= kDoubleClickSlopPx &&
+                                  abs(ev.xbutton.y - s_lastClickY) <= kDoubleClickSlopPx;
+                if (s_lastClickTime != 0 && dt <= kDoubleClickMs && near) {
+                    PickFocus(ev.xbutton.x, ev.xbutton.y);
+                    s_lastClickTime = 0;   // a triple-click is not two doubles
+                } else {
+                    s_lastClickTime = ev.xbutton.time;
+                    s_lastClickX = ev.xbutton.x;
+                    s_lastClickY = ev.xbutton.y;
+                }
+                break;
+            }
+            case Button3: {
+                // Right-drag moves the borderless overlay. Decorated windows
+                // have a title bar for that, so the gesture only starts while
+                // undecorated — matching the `active` gate on Windows.
+                if (g_decorated || g_fullscreen) break;
+                if (!StartWmMove(xr.xDisplay, xr.xWindow, ev.xbutton.x_root, ev.xbutton.y_root)) {
+                    Window gRoot; int gx = 0, gy = 0; unsigned int gw, gh, gbw, gd;
+                    if (XGetGeometry(xr.xDisplay, xr.xWindow, &gRoot, &gx, &gy, &gw, &gh, &gbw, &gd)) {
+                        // XGetGeometry reports coordinates relative to the
+                        // parent (the WM frame), so translate to the root.
+                        int rx = 0, ry = 0; Window child;
+                        XTranslateCoordinates(xr.xDisplay, xr.xWindow, gRoot, 0, 0, &rx, &ry, &child);
+                        s_manualDrag = true;
+                        s_dragRootX = ev.xbutton.x_root;
+                        s_dragRootY = ev.xbutton.y_root;
+                        s_dragWinX = rx;
+                        s_dragWinY = ry;
+                    }
+                }
+                break;
+            }
+            case Button4:   // wheel up
+            case Button5: { // wheel down
+                const float factor = (ev.xbutton.button == Button4) ? 1.1f : (1.0f / 1.1f);
+                if ((ev.xbutton.state & ShiftMask) != 0) {
+                    // Shift+wheel drives the 3D-effect strength, the same
+                    // single knob the shared Windows handler exposes.
+                    g_ipdFactor *= factor;
+                    if (g_ipdFactor < 0.0f) g_ipdFactor = 0.0f;
+                    if (g_ipdFactor > 1.0f) g_ipdFactor = 1.0f;
+                    LOG_INFO("3D strength: %.2f (Shift+wheel)", g_ipdFactor);
+                } else {
+                    g_zoomFactor *= factor;
+                    if (g_zoomFactor < 0.1f) g_zoomFactor = 0.1f;
+                    if (g_zoomFactor > 10.0f) g_zoomFactor = 10.0f;
+                }
+                break;
+            }
+            default: break;
+            }
+            break;
+        }
+
+        case ButtonRelease:
+            if (ev.xbutton.button == Button3) s_manualDrag = false;
+            break;
+
+        case MotionNotify:
+            if (s_manualDrag) {
+                // Coalesce: X11 delivers a motion event per pointer sample, and
+                // only the newest one matters for a move.
+                while (XCheckTypedWindowEvent(xr.xDisplay, xr.xWindow, MotionNotify, &ev)) {}
+                XMoveWindow(xr.xDisplay, xr.xWindow,
+                            s_dragWinX + (ev.xmotion.x_root - s_dragRootX),
+                            s_dragWinY + (ev.xmotion.y_root - s_dragRootY));
+            }
+            break;
+
+        case LeaveNotify:
+            // Losing the pointer means losing the keys: a held W that is
+            // released over another window never reaches us, and the avatar
+            // would pan forever.
+            g_keyW = g_keyA = g_keyS = g_keyD = g_keyQ = g_keyE = false;
+            s_manualDrag = false;
+            break;
+
         case ConfigureNotify:
             if (ev.xconfigure.width > 0 && ev.xconfigure.height > 0) {
                 xr.xWinW = (unsigned int)ev.xconfigure.width;
@@ -715,6 +1342,27 @@ static void PumpXEvents(AppXrSession& xr) {
         default: break;
         }
     }
+}
+
+// ── B / F11 ────────────────────────────────────────────────────────────────
+// The decoration toggle also drops the XShape input region (ClickthroughUpdate
+// clears it while decorated), so the whole framed window becomes interactive
+// for move/resize — the same trade windows/main.cpp makes with
+// SetWindowRgn(NULL).
+static void ToggleDecoration(AppXrSession& xr) {
+    if (xr.xDisplay == nullptr || xr.xWindow == 0) return;
+    if (g_fullscreen) return;   // decoration is meaningless in fullscreen
+    g_decorated = !g_decorated;
+    SetMotifDecorations(xr.xDisplay, xr.xWindow, g_decorated);
+    XFlush(xr.xDisplay);
+    LOG_INFO("Window decoration: %s (B)", g_decorated ? "ON (move/resize)" : "OFF (borderless)");
+}
+
+static void ToggleFullscreen(AppXrSession& xr) {
+    if (xr.xDisplay == nullptr || xr.xWindow == 0) return;
+    g_fullscreen = !g_fullscreen;
+    SetNetWmState(xr.xDisplay, xr.xWindow, "_NET_WM_STATE_FULLSCREEN", g_fullscreen);
+    LOG_INFO("%s fullscreen mode (F11)", g_fullscreen ? "Entered" : "Exited");
 }
 
 static bool InitializeOpenXR(AppXrSession& xr) {
@@ -731,6 +1379,7 @@ static bool InitializeOpenXR(AppXrSession& xr) {
     bool hasViewRig = false;
     bool hasLocal3DZone = false;
     bool hasDisplayZones = false;
+    bool hasAtlasCapture = false;
     for (const auto& ext : extensions) {
         if (strcmp(ext.extensionName, XR_KHR_VULKAN_ENABLE_EXTENSION_NAME) == 0) hasVulkan = true;
         if (strcmp(ext.extensionName, XR_DXR_XLIB_WINDOW_BINDING_EXTENSION_NAME) == 0) hasXlibBinding = true;
@@ -738,6 +1387,7 @@ static bool InitializeOpenXR(AppXrSession& xr) {
         if (strcmp(ext.extensionName, XR_DXR_VIEW_RIG_EXTENSION_NAME) == 0) hasViewRig = true;
         if (strcmp(ext.extensionName, XR_DXR_LOCAL_3D_ZONE_EXTENSION_NAME) == 0) hasLocal3DZone = true;
         if (strcmp(ext.extensionName, XR_DXR_DISPLAY_ZONES_EXTENSION_NAME) == 0) hasDisplayZones = true;
+        if (strcmp(ext.extensionName, XR_DXR_ATLAS_CAPTURE_EXTENSION_NAME) == 0) hasAtlasCapture = true;
     }
 
     LOG_INFO("XR_KHR_vulkan_enable: %s", hasVulkan ? "AVAILABLE" : "NOT FOUND");
@@ -747,6 +1397,7 @@ static bool InitializeOpenXR(AppXrSession& xr) {
     LOG_INFO("XR_DXR_view_rig: %s", hasViewRig ? "AVAILABLE" : "NOT FOUND");
     LOG_INFO("XR_DXR_local_3d_zone: %s", hasLocal3DZone ? "AVAILABLE" : "NOT FOUND");
     LOG_INFO("XR_DXR_display_zones: %s", hasDisplayZones ? "AVAILABLE" : "NOT FOUND");
+    LOG_INFO("XR_DXR_atlas_capture: %s", hasAtlasCapture ? "AVAILABLE" : "NOT FOUND");
 
     std::vector<const char*> enabledExtensions;
     enabledExtensions.push_back(XR_KHR_VULKAN_ENABLE_EXTENSION_NAME);
@@ -797,6 +1448,11 @@ static bool InitializeOpenXR(AppXrSession& xr) {
     if (hasDisplayZones) {
         enabledExtensions.push_back(XR_DXR_DISPLAY_ZONES_EXTENSION_NAME);
         g_hasDisplayZones = true;
+    }
+    // The I key. Harmless when absent — the handler says so and does nothing.
+    if (hasAtlasCapture) {
+        enabledExtensions.push_back(XR_DXR_ATLAS_CAPTURE_EXTENSION_NAME);
+        xr.hasAtlasCapture = true;
     }
 
     XrInstanceCreateInfo createInfo = {XR_TYPE_INSTANCE_CREATE_INFO};
@@ -1031,6 +1687,70 @@ static bool CreateVulkanDevice(VkPhysicalDevice physDevice, uint32_t queueFamily
     return true;
 }
 
+/*!
+ * (Re-)read the runtime's rendering-mode table.
+ *
+ * Called once after xrCreateSession to ADOPT whatever mode the panel is already
+ * in (this leg never forces one at startup), and again after every accepted V /
+ * 0-8 request and every XrEventDataRenderingModeChangedDXR, so the submitted
+ * view count and the `isRequestable` gate follow the runtime rather than a
+ * cached guess.
+ */
+static void RefreshRenderingModes(AppXrSession& xr, bool logTable) {
+    if (xr.pfnEnumerateRenderingModes == nullptr || xr.session == XR_NULL_HANDLE) return;
+    uint32_t modeCount = 0;
+    if (XR_FAILED(xr.pfnEnumerateRenderingModes(xr.session, 0, &modeCount, nullptr)) ||
+        modeCount == 0) {
+        return;
+    }
+    std::vector<XrDisplayRenderingModeInfoDXR> modes(modeCount);
+    for (uint32_t i = 0; i < modeCount; i++) {
+        modes[i].type = XR_TYPE_DISPLAY_RENDERING_MODE_INFO_DXR;
+        modes[i].next = nullptr;
+    }
+    if (XR_FAILED(xr.pfnEnumerateRenderingModes(xr.session, modeCount, &modeCount, modes.data()))) {
+        return;
+    }
+    xr.renderingModeCount = modeCount > 8 ? 8 : modeCount;
+    xr.activeRenderingMode = UINT32_MAX;
+    if (logTable) LOG_INFO("Display rendering modes (%u):", modeCount);
+    for (uint32_t i = 0; i < xr.renderingModeCount; i++) {
+        xr.renderingModeViewCounts[i] = modes[i].viewCount;
+        xr.renderingModeIsRequestable[i] = (modes[i].isRequestable == XR_TRUE);
+        if (modes[i].isActive == XR_TRUE) xr.activeRenderingMode = i;
+        if (logTable) {
+            LOG_INFO("  [%u] %s (views=%u, tiles=%ux%u, 3D=%d%s%s)",
+                     modes[i].modeIndex, modes[i].modeName, modes[i].viewCount,
+                     modes[i].tileColumns ? modes[i].tileColumns : 1u,
+                     modes[i].tileRows ? modes[i].tileRows : 1u,
+                     modes[i].hardwareDisplay3D,
+                     modes[i].isActive == XR_TRUE ? ", ACTIVE" : "",
+                     modes[i].isRequestable == XR_TRUE ? "" : ", LOCKED");
+        }
+    }
+}
+
+//! V / 0-8. `isRequestable` is false for a non-controller session under a
+//! workspace, where the controller is the sole mode authority and the runtime
+//! drops app requests — say so rather than looking inert.
+static void RequestRenderingMode(AppXrSession& xr, uint32_t modeIndex, const char* via) {
+    if (xr.pfnRequestRenderingMode == nullptr) {
+        LOG_INFO("%s: xrRequestDisplayRenderingModeDXR unavailable", via);
+        return;
+    }
+    if (modeIndex < xr.renderingModeCount && !xr.renderingModeIsRequestable[modeIndex]) {
+        LOG_INFO("%s: mode %u is locked by the workspace controller", via, modeIndex);
+        return;
+    }
+    const XrResult r = xr.pfnRequestRenderingMode(xr.session, modeIndex);
+    LOG_INFO("Rendering mode -> %u (%s, via %s)", modeIndex,
+             XR_SUCCEEDED(r) ? "OK" : "rejected", via);
+    // The runtime also pushes XrEventDataRenderingModeChangedDXR, but PollEvents
+    // may not run before the next render; re-read now so the submitted view
+    // count follows immediately.
+    if (XR_SUCCEEDED(r)) RefreshRenderingModes(xr, /*logTable=*/false);
+}
+
 static bool CreateSession(AppXrSession& xr, VkInstance vkInstance, VkPhysicalDevice physDevice,
                           VkDevice device, uint32_t queueFamilyIndex) {
     XrGraphicsBindingVulkanKHR vkBinding = {XR_TYPE_GRAPHICS_BINDING_VULKAN_KHR};
@@ -1088,37 +1808,29 @@ static bool CreateSession(AppXrSession& xr, VkInstance vkInstance, VkPhysicalDev
         xrGetInstanceProcAddr(xr.instance, "xrEnumerateDisplayRenderingModesDXR",
                               (PFN_xrVoidFunction*)&xr.pfnEnumerateRenderingModes);
     }
-    if (xr.pfnEnumerateRenderingModes != nullptr) {
-        uint32_t modeCount = 0;
-        if (XR_SUCCEEDED(xr.pfnEnumerateRenderingModes(xr.session, 0, &modeCount, nullptr)) &&
-            modeCount > 0) {
-            std::vector<XrDisplayRenderingModeInfoDXR> modes(modeCount);
-            for (uint32_t i = 0; i < modeCount; i++) {
-                modes[i].type = XR_TYPE_DISPLAY_RENDERING_MODE_INFO_DXR;
-                modes[i].next = nullptr;
-            }
-            if (XR_SUCCEEDED(xr.pfnEnumerateRenderingModes(xr.session, modeCount, &modeCount,
-                                                           modes.data()))) {
-                xr.renderingModeCount = modeCount > 8 ? 8 : modeCount;
-                LOG_INFO("Display rendering modes (%u):", modeCount);
-                for (uint32_t i = 0; i < xr.renderingModeCount; i++) {
-                    xr.renderingModeViewCounts[i] = modes[i].viewCount;
-                    if (modes[i].isActive == XR_TRUE) xr.activeRenderingMode = i;
-                    LOG_INFO("  [%u] %s (views=%u, tiles=%ux%u, 3D=%d%s)",
-                             modes[i].modeIndex, modes[i].modeName, modes[i].viewCount,
-                             modes[i].tileColumns ? modes[i].tileColumns : 1u,
-                             modes[i].tileRows ? modes[i].tileRows : 1u,
-                             modes[i].hardwareDisplay3D,
-                             modes[i].isActive == XR_TRUE ? ", ACTIVE" : "");
-                }
-            }
-        }
-    }
+    RefreshRenderingModes(xr, /*logTable=*/true);
     if (xr.activeRenderingMode != UINT32_MAX && xr.activeRenderingMode < xr.renderingModeCount) {
         LOG_INFO("Adopting runtime's active rendering mode: %u (views=%u)",
                  xr.activeRenderingMode, xr.renderingModeViewCounts[xr.activeRenderingMode]);
     } else {
         LOG_INFO("Runtime named no active rendering mode — assuming the 2-view default");
+    }
+
+    // V / 0-8 (mode switching) and T (eye-tracking mode) both live behind
+    // XR_DXR_display_info. Unresolved is not fatal: the key handlers say so.
+    if (xr.hasDisplayInfo) {
+        xrGetInstanceProcAddr(xr.instance, "xrRequestDisplayRenderingModeDXR",
+                              (PFN_xrVoidFunction*)&xr.pfnRequestRenderingMode);
+        xrGetInstanceProcAddr(xr.instance, "xrRequestEyeTrackingModeDXR",
+                              (PFN_xrVoidFunction*)&xr.pfnRequestEyeTrackingMode);
+    }
+    if (xr.hasAtlasCapture) {
+        xrGetInstanceProcAddr(xr.instance, "xrCaptureAtlasDXR",
+                              (PFN_xrVoidFunction*)&xr.pfnCaptureAtlas);
+        if (xr.pfnCaptureAtlas == nullptr) {
+            LOG_WARN("xrCaptureAtlasDXR unresolved — the I key is inert");
+            xr.hasAtlasCapture = false;
+        }
     }
     return true;
 }
@@ -1228,6 +1940,15 @@ static bool PollEvents(AppXrSession& xr) {
         case XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING:
             xr.exitRequested = true;
             break;
+        case (XrStructureType)XR_TYPE_EVENT_DATA_RENDERING_MODE_CHANGED_DXR: {
+            // Someone changed the mode — us via V / 0-8, or the workspace
+            // controller. Re-read the table so the submitted view count and the
+            // isRequestable gate follow rather than going stale.
+            auto* e = (XrEventDataRenderingModeChangedDXR*)&event;
+            LOG_INFO("Rendering mode changed: %u -> %u", e->previousModeIndex, e->currentModeIndex);
+            RefreshRenderingModes(xr, /*logTable=*/false);
+            break;
+        }
         default: break;
         }
         event = {XR_TYPE_EVENT_DATA_BUFFER};
@@ -1650,6 +2371,69 @@ static bool TryActivateTigerZone(AppXrSession& xr) {
     return true;
 }
 
+// ============================================================================
+// Per-frame view state shared by the render paths, the click-through pass and
+// the XR_DXR_depth_budget content mask
+// ============================================================================
+static constexpr uint32_t kMaxViews = 8;
+
+//! Whatever the frame's render path produced: the matrices it drew with, the
+//! per-view shader far-cull dxr::ResolveClipPlanes resolved, and the client-px
+//! rect the 3D content occupies. The silhouette pass re-renders the outermost
+//! two from this, and the content mask is placed through `contentRect`.
+struct FrameViews {
+    uint32_t count = 0;
+    float view[kMaxViews][16] = {};
+    float proj[kMaxViews][16] = {};
+    float projUnres[kMaxViews][16] = {};
+    float clipFar[kMaxViews] = {};
+    XrRect2Di contentRect = {{0, 0}, {0, 0}};
+};
+
+/*!
+ * Fill one view's matrices from the runtime's render-ready pose/fov.
+ *
+ * Foreground-only clip: far = the eye→display distance, so the far plane
+ * coincides with the virtual display plane and only popping-out content shows
+ * over the desktop. The coverage pass gets its OWN unrestricted-far projection
+ * (runtime#1470) — the rasterizer's NDC z > 1 clip is a second clip the
+ * fragment shader cannot see.
+ */
+static void FillFrameView(FrameViews& fv, uint32_t i, const XrView& v,
+                          const float rigPos[3], float vHeight) {
+    (void)vHeight;
+    mat4_view_from_xr_pose(fv.view[i], v.pose);
+    const float ez = fabsf(v.pose.position.z - rigPos[2]);
+    const float farZ = (ez > 0.02f) ? ez : 100.0f;
+    mat4_from_xr_fov(fv.proj[i], v.fov, 0.01f, farZ);
+    mat4_from_xr_fov(fv.projUnres[i], v.fov, 0.01f, 100.0f);
+    // mat4_from_xr_fov emits GL [-1,1] clip depth; Vulkan clips [0,1].
+    convert_projection_gl_to_zero_to_one(fv.proj[i]);
+    convert_projection_gl_to_zero_to_one(fv.projUnres[i]);
+    fv.clipFar[i] = 0.0f;
+}
+
+//! Publish the frame's CENTRE view/projection + content rect for the
+//! double-click focus ray. The centre is the view centroid (the views are
+//! spread about the rig centre) with view 0's orientation and fov — close
+//! enough for a pick ray, and the same approximation the Windows leg makes.
+static void PublishPickMatrices(const FrameViews& fv, const XrView* views, uint32_t n) {
+    if (n == 0) { g_pickValid = false; return; }
+    XrPosef centre = views[0].pose;
+    if (n >= 2) {
+        centre.position.x = (views[0].pose.position.x + views[n - 1].pose.position.x) * 0.5f;
+        centre.position.y = (views[0].pose.position.y + views[n - 1].pose.position.y) * 0.5f;
+        centre.position.z = (views[0].pose.position.z + views[n - 1].pose.position.z) * 0.5f;
+    }
+    mat4_view_from_xr_pose(g_pickView, centre);
+    memcpy(g_pickProj, fv.proj[0], sizeof(g_pickProj));
+    g_pickZoneX = fv.contentRect.offset.x;
+    g_pickZoneY = fv.contentRect.offset.y;
+    g_pickZoneW = fv.contentRect.extent.width;
+    g_pickZoneH = fv.contentRect.extent.height;
+    g_pickValid = (g_pickZoneW > 0 && g_pickZoneH > 0);
+}
+
 // Per-frame tiger-zone render: zone rect = bottom kAvatarCanvasFrac (75%) of the
 // window; the avatar renders rig-framed INTO that rect (runtime Kooima via the
 // zone-scoped locate) — no squish, 3D kept out of the top band. Fills projViews
@@ -1659,9 +2443,8 @@ static bool TryActivateTigerZone(AppXrSession& xr) {
 // windows/main.cpp's zones branch + the cube_zones_vk_linux locate/render loop.
 static bool RenderTigerZone(AppXrSession& xr, const XrFrameState& frameState,
                             std::vector<XrCompositionLayerProjectionView>& projViews,
-                            XrDisplayZoneDXR& outZone,
-                            float silView[16], float silProj[16], bool& haveSil) {
-    haveSil = false;
+                            XrDisplayZoneDXR& outZone, FrameViews& fv) {
+    fv.count = 0;
     if (g_zoneSwapchain == XR_NULL_HANDLE || g_zoneSwW == 0 || g_zoneSwH == 0) return false;
 
     // Live client-window size (fixed portrait, but query so a resize tracks).
@@ -1682,8 +2465,10 @@ static bool RenderTigerZone(AppXrSession& xr, const XrFrameState& frameState,
     rig.pose.orientation = {0.0f, 0.0f, 0.0f, 1.0f};
     float rigPos[3]; ComputeRigPosition(rigPos);
     rig.pose.position = {rigPos[0], rigPos[1], rigPos[2]};
-    rig.virtualDisplayHeight = g_fitValid ? g_fitVHeight : kFallbackVHeightM;
-    rig.ipdFactor = 1.0f; rig.parallaxFactor = 1.0f; rig.perspectiveFactor = 1.0f;
+    rig.virtualDisplayHeight = CurrentVHeight();   // auto-fit ÷ wheel zoom
+    // ipd and parallax move together — the one "3D effect strength" knob the
+    // shared Windows input handler exposes on -/+ and Shift+wheel.
+    rig.ipdFactor = g_ipdFactor; rig.parallaxFactor = g_ipdFactor; rig.perspectiveFactor = 1.0f;
 
     outZone = {(XrStructureType)XR_TYPE_DISPLAY_ZONE_DXR};
     outZone.next = &rig;                 // rig chained for the locate (framing)
@@ -1716,9 +2501,9 @@ static bool RenderTigerZone(AppXrSession& xr, const XrFrameState& frameState,
     locateInfo.space = xr.localSpace;
     XrViewState viewState = {XR_TYPE_VIEW_STATE};
     uint32_t viewCountOut = 0;
-    XrView zoneViews[8];
-    for (uint32_t i = 0; i < 8; i++) zoneViews[i] = {XR_TYPE_VIEW};
-    if (XR_FAILED(xrLocateViews(xr.session, &locateInfo, &viewState, 8, &viewCountOut, zoneViews)) ||
+    XrView zoneViews[kMaxViews];
+    for (uint32_t i = 0; i < kMaxViews; i++) zoneViews[i] = {XR_TYPE_VIEW};
+    if (XR_FAILED(xrLocateViews(xr.session, &locateInfo, &viewState, kMaxViews, &viewCountOut, zoneViews)) ||
         viewCountOut == 0) {
         static bool s_warned = false;
         if (!s_warned) { s_warned = true; LOG_WARN("[zones] zone-scoped xrLocateViews failed — full-tile fallback"); }
@@ -1753,38 +2538,22 @@ static bool RenderTigerZone(AppXrSession& xr, const XrFrameState& frameState,
         return false;
     }
 
+    const float vHeight = rig.virtualDisplayHeight;
+
+    fv.count = n;
+    fv.contentRect = outZone.rect;
     projViews.assign(n, {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW});
     for (uint32_t i = 0; i < n; i++) {
-        float viewMat[16], projMat[16];
-        mat4_view_from_xr_pose(viewMat, zoneViews[i].pose);
-        // Same foreground-clip recipe as the full-tile path: far = eye→display
-        // distance (display plane at the model center); GL depth → Vulkan [0,1].
-        float ez = fabsf(zoneViews[i].pose.position.z - g_fitCenter[2]);
-        float farZ = (ez > 0.02f) ? ez : 100.0f;
-        mat4_from_xr_fov(projMat, zoneViews[i].fov, 0.01f, farZ);
-        convert_projection_gl_to_zero_to_one(projMat);
-        // runtime#1470: the content-mask coverage pass gets its own projection
-        // with the far plane unrestricted — the rasterizer's NDC z > 1 clip is
-        // a second, budget-dependent clip the fragment shader cannot see.
-        float projMatUnres[16];
-        mat4_from_xr_fov(projMatUnres, zoneViews[i].fov, 0.01f, 100.0f);
-        convert_projection_gl_to_zero_to_one(projMatUnres);
+        FillFrameView(fv, i, zoneViews[i], rigPos, vHeight);
         ModelRenderer::MaskProjections mp;
-        mp.unrestricted = projMatUnres;
-        mp.testRestricted = projMat;
-        mp.testUnrestrictedReal = projMatUnres;
-        if (i == 0) {
-            memcpy(silView, viewMat, 16 * sizeof(float));
-            memcpy(silProj, projMat, 16 * sizeof(float));
-            haveSil = true;
-        }
+        mp.unrestricted = fv.projUnres[i];
         // Render the avatar into this eye's tile of the zone swapchain.
         g_modelRenderer.renderEye(
             g_zoneImages[imageIndex].image, (VkFormat)xr.swapchain.format,
             g_zoneSwW, g_zoneSwH,
             i * tileW, 0, tileW, tileH,
-            viewMat, projMat, /*transparentBg*/ true,
-            /*clipFarViewSpace=*/0.0f, /*edgeFadePx=*/0.0f, &mp);
+            fv.view[i], fv.proj[i], g_transparentBg,
+            fv.clipFar[i], /*edgeFadePx=*/0.0f, &mp);
 
         projViews[i].type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
         projViews[i].subImage.swapchain = g_zoneSwapchain;
@@ -1796,6 +2565,7 @@ static bool RenderTigerZone(AppXrSession& xr, const XrFrameState& frameState,
     }
     XrSwapchainImageReleaseInfo ri = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
     xrReleaseSwapchainImage(g_zoneSwapchain, &ri);
+    PublishPickMatrices(fv, zoneViews, n);
     return true;
 }
 
@@ -1939,13 +2709,23 @@ int main(int argc, char** argv) {
 
     while (g_running && !xr.exitRequested) {
         PollEvents(xr);
-        PumpXEvents(xr);   // O / Ctrl+O = open-file dialog
+        PumpXEvents(xr);   // keyboard + mouse (see the control table there)
         PollFilePicker();  // async zenity result → loadModel + auto-fit
 
         auto now = std::chrono::high_resolution_clock::now();
         float dt = std::chrono::duration<float>(now - lastTime).count();
         lastTime = now;
+
+        // Frame boundary for the renderer's per-view ring. MUST precede
+        // updateAnimation: that rewrites the joint-matrix SSBO, which the
+        // previous frame's views may still be reading — renderEye does not
+        // drain the queue after each view. It is also what folds the
+        // content-mask coverage readbacks in (see beginContentMaskFrame).
+        // This leg never called it, so every kRingSlots-th renderEye fell back
+        // to a full queue drain and the coverage pass could never publish.
+        g_modelRenderer.beginFrame();
         g_modelRenderer.updateAnimation(dt);
+        UpdateInteractive(dt, xr.displayHeightM);   // WASD/QE pan, focus ease
 
         if (!xr.sessionRunning) { usleep(100000); continue; }
 
@@ -1960,6 +2740,9 @@ int main(int argc, char** argv) {
         // Persists locate→submit: chained on the projection layer at xrEndFrame.
         XrDisplayZoneDXR tigerZone = {(XrStructureType)XR_TYPE_DISPLAY_ZONE_DXR};
         std::vector<XrCompositionLayerProjectionView> projViews;
+        // What this frame drew with: consumed after the render by the
+        // click-through silhouette pass and the depth-budget content mask.
+        FrameViews fv;
 
         if (frameState.shouldRender) {
             // Lazily activate the tiger-zone once the session + window are up
@@ -1968,27 +2751,8 @@ int main(int argc, char** argv) {
 
             // ── Tiger-zone path: avatar confined to the bottom-75% zone rect ──
             if (g_zonesActive) {
-                float zSilView[16], zSilProj[16];
-                bool zHaveSil = false;
-                zonesFrame = RenderTigerZone(xr, frameState, projViews, tigerZone,
-                                             zSilView, zSilProj, zHaveSil);
+                zonesFrame = RenderTigerZone(xr, frameState, projViews, tigerZone, fv);
                 rendered = zonesFrame;
-                // Click-through silhouette (throttled), same as the full-tile path.
-                if (zonesFrame && xr.usingAppWindow && zHaveSil) {
-                    static uint32_t s_zClickFrame = 0;
-                    constexpr uint32_t kClickUpdateEveryN = 15; // ~4 Hz at 60 fps
-                    if ((s_zClickFrame++ % kClickUpdateEveryN) == 0) {
-                        unsigned int cw = xr.xWinW, ch = xr.xWinH;
-                        Window gRoot; int gx, gy; unsigned int gw, gh, gbw, gd;
-                        if (XGetGeometry(xr.xDisplay, xr.xWindow, &gRoot, &gx, &gy,
-                                         &gw, &gh, &gbw, &gd) && gw > 0 && gh > 0) {
-                            cw = gw; ch = gh;
-                        }
-                        ClickthroughUpdate(vkDevice, physDevice, graphicsQueue, queueFamilyIndex,
-                                           g_modelRenderer, xr.xDisplay, xr.xWindow, cw, ch,
-                                           zSilView, zSilProj);
-                    }
-                }
             }
 
             // ── Full-tile fallback path (zones inactive / a transient zone-frame
@@ -2014,9 +2778,9 @@ int main(int argc, char** argv) {
             displayRig.pose.orientation = {0.0f, 0.0f, 0.0f, 1.0f};
             float dispRigPos[3]; ComputeRigPosition(dispRigPos);
             displayRig.pose.position = {dispRigPos[0], dispRigPos[1], dispRigPos[2]};
-            displayRig.virtualDisplayHeight = g_fitValid ? g_fitVHeight : kFallbackVHeightM;
-            displayRig.ipdFactor = 1.0f;
-            displayRig.parallaxFactor = 1.0f;
+            displayRig.virtualDisplayHeight = CurrentVHeight();   // auto-fit ÷ wheel zoom
+            displayRig.ipdFactor = g_ipdFactor;       // -/+ and Shift+wheel, in lockstep
+            displayRig.parallaxFactor = g_ipdFactor;
             displayRig.perspectiveFactor = 1.0f;
             // Only chain the rig when display_info actually gave us panel dims —
             // the runtime needs them for the window-relative Kooima. Matches
@@ -2105,53 +2869,32 @@ int main(int argc, char** argv) {
                         if (eyeW > xr.swapchain.width / eyeCount) eyeW = xr.swapchain.width / eyeCount;
                         if (eyeH > xr.swapchain.height) eyeH = xr.swapchain.height;
                         projViews.resize(eyeCount, {});
-                        float silView[16], silProj[16];
-                        bool haveSil = false;
+                        const float vHeight = displayRig.virtualDisplayHeight;
+                        float rigPos[3];
+                        ComputeRigPosition(rigPos);
+                        fv.count = (eyeCount < kMaxViews) ? eyeCount : kMaxViews;
+                        // No zone on this path: the avatar occupies the whole tile,
+                        // so the content rect is the whole window.
+                        fv.contentRect.offset = {0, 0};
+                        fv.contentRect.extent = {(int32_t)(winW > 0 ? winW : eyeW),
+                                                 (int32_t)(winH > 0 ? winH : eyeH)};
                         for (uint32_t i = 0; i < eyeCount; i++) {
-                            float viewMat[16], projMat[16];
                             // Render at native model scale — the rig (placed at the
                             // model center, sized to the model) owns the framing. No
                             // model-fit baked into the view.
-                            mat4_view_from_xr_pose(viewMat, views[i].pose);
-                            // Foreground clip (well-defined, no magic numbers): far =
-                            // eye→display distance, so the far plane coincides with the
-                            // virtual display plane (placed at the model center). ez =
-                            // the eye's z relative to the rig pose (identity orientation
-                            // → z difference). Avatar renders in front of the display;
-                            // desktop shows behind via compose-under-bg. Falls back to a
-                            // far plane if the rig is absent / z degenerate.
-                            float ez = fabsf(views[i].pose.position.z - g_fitCenter[2]);
-                            float farZ = (ez > 0.02f) ? ez : 100.0f;
-                            mat4_from_xr_fov(projMat, views[i].fov, 0.01f, farZ);
-                            // mat4_from_xr_fov emits GL [-1,1] clip-depth; Vulkan
-                            // clips [0,1], so remap or the avatar is near-clipped
-                            // whenever the near sits close to the content
-                            // (invisible windowed). displayxr-common shared fn,
-                            // exactly like cube_handle_vk_linux + the win/mac peers.
-                            convert_projection_gl_to_zero_to_one(projMat);
-                            // runtime#1470: unrestricted-far projection for the
-                            // content-mask coverage pass (see MaskProjections).
-                            float projMatUnres[16];
-                            mat4_from_xr_fov(projMatUnres, views[i].fov, 0.01f, 100.0f);
-                            convert_projection_gl_to_zero_to_one(projMatUnres);
+                            const uint32_t fi = (i < kMaxViews) ? i : kMaxViews - 1;
+                            FillFrameView(fv, fi, views[i], rigPos, vHeight);
                             ModelRenderer::MaskProjections mp;
-                            mp.unrestricted = projMatUnres;
-                            mp.testRestricted = projMat;
-                            mp.testUnrestrictedReal = projMatUnres;
-                            if (i == 0) { // view 0 drives the click-through silhouette
-                                memcpy(silView, viewMat, sizeof(silView));
-                                memcpy(silProj, projMat, sizeof(silProj));
-                                haveSil = true;
-                            }
+                            mp.unrestricted = fv.projUnres[fi];
                             // Draw the avatar into this eye's SBS viewport region.
                             g_modelRenderer.renderEye(
                                 swapchainImages[imageIndex].image,
                                 (VkFormat)xr.swapchain.format,
                                 xr.swapchain.width, xr.swapchain.height,
                                 i * eyeW, 0, eyeW, eyeH,
-                                viewMat, projMat,
-                                /*transparentBg*/ true,
-                                /*clipFarViewSpace=*/0.0f, /*edgeFadePx=*/0.0f, &mp);
+                                fv.view[fi], fv.proj[fi],
+                                g_transparentBg,
+                                fv.clipFar[fi], /*edgeFadePx=*/0.0f, &mp);
 
                             projViews[i].type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
                             projViews[i].subImage.swapchain = xr.swapchain.swapchain;
@@ -2163,42 +2906,69 @@ int main(int argc, char** argv) {
                         }
                         XrSwapchainImageReleaseInfo relInfo = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
                         xrReleaseSwapchainImage(xr.swapchain.swapchain, &relInfo);
-
-                        // Refresh the click-through input region from the avatar
-                        // silhouette (view 0). THROTTLED: the silhouette re-render +
-                        // GPU readback is expensive (it churns the renderer's 4K MSAA
-                        // targets — measured ~8x FPS hit at 60Hz), and the region
-                        // changes slowly with the animation. ~4 Hz is plenty and keeps
-                        // the frame loop at refresh. Only meaningful with an app-owned
-                        // window; a no-op otherwise.
-                        static uint32_t s_clickFrame = 0;
-                        constexpr uint32_t kClickUpdateEveryN = 15; // ~4 Hz at 60 fps
-                        if (xr.usingAppWindow && haveSil && (s_clickFrame++ % kClickUpdateEveryN) == 0) {
-                            // FLAG 1 fix (Suki, on-panel): the window is created at
-                            // DisplayWidth/Height (the WHOLE X screen — 7680x2400 across eDP-1 +
-                            // DP-1), but the runtime repositions/resizes the overlay onto the
-                            // target output (RandR panel override -> DS1 3840x2160). xr.xWinW/xWinH
-                            // hold the stale creation size, so the input region was scaled to the
-                            // root (non-uniform 12x/6.67x) and shoved off the real window -> every
-                            // click fell through. Query the ACTUAL geometry (throttled ~4 Hz, so
-                            // XGetGeometry cost is nil). xWinW/xWinH has no other consumer, so this
-                            // call-site query is the complete fix (no ConfigureNotify tracking).
-                            unsigned int cw = xr.xWinW, ch = xr.xWinH;
-                            {
-                                Window gRoot; int gx, gy; unsigned int gw, gh, gbw, gd;
-                                if (XGetGeometry(xr.xDisplay, xr.xWindow, &gRoot, &gx, &gy,
-                                                 &gw, &gh, &gbw, &gd) && gw > 0 && gh > 0) {
-                                    cw = gw; ch = gh;
-                                }
-                            }
-                            ClickthroughUpdate(vkDevice, physDevice, graphicsQueue, queueFamilyIndex,
-                                               g_modelRenderer, xr.xDisplay, xr.xWindow, cw, ch,
-                                               silView, silProj);
-                        }
+                        PublishPickMatrices(fv, views.data(), eyeCount);
                     }
                 }
             }
             } // end if (!zonesFrame) — full-tile fallback path
+        }
+
+        // ── Live client geometry, queried ONCE per frame ────────────────────
+        // On the app-owned path the runtime repositions/resizes the overlay
+        // onto the target panel without a ConfigureNotify, so xr.xWinW/xWinH
+        // hold the stale creation size. Everything below (the click-through
+        // region, the content mask, the bubble band) needs the real rect.
+        unsigned int winPxW = xr.xWinW, winPxH = xr.xWinH;
+        if (xr.usingAppWindow && xr.xDisplay != nullptr && xr.xWindow != 0) {
+            Window gRoot; int gx, gy; unsigned int gw, gh, gbw, gd;
+            if (XGetGeometry(xr.xDisplay, xr.xWindow, &gRoot, &gx, &gy, &gw, &gh, &gbw, &gd) &&
+                gw > 0 && gh > 0) {
+                winPxW = gw; winPxH = gh;
+            }
+        }
+        if (winPxW == 0 || winPxH == 0) { winPxW = xr.viewWidth; winPxH = xr.viewHeight; }
+        const int bubbleBandW = (int)winPxW;
+        const int bubbleBandH = (winPxH > 0) ? (int)((float)winPxH * (1.0f - kAvatarCanvasFrac)) : 1;
+        const bool bubbleWillSubmit = rendered && g_bubbleReady && g_hasLocal3DZone &&
+                                      xr.usingAppWindow && bubbleCmdPool != VK_NULL_HANDLE;
+
+        // ── Click-through region + XR_DXR_depth_budget content mask ─────────
+        // Runs EVERY frame now. It used to be throttled to ~4 Hz because the
+        // readback was a synchronous vkQueueWaitIdle; it is pipelined behind a
+        // fence and HOST_CACHED, and the region is not only a hit mask — the
+        // XShape input region decides where the window exists at all, so a
+        // stale one clips the leading edge of a moving avatar.
+        if (rendered && xr.usingAppWindow && fv.count > 0) {
+            ClickthroughParams cp;
+            cp.dev = vkDevice;
+            cp.phys = physDevice;
+            cp.queue = graphicsQueue;
+            cp.queueFamily = queueFamilyIndex;
+            cp.renderer = &g_modelRenderer;
+            cp.dpy = xr.xDisplay;
+            cp.win = xr.xWindow;
+            cp.winW = winPxW;
+            cp.winH = winPxH;
+            cp.viewMats = fv.view;
+            cp.projMats = fv.proj;
+            cp.projMatsUnres = fv.projUnres;
+            cp.clipFars = fv.clipFar;
+            cp.numViews = fv.count;
+            // Where the avatar actually is: the zone rect on the zones path,
+            // the whole window on the full-tile fallback.
+            cp.avatarFrac = (winPxH > 0 && fv.contentRect.extent.height > 0)
+                                ? (float)fv.contentRect.extent.height / (float)winPxH
+                                : 1.0f;
+            if (cp.avatarFrac <= 0.0f || cp.avatarFrac > 1.0f) cp.avatarFrac = 1.0f;
+            cp.transparentBg = g_transparentBg;
+            cp.decorated = g_decorated;
+            cp.bubbleVisible = bubbleWillSubmit;
+            cp.bubbleX = 0;
+            cp.bubbleY = 0;
+            cp.bubbleW = bubbleBandW;
+            cp.bubbleH = bubbleBandH;
+            ClickthroughUpdate(cp);
+
         }
 
         XrFrameEndInfo endInfo = {XR_TYPE_FRAME_END_INFO};
@@ -2236,23 +3006,11 @@ int main(int argc, char** argv) {
             // so xrEndFrame accepts the frame — see the swapchain-create comment.
             if (g_bubbleReady && g_hasLocal3DZone && xr.usingAppWindow &&
                 bubbleCmdPool != VK_NULL_HANDLE) {
-                // Client-window pixel dims for the band rect. On the app-owned
-                // path the runtime repositions/resizes the overlay onto the target
-                // panel, so query the ACTUAL geometry (xr.xWinW/xWinH hold the
-                // stale creation size); fall back to the creation size, then the
-                // per-view dims for the hosted-NULL path.
-                unsigned int winW = xr.xWinW, winH = xr.xWinH;
-                if (xr.usingAppWindow && xr.xDisplay != nullptr && xr.xWindow != 0) {
-                    Window gRoot; int gx, gy; unsigned int gw, gh, gbw, gd;
-                    if (XGetGeometry(xr.xDisplay, xr.xWindow, &gRoot, &gx, &gy,
-                                     &gw, &gh, &gbw, &gd) && gw > 0 && gh > 0) {
-                        winW = gw; winH = gh;
-                    }
-                }
-                if (winW == 0 || winH == 0) { winW = xr.viewWidth; winH = xr.viewHeight; }
-
-                const int bandH = (winH > 0) ? (int)((float)winH * (1.0f - kAvatarCanvasFrac)) : 1;
-                const int bandW = (int)winW;
+                // Band rect from the once-per-frame geometry query above — the
+                // click-through region unions the SAME rect, so the two cannot
+                // drift apart.
+                const int bandH = bubbleBandH;
+                const int bandW = bubbleBandW;
                 const float bandAR = (float)bandW / (float)(bandH > 0 ? bandH : 1);
                 const float texAR = (float)kBubbleTexW / (float)kBubbleTexH;
                 uint32_t subW, subH;
