@@ -49,7 +49,7 @@ renderer (`model_common/`), specialised into an avatar shell.
 |---|---|
 | `W` / `S` | Dolly the avatar nearer / further in depth (clips at the display plane) |
 | `A` / `D`, `Q` / `E` | Slide the avatar left / right, up / down |
-| Right-click drag | Move the borderless window |
+| Right-click drag | Move the borderless window (phase-snapped to the lens lattice so the 3D holds while dragging) |
 | Double-click | Focus / re-pose toward the picked surface point |
 | Scroll | Zoom (virtual-display height) |
 | `Shift`+scroll, `-` / `+` | 3D-effect strength (IPD + parallax, in lockstep) |
@@ -74,6 +74,12 @@ this table claimed otherwise.)
 The same set is wired on Windows, macOS and Linux except where a platform has
 no equivalent — the Linux leg has no on-panel HUD or toast chips, no
 drag-and-drop model load (`Ctrl+O` covers it) and no `C` camera-rig round-trip.
+
+On Linux (X11) the right-click window drag is owned by the app, not the window
+manager: every step goes through the runtime's `xrWeaveSnapWindowRectDXR`
+(`XR_DXR_weave`) so the window only lands on positions where the weave phase is
+unchanged. A window-manager move (the `B` title bar) cannot be snapped on X11
+and will make the 3D shimmer while it moves.
 
 There is **no in-app model-load UI** — the avatar auto-loads its bundled tiger.
 Pass a model path as the first CLI argument to float a different character
