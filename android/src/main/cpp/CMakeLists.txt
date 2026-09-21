@@ -45,6 +45,22 @@ FetchContent_Declare(stb
     GIT_TAG        master)
 FetchContent_MakeAvailable(stb)
 
+# ── displayxr-common (header-only rules: dxr_view_config.h) ──────────────
+# DxrSelectViewConfigType + DxrAliasInactiveViews (ADR-041) — the ONE shared
+# implementation the desktop legs reach through sr_common_base. Sources only:
+# its CMake builds a STATIC lib with desktop platform deps, so it is not run
+# here; the header-only common/ dir is appended to the include path below.
+# TODO(runtime #1612): TEMPORARY pin to displayxr-common PR #50's commit. Repin to the release tag that contains DxrAliasInactiveViews (and restore GIT_SHALLOW TRUE) BEFORE this PR merges.
+# Keep equal to the pin in common/CMakeLists.txt.
+FetchContent_Declare(displayxr_common_rules
+    GIT_REPOSITORY https://github.com/DisplayXR/displayxr-common.git
+    GIT_TAG        7a5acac5b15b6826cd88aa9ef616a8b480270bed
+    GIT_SHALLOW    FALSE)
+FetchContent_GetProperties(displayxr_common_rules)
+if(NOT displayxr_common_rules_POPULATED)
+    FetchContent_Populate(displayxr_common_rules)
+endif()
+
 # ── PBR/IBL shaders → SPIR-V header arrays ────────────────────────────────
 find_program(GLSLANGVALIDATOR_COMMAND glslangValidator)
 if(NOT GLSLANGVALIDATOR_COMMAND)
@@ -101,10 +117,10 @@ target_include_directories(avatar_vk_android PRIVATE
     ${glm_SOURCE_DIR}                           # glm/ (header-only)
     ${stb_SOURCE_DIR}                           # stb_truetype.h (button bar)
     ${REPO_ROOT}/openxr_includes                 # DisplayXR XR_DXR_* headers
-    ${REPO_ROOT}/common)                        # dxr_view_config.h / dxr_submit_views.h
-                                                # (the other legs get common/ via
-                                                #  sr_common_base or their own
-                                                #  target_include_directories)
+    ${REPO_ROOT}/common                         # dxr_submit_views.h (the other legs
+                                                #  get common/ via sr_common_base)
+    ${displayxr_common_rules_SOURCE_DIR}/common) # dxr_view_config.h (displayxr-common;
+                                                #  LAST, so no local header is shadowed)
 
 set_target_properties(avatar_vk_android PROPERTIES
     LINK_FLAGS "-u ANativeActivity_onCreate")

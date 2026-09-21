@@ -32,7 +32,7 @@
 #include <openxr/XR_DXR_atlas_capture.h>
 #include <openxr/XR_DXR_mcp_tools.h>
 #include <openxr/XR_DXR_local_3d_zone.h>   // XrCompositionLayerLocal2DDXR (speech bubble)
-#include "../common/dxr_view_config.h"   // DxrSelectViewConfigType (runtime #1486)
+#include "dxr_view_config.h"   // displayxr-common: DxrSelectViewConfigType (#1486) + DxrAliasInactiveViews (ADR-041)
 #include "dxr_submit_views.h"              // DxrClampSubmitViewCount — INV-3.1 submit gate
 
 #include <cmath>
@@ -3358,6 +3358,22 @@ int main(int argc, char** argv) {
                             }
 
                             ReleaseSwapchainImage(xr);
+
+                            // ADR-041 (runtime #1612): the layer carries EVERY
+                            // located view, not only the eyeCount rendered ones.
+                            // Under PRIMARY_MULTIVIEW_DXR xrEndFrame rejects a
+                            // shorter layer, so a 2D (1-view) frame was dropped
+                            // outright and the panel kept the last woven 3D frame
+                            // (a frozen double image). Alias the unrendered tail
+                            // onto view 0's subimage; each keeps its own located
+                            // pose/fov. The per-eye matrices above stay eyeCount
+                            // long — only the submitted layer grows.
+                            if ((uint32_t)eyeCount < runtimeViewCount) {
+                                projectionViews.resize(runtimeViewCount,
+                                                       {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW});
+                                DxrAliasInactiveViews(projectionViews.data(), views, runtimeViewCount,
+                                                      (uint32_t)eyeCount);
+                            }
 
                             // Update the click-through silhouette from the same
                             // per-view matrices we just drew (so the hit mask

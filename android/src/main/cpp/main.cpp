@@ -42,9 +42,11 @@
 // Runtime #1486/#1500: PRIMARY_STEREO reports exactly 2 views and xrEndFrame
 // rejects a projection layer that carries more. DxrSelectViewConfigType picks
 // XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR when the runtime advertises
-// it; DxrClampSubmitViewCount is the INV-3.1 submit gate. (Both come from
-// <repo>/common, which android/src/main/cpp/CMakeLists.txt puts on the include
-// path alongside the other legs.)
+// it; DxrClampSubmitViewCount bounds how many views are RENDERED (INV-3.1).
+// ADR-041: the layer still carries every LOCATED view — DxrAliasInactiveViews
+// points the unrendered tail at view 0's subimage. dxr_view_config.h is
+// displayxr-common's (the one implementation; android/src/main/cpp/
+// CMakeLists.txt fetches it), dxr_submit_views.h is this repo's <repo>/common.
 #include "dxr_view_config.h"
 #include "dxr_submit_views.h"
 
@@ -2306,6 +2308,17 @@ render_frame()
 				log_xr_result("xrAcquire/WaitSwapchainImage", res);
 			}
 			rendered = (res == XR_SUCCESS);
+			// ADR-041 (runtime #1612): the layer carries EVERY located view, not
+			// only the `view_count` rendered ones. Under PRIMARY_MULTIVIEW_DXR
+			// xrEndFrame rejects a shorter layer, so a 2D (1-view) frame was
+			// dropped outright and the panel kept the last woven 3D frame — a
+			// frozen double image. Alias the unrendered tail onto view 0's
+			// subimage; each aliased view keeps its own located pose/fov.
+			if (rendered && view_count > 0 && view_count < located) {
+				const uint32_t located_cap = located < kViewCount ? located : kViewCount;
+				DxrAliasInactiveViews(projection_views, views, located_cap, view_count);
+				submitted_view_count = located_cap;
+			}
 			// Refresh the gesture/click-through silhouette (throttled ~10 Hz —
 			// the tiger moves slowly and only touch-DOWN samples it; each tick is
 			// 1-2 extra downscaled model draws + a readback). Zone frames only.

@@ -40,6 +40,7 @@
 #include "content_bounds.h"  // dxr::ProjectAabbToWindowBounds / ChainContentBounds (#81 v2; #82 zone rebase)
 #include "content_mask.h"    // dxr::ContentMaskFromCoverage / ChainContentMask (#81 v3 silhouette ROI)
 #include "dxr_submit_views.h" // DxrClampSubmitViewCount — INV-3.1 submit gate (runtime #1486/#1500)
+#include "dxr_view_config.h"   // displayxr-common: DxrAliasInactiveViews (ADR-041, runtime #1612)
 
 #include "hud_renderer.h"   // HudRenderer + text_overlay (RenderFilledRect/RenderText) — drive the speech bubble
 #include "atlas_capture.h"
@@ -2837,6 +2838,8 @@ static void RenderThreadFunc(
                 // recomputing the mode count at submit time is how a frame ends
                 // up claiming views it never rendered (and, since #1500, failing
                 // xrEndFrame outright). 0 until the eye loop has run.
+                // ADR-041: after the eye loop this is the LOCATED count — the
+                // rendered views plus the aliased inactive tail.
                 uint32_t submittedViewCount = 0;
 
                 // Display zones: the SAME XrDisplayZoneDXR instance chains on the
@@ -3644,6 +3647,20 @@ static void RenderThreadFunc(
                                         LOG_WARN("Submit clamp: rendered=%d located=%u tiles=%ux%u -> submitting %u",
                                                  eyeCount, locatedForSubmit, cols, rows, submittedViewCount);
                                     }
+                                }
+                                // ADR-041 (runtime #1612): the layer carries EVERY
+                                // located view, not just the rendered ones. Under
+                                // PRIMARY_MULTIVIEW_DXR xrEndFrame rejects a shorter
+                                // layer, so a 2D frame submitted as 1 view was
+                                // dropped outright — the lens went 2D while the
+                                // window kept the last woven 3D frame (a frozen
+                                // double image). Point the unrendered tail at view
+                                // 0's subimage; each keeps its own located pose/fov.
+                                const uint32_t locatedCap = locatedForSubmit < 8u ? locatedForSubmit : 8u;
+                                if (submittedViewCount > 0 && submittedViewCount < locatedCap) {
+                                    DxrAliasInactiveViews(projectionViews, zonesFrame ? zoneViews : rawViews,
+                                                          locatedCap, submittedViewCount);
+                                    submittedViewCount = locatedCap;
                                 }
                             }
                             if (zonesFrame) ReleaseWindowSpaceImage(g_zoneSwapchain);
