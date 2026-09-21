@@ -88,7 +88,9 @@
 // Runtime #1486/#1500: PRIMARY_STEREO reports exactly 2 views and xrEndFrame
 // rejects a projection layer that carries more. DxrSelectViewConfigType picks
 // XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR when the runtime advertises
-// it; DxrClampSubmitViewCount is the INV-3.1 submit gate.
+// it; DxrClampSubmitViewCount bounds how many views are RENDERED (INV-3.1).
+// ADR-041: the layer still carries every LOCATED view — DxrAliasInactiveViews
+// points the unrendered tail at view 0's subimage (INV-3.4).
 #include "../common/dxr_view_config.h"
 #include "dxr_submit_views.h"
 // Display zones (ADR-027): the tiger-zone. The 3D avatar renders rig-framed INTO
@@ -135,6 +137,7 @@
 
 #include "model_renderer.h"
 #include "recenter_control.h"  // dynamic-recenter per-axis pins (DXR_RECENTER_PIN on Linux)
+#include "mode_switch.h"       // dxr::ModeSwitch — smooth 2D<->3D disparity ramp (V / 0-8)
 #include "model_loader.h"
 #include "model_vulkan_utils.h" // modelCreateBuffer / ModelBuffer (bubble staging)
 
@@ -331,6 +334,21 @@ static float g_zoomFactor = 1.0f;
 //! parallaxFactor, the same "one 3D-effect strength knob" the shared Windows
 //! input handler implements.
 static float g_ipdFactor = 1.0f;
+
+//! V / 0-8 go through displayxr-common's dxr::ModeSwitch — the same sequencer
+//! windows/main.cpp drives via XrSessionUpdateModeSwitch and the model viewer's
+//! Linux leg drives inline. It owns the asymmetry a bare request gets wrong:
+//! 3D->2D ramps the disparity to 0 BEFORE the mode request (2D lands on flat
+//! content), ->3D requests first and eases the disparity up. g_ipdFactor stays
+//! the user's STEADY value (the -/+ knob, the ramp's target); g_renderIpdFactor
+//! is what the rig submits THIS frame — the ramp output mid-switch, else the
+//! steady value. parallaxFactor is not ramped, exactly as on Windows (the
+//! sequencer writes only viewParams.ipdFactor there).
+static dxr::ModeSwitch g_modeSwitch;
+static bool g_modeSwitchConfigured = false;
+static float g_renderIpdFactor = 1.0f;
+static bool g_cycleModeRequested = false;      // V
+static int32_t g_absoluteModeRequested = -1;   // 0-8
 
 //! WASD / QE pan+dolly and the double-click focus target, as an offset from the
 //! auto-fit centre. Added on top of the per-axis recenter anchor in
@@ -669,10 +687,10 @@ struct AppXrSession {
     int32_t displayScreenLeft = 0;     // 3D-panel top-left in virtual-desktop px (INV-1.3)
     int32_t displayScreenTop = 0;
 
-    // Display rendering modes (XR_DXR_display_info). This leg does not offer a
-    // mode-switch UI — it enumerates ONCE after xrCreateSession purely to learn
-    // which mode the panel is already in, so the submitted view count follows
-    // the runtime instead of a hardcoded 2. Mirrors the macOS leg's adoption.
+    // Display rendering modes (XR_DXR_display_info). Enumerated after
+    // xrCreateSession to ADOPT the mode the panel is already in (the submitted
+    // view count follows the runtime instead of a hardcoded 2), then re-read on
+    // every V / 0-8 request and XrEventDataRenderingModeChangedDXR.
     PFN_xrEnumerateDisplayRenderingModesDXR pfnEnumerateRenderingModes = nullptr;
     uint32_t renderingModeCount = 0;
     uint32_t renderingModeViewCounts[8] = {};
@@ -686,6 +704,9 @@ struct AppXrSession {
     // doing nothing, and dxr::ResolveClipPlanes' `standalone` predicate is
     // derived from it exactly as windows/main.cpp derives its own.
     bool renderingModeIsRequestable[8] = {};
+    // hardwareDisplay3D per mode. A mode with it false is MONO whatever its
+    // viewCount says — windows/main.cpp's `monoMode` renders ONE view there.
+    bool renderingModeDisplay3D[8] = {};
     PFN_xrRequestDisplayRenderingModeDXR pfnRequestRenderingMode = nullptr;
 
     // Eye-tracking mode toggle (T). MANAGED vs MANUAL — see
@@ -1227,7 +1248,6 @@ static bool CreateAppWindow(AppXrSession& xr) {
 
 // Forward declarations for the handlers the X11 pump drives.
 static void RefreshRenderingModes(AppXrSession& xr, bool logTable);
-static void RequestRenderingMode(AppXrSession& xr, uint32_t modeIndex, const char* via);
 static void ToggleDecoration(AppXrSession& xr);
 static void ToggleFullscreen(AppXrSession& xr);
 
@@ -1409,14 +1429,15 @@ static void PumpXEvents(AppXrSession& xr) {
                 break;
             }
 
+            // V / 0-8 only RAISE a request; UpdateModeSwitch (main loop)
+            // funnels both into dxr::ModeSwitch, which decides the frame the
+            // runtime request actually goes out on.
             case XK_v: case XK_V: {
                 if (xr.renderingModeCount == 0) {
                     LOG_INFO("V: the runtime enumerated no rendering modes");
                     break;
                 }
-                const uint32_t cur = (xr.activeRenderingMode < xr.renderingModeCount)
-                                         ? xr.activeRenderingMode : 0u;
-                RequestRenderingMode(xr, (cur + 1u) % xr.renderingModeCount, "V");
+                g_cycleModeRequested = true;
                 break;
             }
 
@@ -1427,7 +1448,7 @@ static void PumpXEvents(AppXrSession& xr) {
                     LOG_INFO("Mode %u: the runtime offers only %u mode(s)", want, xr.renderingModeCount);
                     break;
                 }
-                RequestRenderingMode(xr, want, "0-8");
+                g_absoluteModeRequested = (int32_t)want;
                 break;
             }
 
@@ -1983,6 +2004,7 @@ static void RefreshRenderingModes(AppXrSession& xr, bool logTable) {
     for (uint32_t i = 0; i < xr.renderingModeCount; i++) {
         xr.renderingModeViewCounts[i] = modes[i].viewCount;
         xr.renderingModeIsRequestable[i] = (modes[i].isRequestable == XR_TRUE);
+        xr.renderingModeDisplay3D[i] = (modes[i].hardwareDisplay3D == XR_TRUE);
         if (modes[i].isActive == XR_TRUE) xr.activeRenderingMode = i;
         if (logTable) {
             LOG_INFO("  [%u] %s (views=%u, tiles=%ux%u, 3D=%d%s%s)",
@@ -2015,6 +2037,95 @@ static void RequestRenderingMode(AppXrSession& xr, uint32_t modeIndex, const cha
     // may not run before the next render; re-read now so the submitted view
     // count follows immediately.
     if (XR_SUCCEEDED(r)) RefreshRenderingModes(xr, /*logTable=*/false);
+}
+
+//! The mode the runtime reports active, or 0 when it named none (the fallback
+//! the V cycle has always used on this leg).
+static uint32_t CurrentModeIndex(const AppXrSession& xr) {
+    return (xr.activeRenderingMode < xr.renderingModeCount) ? xr.activeRenderingMode : 0u;
+}
+
+/*!
+ * Rendering-mode switch (V / 0-8) through the shared dxr::ModeSwitch sequencer.
+ *
+ * The Linux transliteration of displayxr-common's XrSessionUpdateModeSwitch
+ * (xr_session_common.cpp), which windows/main.cpp calls but which lives on the
+ * Win32-only XrSessionManager — the same inline form the model viewer's Linux
+ * leg uses. Same 0.18 s SmoothStep ramp. INV-2.4: the app REQUESTS; the runtime
+ * owns the active mode and reports it (RefreshRenderingModes / the
+ * XrEventDataRenderingModeChangedDXR arm of PollEvents).
+ *
+ * Before this, V / 0-8 called xrRequestDisplayRenderingModeDXR on the keypress:
+ * the panel dropped into 2D while the avatar's last frames were still two
+ * DIFFERENT eye views, which in 2D both eyes see at once — the double image.
+ * Now 3D->2D flattens the disparity first and requests 2D only once the views
+ * coincide; 2D->3D requests first and eases the disparity up from 0, so the
+ * first 3D frame is flat rather than a full-disparity snap.
+ *
+ * Must run before the rig is built: it writes g_renderIpdFactor.
+ */
+static void UpdateModeSwitch(AppXrSession& xr, float dt) {
+    if (!g_modeSwitchConfigured) {
+        g_modeSwitch.configure(0.18f, dxr::ModeSwitchEasing::SmoothStep);
+        g_modeSwitchConfigured = true;
+    }
+    const float steady = g_ipdFactor;
+    // Active view count of a mode for the sequencer's 2D/3D decision (1 = mono).
+    // A hardwareDisplay3D=false mode is mono whatever its viewCount says — the
+    // same predicate the render paths use (ActiveModeViewCount).
+    auto vcOf = [&](uint32_t m) -> uint32_t {
+        if (m >= xr.renderingModeCount) return 1u;
+        if (!xr.renderingModeDisplay3D[m]) return 1u;
+        return xr.renderingModeViewCounts[m] > 0 ? xr.renderingModeViewCounts[m] : 1u;
+    };
+
+    // Funnel the V cycle and the 0-8 absolute request into one target.
+    // Absolute wins if both fired the same frame (Windows parity).
+    const uint32_t cur = CurrentModeIndex(xr);
+    int32_t target = -1;
+    const char* via = "V";
+    if (g_cycleModeRequested) {
+        g_cycleModeRequested = false;
+        if (xr.renderingModeCount > 0) target = (int32_t)((cur + 1u) % xr.renderingModeCount);
+    }
+    if (g_absoluteModeRequested >= 0) {
+        const int32_t a = g_absoluteModeRequested;
+        g_absoluteModeRequested = -1;
+        if ((uint32_t)a < xr.renderingModeCount) { target = a; via = "0-8"; }
+    }
+
+    if (target >= 0) {
+        if (xr.pfnRequestRenderingMode == nullptr || xr.session == XR_NULL_HANDLE) {
+            LOG_INFO("%s: xrRequestDisplayRenderingModeDXR unavailable", via);
+        } else if (!xr.renderingModeIsRequestable[target]) {
+            // Refuse up front: ramping the avatar flat for a request the
+            // runtime will drop would flatten it for nothing.
+            LOG_INFO("%s: mode %d is locked by the workspace controller", via, target);
+        } else {
+            // currentIpd = the disparity actually on screen: the ramp's last
+            // output while one is in flight, else the steady value. The bare
+            // ipd() is 0 until the first ramp ever runs, which would make the
+            // FIRST 3D->2D switch a one-time snap.
+            const float currentIpd = g_modeSwitch.active() ? g_modeSwitch.ipd() : steady;
+            g_modeSwitch.request((uint32_t)target, vcOf((uint32_t)target), cur, vcOf(cur),
+                                 currentIpd, steady);
+            LOG_INFO("Rendering mode -> %d (%s, via %s): sequencing", target,
+                     vcOf((uint32_t)target) > 1 ? "3D" : "2D", via);
+        }
+    }
+
+    if (g_modeSwitch.active()) {
+        float ipd = steady;
+        bool fire = false;
+        uint32_t mode = cur;
+        g_modeSwitch.update(dt, &ipd, &fire, &mode);
+        g_renderIpdFactor = ipd;
+        // Skip a no-op reversal (a not-yet-fired ->2D the user took back).
+        if (fire && mode != cur) RequestRenderingMode(xr, mode, "mode-switch");
+    } else {
+        // Idle: the tuned steady value (tracks -/+ at once).
+        g_renderIpdFactor = steady;
+    }
 }
 
 static bool CreateSession(AppXrSession& xr, VkInstance vkInstance, VkPhysicalDevice physDevice,
@@ -2080,9 +2191,9 @@ static bool CreateSession(AppXrSession& xr, VkInstance vkInstance, VkPhysicalDev
                                          : "lands on the raw pointer position (unsnapped)");
     }
 
-    // ADOPT the runtime's active rendering mode (display_info v13). This leg has
-    // no mode-switch UI and never REQUESTS a mode — it only reads which one the
-    // panel is already in, so the submitted view count follows the runtime
+    // ADOPT the runtime's active rendering mode (display_info v13). Startup never
+    // REQUESTS a mode (only V / 0-8 do, through UpdateModeSwitch) — it reads
+    // which one the panel is already in, so the submitted view count follows the runtime
     // instead of the hardcoded 2 it used to assume. That matters as soon as the
     // panel boots into a 1-view mode (SIM_DISPLAY_OUTPUT=2d): the app used to
     // submit two views into a one-tile atlas.
@@ -2121,16 +2232,22 @@ static bool CreateSession(AppXrSession& xr, VkInstance vkInstance, VkPhysicalDev
  * Views the ACTIVE rendering mode wants, or 2 when the runtime named no mode.
  *
  * This leg renders a FIXED 2-tile horizontal atlas, so it can honour a 1-view
- * mode (submit one tile) but not a 4-view one — the caller's
+ * mode (render one tile, alias the rest of the located views onto it — ADR-041)
+ * but not a 4-view one — the caller's
  * DxrClampSubmitViewCount() cuts the wanted count down to the 2 tiles that
  * exist and logs the disagreement once, which is the honest outcome until the
  * tile layout is generalised to the mode's cols x rows grid.
  */
 static uint32_t ActiveModeViewCount(const AppXrSession& xr) {
     if (xr.activeRenderingMode != UINT32_MAX &&
-        xr.activeRenderingMode < xr.renderingModeCount &&
-        xr.renderingModeViewCounts[xr.activeRenderingMode] > 0) {
-        return xr.renderingModeViewCounts[xr.activeRenderingMode];
+        xr.activeRenderingMode < xr.renderingModeCount) {
+        // A 2D (hardwareDisplay3D=false) mode is MONO: exactly one view,
+        // windows/main.cpp's `monoMode ? 1 : activeViewCount`. Its viewCount
+        // is normally 1 anyway; this keeps a vendor that advertises a 2D mode
+        // with more views from putting two eye views on a lens-off panel.
+        if (!xr.renderingModeDisplay3D[xr.activeRenderingMode]) return 1u;
+        if (xr.renderingModeViewCounts[xr.activeRenderingMode] > 0)
+            return xr.renderingModeViewCounts[xr.activeRenderingMode];
     }
     return 2u;
 }
@@ -2229,6 +2346,11 @@ static bool PollEvents(AppXrSession& xr) {
             auto* e = (XrEventDataRenderingModeChangedDXR*)&event;
             LOG_INFO("Rendering mode changed: %u -> %u", e->previousModeIndex, e->currentModeIndex);
             RefreshRenderingModes(xr, /*logTable=*/false);
+            // The event's index is authoritative (Windows' PollEvents and the
+            // model viewer take currentModeIndex straight off it); the re-read
+            // above refreshes the per-mode table and the isRequestable gate.
+            if (e->currentModeIndex < xr.renderingModeCount)
+                xr.activeRenderingMode = e->currentModeIndex;
             break;
         }
         default: break;
@@ -2783,8 +2905,9 @@ static bool RenderTigerZone(AppXrSession& xr, const XrFrameState& frameState,
     rig.pose.position = {rigPos[0], rigPos[1], rigPos[2]};
     rig.virtualDisplayHeight = CurrentVHeight();   // auto-fit ÷ wheel zoom
     // ipd and parallax move together — the one "3D effect strength" knob the
-    // shared Windows input handler exposes on -/+ and Shift+wheel.
-    rig.ipdFactor = g_ipdFactor; rig.parallaxFactor = g_ipdFactor; rig.perspectiveFactor = 1.0f;
+    // shared Windows input handler exposes on -/+ and Shift+wheel. ipd carries
+    // the V / 0-8 ModeSwitch ramp on top (see UpdateModeSwitch).
+    rig.ipdFactor = g_renderIpdFactor; rig.parallaxFactor = g_ipdFactor; rig.perspectiveFactor = 1.0f;
 
     outZone = {(XrStructureType)XR_TYPE_DISPLAY_ZONE_DXR};
     outZone.next = &rig;                 // rig chained for the locate (framing)
@@ -2869,7 +2992,12 @@ static bool RenderTigerZone(AppXrSession& xr, const XrFrameState& frameState,
 
     fv.count = n;
     fv.contentRect = outZone.rect;
-    projViews.assign(n, {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW});
+    // ADR-041: the layer carries EVERY located view; only [0, n) are rendered.
+    // The tail is aliased below. Under PRIMARY_MULTIVIEW_DXR xrEndFrame refuses
+    // anything shorter, so a 1-view (2D) frame submitted as 1 view was dropped
+    // outright — the panel went 2D while still showing the last woven 3D frame.
+    const uint32_t located = (viewCountOut < kMaxViews) ? viewCountOut : kMaxViews;
+    projViews.assign(located, {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW});
     for (uint32_t i = 0; i < n; i++) {
         FillFrameView(fv, i, zoneViews[i], rigPos, vHeight, pBudget, standalone);
         ModelRenderer::MaskProjections mp;
@@ -2890,6 +3018,7 @@ static bool RenderTigerZone(AppXrSession& xr, const XrFrameState& frameState,
         projViews[i].pose = zoneViews[i].pose;
         projViews[i].fov = zoneViews[i].fov;
     }
+    DxrAliasInactiveViews(projViews.data(), zoneViews, located, n);
     XrSwapchainImageReleaseInfo ri = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
     xrReleaseSwapchainImage(g_zoneSwapchain, &ri);
     PublishPickMatrices(fv, zoneViews, n);
@@ -3056,6 +3185,12 @@ int main(int argc, char** argv) {
 
         if (!xr.sessionRunning) { usleep(100000); continue; }
 
+        // V / 0-8 through the shared sequencer. Writes this frame's
+        // g_renderIpdFactor, so it must run before either render path builds
+        // its rig; a request it fires is re-read synchronously, so the view
+        // count this frame submits already follows it.
+        UpdateModeSwitch(xr, dt);
+
         XrFrameState frameState = {XR_TYPE_FRAME_STATE};
         XrFrameWaitInfo waitInfo = {XR_TYPE_FRAME_WAIT_INFO};
         if (XR_FAILED(xrWaitFrame(xr.session, &waitInfo, &frameState))) { xr.exitRequested = true; break; }
@@ -3106,7 +3241,7 @@ int main(int argc, char** argv) {
             float dispRigPos[3]; ComputeRigPosition(dispRigPos);
             displayRig.pose.position = {dispRigPos[0], dispRigPos[1], dispRigPos[2]};
             displayRig.virtualDisplayHeight = CurrentVHeight();   // auto-fit ÷ wheel zoom
-            displayRig.ipdFactor = g_ipdFactor;       // -/+ and Shift+wheel, in lockstep
+            displayRig.ipdFactor = g_renderIpdFactor; // -/+ and Shift+wheel, + the V ramp
             displayRig.parallaxFactor = g_ipdFactor;
             displayRig.perspectiveFactor = 1.0f;
             // Only chain the rig when display_info actually gave us panel dims —
@@ -3199,7 +3334,10 @@ int main(int argc, char** argv) {
                         // Clamp to the worst-case swapchain (SBS packs 2 tiles wide).
                         if (eyeW > xr.swapchain.width / eyeCount) eyeW = xr.swapchain.width / eyeCount;
                         if (eyeH > xr.swapchain.height) eyeH = xr.swapchain.height;
-                        projViews.resize(eyeCount, {});
+                        // ADR-041: size the layer to the LOCATED count and alias
+                        // the tail after the render loop (see RenderTigerZone).
+                        projViews.assign(viewCount > eyeCount ? viewCount : eyeCount,
+                                         {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW});
                         // Foreground clip: far = eye→display distance, so the far
                         // plane coincides with the virtual display plane, with the
                         // runtime's advisory rear budget allowed to push it back.
@@ -3243,6 +3381,7 @@ int main(int argc, char** argv) {
                             projViews[i].pose = views[i].pose;
                             projViews[i].fov = views[i].fov;
                         }
+                        DxrAliasInactiveViews(projViews.data(), views.data(), viewCount, eyeCount);
                         XrSwapchainImageReleaseInfo relInfo = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
                         xrReleaseSwapchainImage(xr.swapchain.swapchain, &relInfo);
                         PublishPickMatrices(fv, views.data(), eyeCount);

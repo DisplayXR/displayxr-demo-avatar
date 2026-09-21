@@ -36,9 +36,10 @@
 
 /*
  * VENDORED from displayxr-runtime `test_apps/common/dxr_view_config.h` at
- * commit c1e4fe00da0f189122eca14e61e9faaa88e4b38e. The only edit is the clearly
- * marked DEMO-LOCAL ADDITION below (a second-stage macro fallback); everything
- * else is verbatim. displayxr-common gains the same helper in v2.14.0 — once
+ * commit c1e4fe00da0f189122eca14e61e9faaa88e4b38e. The edits are the clearly
+ * marked DEMO-LOCAL ADDITION below (a second-stage macro fallback) and the
+ * later-vendored ADR-041 DxrAliasInactiveViews at the bottom; everything else
+ * is verbatim. displayxr-common gains the same helper in v2.14.0 — once
  * common/CMakeLists.txt re-pins to that tag this file can be deleted and the
  * include switched, which is a one-liner per leg.
  *
@@ -145,6 +146,76 @@ DxrViewConfigTypeName(XrViewConfigurationType t)
 		return "PRIMARY_STEREO";
 	}
 	return "other";
+}
+
+/* ---- ADR-041 alias helper (copied from the runtime's test_apps/common) ------
+ *
+ * DxrAliasInactiveViews() below is byte-for-byte the runtime's
+ * test_apps/common/dxr_view_config.h helper (runtime ADR-041, 2026-09-18). It
+ * is carried here, next to DxrSelectViewConfigType, because the displayxr-common
+ * tag this demo pins (v2.14.0) predates it. Drop it with the rest of this file
+ * when displayxr-common ships it.
+ *
+ * Why it is load-bearing: under PRIMARY_MULTIVIEW_DXR (which every leg opts
+ * into via DxrSelectViewConfigType) xrEndFrame REFUSES a projection layer whose
+ * viewCount is below xrLocateViews' count — there is no compat arm for that
+ * type. A 2D mode renders one view, so without the alias every 2D frame was
+ * rejected and the panel kept showing the last woven 3D frame on a lens-off
+ * display: a frozen double image.
+ */
+/*!
+ * ADR-041: fill the INACTIVE tail of a projection layer so the layer carries
+ * the full located view count.
+ *
+ * The view count a session gets is fixed for its lifetime; what changes per
+ * frame is how many of those views the active rendering mode actually uses
+ * (chain XrViewActivityStateDXR on XrViewState to read it, or derive it from
+ * the mode as these apps do). Core OpenXR still requires EVERY located view to
+ * be supplied at xrEndFrame, so an app that renders only the active ones closes
+ * the gap by pointing each inactive view at content it already rendered. The
+ * runtime ignores those pixels.
+ *
+ * Each inactive view keeps its OWN located pose/fov — they are valid (the
+ * runtime parks them at view 0's pose) and a pose the runtime rejects would
+ * fail the layer for real. Only the subimage is aliased, onto view 0's.
+ *
+ * Safe to call with active >= located (does nothing).
+ *
+ * @param projViews  The layer's view array, sized @p located. [0, active) must
+ *                   already be filled by the caller.
+ * @param views      The XrView array xrLocateViews wrote, sized @p located.
+ * @param located    What xrLocateViews returned (viewCountOutput).
+ * @param active     Views the app actually rendered this frame.
+ */
+static inline void
+DxrAliasInactiveViews(XrCompositionLayerProjectionView *projViews,
+		      const XrView *views, uint32_t located, uint32_t active) {
+	/*
+	 * `active == 0` means the app rendered NOTHING this frame, so
+	 * projViews[0] holds no subimage to alias — it is still
+	 * zero-initialised, i.e. XR_NULL_HANDLE. Stamping that over every view
+	 * would turn a frame with no content into a layer full of null
+	 * swapchains. Reachable: a zones app whose per-zone tile count clamps to
+	 * 0 (cube_zones_texture_d3d11_win). Do nothing — the caller's own "skip
+	 * this layer" gate handles that frame.
+	 */
+	if (projViews == NULL || active == 0 || active >= located) {
+		return;
+	}
+	for (uint32_t i = active; i < located; i++) {
+		projViews[i].type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
+		projViews[i].next = NULL;
+		if (views != NULL) {
+			projViews[i].pose = views[i].pose;
+			projViews[i].fov = views[i].fov;
+		} else {
+			projViews[i].pose = projViews[0].pose;
+			projViews[i].fov = projViews[0].fov;
+		}
+		// The whole trick: content the app DID render this frame, which
+		// the runtime then discards because the view is inactive.
+		projViews[i].subImage = projViews[0].subImage;
+	}
 }
 
 #ifdef __cplusplus
