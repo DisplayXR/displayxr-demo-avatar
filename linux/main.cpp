@@ -23,8 +23,9 @@
  * XR_DXR_display_zones), the Local2D speech bubble in the top 25%, auto-fit
  * against the zone rect, dynamic recenter, XShape silhouette click-through
  * (clickthrough.cpp), XR_DXR_depth_budget v1 + v3, rendering-mode adoption and
- * switching, and the Windows leg's keyboard + mouse controls (see the control
- * table on PumpXEvents).
+ * switching, a client-owned RMB window drag phase-snapped through
+ * xrWeaveSnapWindowRectDXR (XR_DXR_weave, runtime#1588), and the Windows leg's
+ * keyboard + mouse controls (see the control table on PumpXEvents).
  *
  * What it still does not do: no on-panel HUD or toast chips (the bubble is the
  * only overlay), no XR_DXR_mcp_tools agent surface, no drag-and-drop model
@@ -106,6 +107,10 @@
 // place that turns it (or its absence) into near/far + the shader far-cull, and
 // content_mask.h reduces the silhouette to the v3 occupancy grid.
 #include <openxr/XR_DXR_depth_budget.h>
+// XR_DXR_weave carries xrWeaveSnapWindowRectDXR — the drag-time window-origin
+// phase snap the client-owned RMB drag routes every step through (runtime#1588).
+// Optional: absent, the drag is merely unsnapped.
+#include <openxr/XR_DXR_weave.h>
 #include "clip_policy.h"
 #include "content_mask.h"
 
@@ -697,6 +702,10 @@ struct AppXrSession {
     // must never be handed the v3 content-mask chain it cannot parse.
     bool hasDepthBudget = false;
     uint32_t depthBudgetVersion = 0;
+
+    // XR_DXR_weave (drag phase snap, runtime#1588). Only xrWeaveSnapWindowRectDXR
+    // is used — this app is a _handle app, not a present-owning weave client.
+    bool hasWeave = false;
 };
 
 // Default portrait client size (Windows parity: windows/main.cpp g_windowWidth ×
@@ -847,28 +856,6 @@ static void SetMotifDecorations(Display* dpy, Window win, bool decorated) {
     }
 }
 
-//! True when the WM advertises `name` in _NET_SUPPORTED. Cached per atom name
-//! is not worth it — this is called at most a few times per session.
-static bool WmSupports(Display* dpy, const char* name) {
-    Atom want = XInternAtom(dpy, name, True);
-    if (want == None) return false;
-    Atom supported = XInternAtom(dpy, "_NET_SUPPORTED", True);
-    if (supported == None) return false;
-    Atom actualType = None; int actualFormat = 0;
-    unsigned long n = 0, bytesAfter = 0; unsigned char* data = nullptr;
-    if (XGetWindowProperty(dpy, DefaultRootWindow(dpy), supported, 0, 4096, False, XA_ATOM,
-                           &actualType, &actualFormat, &n, &bytesAfter, &data) != Success) {
-        return false;
-    }
-    bool found = false;
-    if (data != nullptr && actualType == XA_ATOM && actualFormat == 32) {
-        const Atom* atoms = (const Atom*)data;
-        for (unsigned long i = 0; i < n; i++) if (atoms[i] == want) { found = true; break; }
-    }
-    if (data != nullptr) XFree(data);
-    return found;
-}
-
 //! Send an EWMH _NET_WM_STATE add/remove/toggle for one state atom.
 static void SetNetWmState(Display* dpy, Window win, const char* stateName, bool on) {
     Atom stateAtom = XInternAtom(dpy, "_NET_WM_STATE", False);
@@ -888,41 +875,207 @@ static void SetNetWmState(Display* dpy, Window win, const char* stateName, bool 
     XFlush(dpy);
 }
 
-/*!
- * RIGHT-button drag moves the borderless overlay — the desktop-avatar
- * convention, matching windows/main.cpp's dxr::RmbWindowDrag (and modelviewer /
- * gaussiansplat). The gesture is gated on the opaque element for free: a shaped
- * window never receives a button press outside its XShape input region, so the
- * transparent area keeps clicking through to the desktop.
- *
- * Preferred implementation is the EWMH _NET_WM_MOVERESIZE handoff — the WM runs
- * its own move loop, which is what an OS title-bar drag does, so any
- * windowed-weaving phase-snap the compositor keys on a WM move still fires.
- * Returns false when the WM does not advertise it; the caller then falls back
- * to tracking the pointer itself.
- */
-static bool StartWmMove(Display* dpy, Window win, int rootX, int rootY) {
-    if (!WmSupports(dpy, "_NET_WM_MOVERESIZE")) return false;
-    Atom mr = XInternAtom(dpy, "_NET_WM_MOVERESIZE", False);
-    if (mr == None) return false;
-    // The WM takes over the pointer; we must drop our implicit grab first or it
-    // cannot grab, and the drag silently does nothing.
-    XUngrabPointer(dpy, CurrentTime);
-    XFlush(dpy);
-    XEvent ev = {};
-    ev.type = ClientMessage;
-    ev.xclient.window = win;
-    ev.xclient.message_type = mr;
-    ev.xclient.format = 32;
-    ev.xclient.data.l[0] = rootX;
-    ev.xclient.data.l[1] = rootY;
-    ev.xclient.data.l[2] = 8;   // _NET_WM_MOVERESIZE_MOVE
-    ev.xclient.data.l[3] = Button3;
-    ev.xclient.data.l[4] = 1;   // source indication: normal application
-    XSendEvent(dpy, DefaultRootWindow(dpy), False,
-               SubstructureNotifyMask | SubstructureRedirectMask, &ev);
-    XFlush(dpy);
-    return true;
+// ============================================================================
+// Client-owned, phase-snapped window drag (RMB) — runtime#1588
+// ============================================================================
+//
+// RIGHT-button drag moves the borderless overlay — the desktop-avatar
+// convention, matching windows/main.cpp's dxr::RmbWindowDrag (and modelviewer /
+// gaussiansplat). The gesture is gated on the opaque element for free: a shaped
+// window never receives a button press outside its XShape input region, so the
+// transparent area keeps clicking through to the desktop.
+//
+// WHY THE APP OWNS THE DRAG. The vendor display processor weaves at a phase
+// that is a function of the window's ABSOLUTE position in physical panel
+// pixels, so a window dragged across arbitrary pixels re-lands the phase every
+// frame and the 3D stutters. The cure is invariance: the window only ever lands
+// on the lens lattice, so the woven pattern is identical at every position the
+// drag visits. Windows gets that inside the OS move loop (WM_WINDOWPOSCHANGING
+// -> the DP's snap_window_rect). X11 has no equivalent: an EWMH
+// _NET_WM_MOVERESIZE handoff runs the move inside the window manager's own grab
+// loop and the client only learns the result afterwards — nothing can snap it
+// (disproven on the DS1 under mutter; this leg used to hand the drag off that
+// way and the avatar stuttered while dragged). So the app grabs the pointer
+// itself and routes every step through xrWeaveSnapWindowRectDXR (XR_DXR_weave).
+// The lattice is the vendor's and never leaves the DP — the app only asks
+// "given I started here and want to go there, where may I land?".
+//
+// Do NOT round, quantize or second-guess the snapped point. Where the X screen
+// can only place windows on a coarser grid (XWayland's global scale), the
+// RUNTIME already offers the DP only reachable positions (runtime#1609); the
+// app moves to exactly what the snap returns and merely VERIFIES the landing
+// (DragCheckLanding), warning once if placement is persistently not honoured.
+//
+// STRICTLY OPTIONAL. Absent extension / entry point / a failing call -> one log
+// line and an unsnapped drag; nothing else changes.
+//
+// Coordinate convention — ONE window's frame throughout, never mixed: origin,
+// target, snapped result, the XMoveWindow argument and the landing read-back
+// are all xWindow's absolute root origin. The vendor snap uses only the
+// displacement origin -> target, so a constant offset would cancel, but mixing
+// two windows' frames would not. The avatar has no header bar (borderless by
+// design, on Windows too), so xWindow IS the bound, woven window.
+// Mirrors the runtime's test_apps/common/dxr_linux_window.cpp X11 drag.
+// ============================================================================
+struct WeaveSnap {
+    PFN_xrWeaveSnapWindowRectDXR pfn = nullptr;
+    XrSession session = XR_NULL_HANDLE;
+    int32_t w = 0, h = 0;
+    bool failed = false;
+    bool reported = false;
+
+    void attach(XrInstance instance, XrSession s, uint32_t extentW, uint32_t extentH) {
+        session = s; w = (int32_t)extentW; h = (int32_t)extentH; pfn = nullptr;
+        if (instance == XR_NULL_HANDLE || s == XR_NULL_HANDLE) return;
+        PFN_xrVoidFunction fn = nullptr;
+        if (xrGetInstanceProcAddr(instance, "xrWeaveSnapWindowRectDXR", &fn) == XR_SUCCESS &&
+            fn != nullptr) {
+            pfn = reinterpret_cast<PFN_xrWeaveSnapWindowRectDXR>(fn);
+        }
+    }
+    void setExtent(uint32_t nw, uint32_t nh) { w = (int32_t)nw; h = (int32_t)nh; }
+    bool available() const { return pfn != nullptr; }
+
+    //! origin/target are ABSOLUTE root (desktop) pixels — the phase is absolute.
+    //! Only the offset is snapped; the extent passes through per the spec.
+    bool snap(int32_t originX, int32_t originY, int32_t targetX, int32_t targetY,
+              int32_t* outX, int32_t* outY) {
+        if (pfn == nullptr || session == XR_NULL_HANDLE) return false;
+        XrRect2Di origin = {};
+        origin.offset.x = originX; origin.offset.y = originY;
+        origin.extent.width = w; origin.extent.height = h;
+        XrRect2Di target = origin;
+        target.offset.x = targetX; target.offset.y = targetY;
+        XrRect2Di snapped = {};
+        const XrResult res = pfn(session, &origin, &target, &snapped);
+        if (res != XR_SUCCESS) {
+            if (!failed) {
+                failed = true;
+                LOG_WARN("xrWeaveSnapWindowRectDXR failed (%d) — the window drag falls back to "
+                         "an unsnapped position for the rest of this run", (int)res);
+            }
+            pfn = nullptr;
+            return false;
+        }
+        *outX = snapped.offset.x; *outY = snapped.offset.y;
+        return true;
+    }
+};
+
+static WeaveSnap g_weaveSnap;
+
+// Drag bookkeeping. Single-threaded: the X pump and the render loop share one
+// thread, so no lock.
+static bool g_dragging = false;
+static int g_dragPtrX = 0, g_dragPtrY = 0;       // pointer root position at the grab
+static int g_dragOriginX = 0, g_dragOriginY = 0; // window root origin at the grab (snap origin)
+static int g_dragAtX = 0, g_dragAtY = 0;         // where the window was last moved to
+static uint64_t g_dragMoves = 0, g_dragSnapped = 0;
+
+// Landing check: did the window go where the snap asked? XMoveWindow is
+// asynchronous, so the previous request is compared against the window's real
+// origin a pump later (just before the next move, or at the top of the next
+// pump). Accumulates across drags; warns once. A snap the environment silently
+// rounds away is indistinguishable from a working one unless someone reads the
+// window back.
+static bool g_landingPending = false;
+static int g_landingWantX = 0, g_landingWantY = 0;
+static uint32_t g_landingMoves = 0, g_landingDiverged = 0, g_landingWorst = 0;
+static bool g_landingReported = false;
+
+static void X11RootOrigin(Display* dpy, Window win, int* x, int* y) {
+    Window child = 0;
+    *x = 0; *y = 0;
+    XTranslateCoordinates(dpy, win, DefaultRootWindow(dpy), 0, 0, x, y, &child);
+}
+
+static void DragCheckLanding(AppXrSession& xr) {
+    if (!g_landingPending || xr.xDisplay == nullptr || xr.xWindow == 0) return;
+    g_landingPending = false;
+    int gotX = 0, gotY = 0;
+    X11RootOrigin(xr.xDisplay, xr.xWindow, &gotX, &gotY);
+    g_landingMoves++;
+    if (gotX != g_landingWantX || gotY != g_landingWantY) {
+        g_landingDiverged++;
+        const uint32_t dx = (uint32_t)abs(gotX - g_landingWantX);
+        const uint32_t dy = (uint32_t)abs(gotY - g_landingWantY);
+        const uint32_t d = dx > dy ? dx : dy;
+        if (d > g_landingWorst) g_landingWorst = d;
+    }
+    // Conservative, as in the runtime's placement probe: several moves and a
+    // clear majority missing, so one stale read or a WM nudge cannot trip it.
+    if (!g_landingReported && g_landingMoves >= 8 && g_landingDiverged * 2u >= g_landingMoves) {
+        g_landingReported = true;
+        LOG_WARN("drag: placement NOT honoured — %u of %u moves landed somewhere other than "
+                 "the snapped origin (worst %u px). The 3D will stutter while dragging. The "
+                 "runtime normally compensates for XWayland's global scale (runtime#1609); "
+                 "check its log and `displayxr-cli info`, or set every output to 100%%.",
+                 g_landingDiverged, g_landingMoves, g_landingWorst);
+    }
+}
+
+//! Snap (or identity) + XMoveWindow to exactly the snapped point.
+static void MoveWindowSnapped(AppXrSession& xr, int targetX, int targetY) {
+    if (xr.xDisplay == nullptr || xr.xWindow == 0) return;
+    DragCheckLanding(xr);
+    int32_t sx = (int32_t)targetX, sy = (int32_t)targetY;
+    const bool snapped = g_weaveSnap.snap((int32_t)g_dragOriginX, (int32_t)g_dragOriginY,
+                                          (int32_t)targetX, (int32_t)targetY, &sx, &sy);
+    if (!snapped) { sx = (int32_t)targetX; sy = (int32_t)targetY; }
+    if (!g_weaveSnap.reported) {
+        g_weaveSnap.reported = true;
+        LOG_INFO("drag: snap provider %s — %s",
+                 g_weaveSnap.available() ? "installed" : "ABSENT (identity)",
+                 snapped ? "the display processor is offering snapped origins; each landing "
+                           "is verified ('drag: placement')"
+                         : "unsnapped drag (no DP lattice snap on this runtime); the drag "
+                           "mechanics are unaffected");
+    }
+    if (sx != targetX || sy != targetY) {
+        g_dragSnapped++;
+        LOG_INFO("drag: raw (%d, %d) -> snapped (%d, %d)", targetX, targetY, (int)sx, (int)sy);
+    }
+    if (sx == g_dragAtX && sy == g_dragAtY) return;   // the lattice swallowed this step
+    XMoveWindow(xr.xDisplay, xr.xWindow, sx, sy);
+    XFlush(xr.xDisplay);
+    g_dragAtX = sx; g_dragAtY = sy;
+    g_dragMoves++;
+    g_landingPending = true;
+    g_landingWantX = sx; g_landingWantY = sy;
+}
+
+static void BeginWindowDrag(AppXrSession& xr, int rootX, int rootY) {
+    if (g_dragging || xr.xDisplay == nullptr || xr.xWindow == 0) return;
+    DragCheckLanding(xr);
+    g_dragging = true;
+    g_dragPtrX = rootX;
+    g_dragPtrY = rootY;
+    X11RootOrigin(xr.xDisplay, xr.xWindow, &g_dragOriginX, &g_dragOriginY);
+    g_dragAtX = g_dragOriginX; g_dragAtY = g_dragOriginY;
+    g_dragMoves = 0; g_dragSnapped = 0;
+    // Explicit grab so motion OUTSIDE the window keeps arriving: the pointer
+    // routinely leaves a window being dragged fast, and on this overlay it
+    // leaves the XShape input region (the avatar's silhouette) within pixels.
+    XGrabPointer(xr.xDisplay, xr.xWindow, False,
+                 ButtonReleaseMask | PointerMotionMask | Button3MotionMask,
+                 GrabModeAsync, GrabModeAsync, None, None, CurrentTime);
+    LOG_INFO("drag: start (RMB) — grab origin (%d, %d), pointer (%d, %d)",
+             g_dragOriginX, g_dragOriginY, g_dragPtrX, g_dragPtrY);
+}
+
+static void EndWindowDrag(AppXrSession& xr, const char* why) {
+    if (!g_dragging) return;
+    g_dragging = false;
+    if (xr.xDisplay != nullptr) {
+        XUngrabPointer(xr.xDisplay, CurrentTime);
+        XFlush(xr.xDisplay);
+    }
+    LOG_INFO("drag: end (%s) — %llu move(s), %llu snapped away from the raw target, "
+             "origin (%d, %d) -> (%d, %d); placement so far: %u of %u verified moves "
+             "landed exactly",
+             why, (unsigned long long)g_dragMoves, (unsigned long long)g_dragSnapped,
+             g_dragOriginX, g_dragOriginY, g_dragAtX, g_dragAtY,
+             g_landingMoves - g_landingDiverged, g_landingMoves);
 }
 
 // Create a 32-bit ARGB X11 window for the avatar overlay. Windowed PORTRAIT
@@ -1076,7 +1229,8 @@ static void ToggleFullscreen(AppXrSession& xr);
  *
  *   mouse                                      windows/main.cpp
  *   ------------------------------------------ -------------------------------
- *   right-drag            move the window      dxr::RmbWindowDrag
+ *   right-drag            move the window      dxr::RmbWindowDrag (+ the DP
+ *                         (phase-snapped)      snap in WM_WINDOWPOSCHANGING)
  *   wheel                 zoom (rig vHeight)   UpdateInputState WM_MOUSEWHEEL
  *   Shift+wheel           3D strength (ipd)    ditto, shift branch
  *   double-click          focus picked surface WM_LBUTTONDBLCLK -> teleport
@@ -1108,11 +1262,15 @@ static void ToggleFullscreen(AppXrSession& xr);
 static void PumpXEvents(AppXrSession& xr) {
     if (xr.xDisplay == nullptr) return;
 
-    // Manual RMB-drag fallback, used only when the WM does not advertise
-    // _NET_WM_MOVERESIZE (see StartWmMove). Window-thread owned.
-    static bool s_manualDrag = false;
-    static int  s_dragRootX = 0, s_dragRootY = 0;
-    static int  s_dragWinX = 0, s_dragWinY = 0;
+    // Verify the previous drag step landed where the snap asked (a pump has
+    // passed, so the server has placed it). No-op when nothing is pending.
+    DragCheckLanding(xr);
+
+    // RMB drag motion is coalesced across the whole drain and applied ONCE
+    // afterwards — X11 delivers a MotionNotify per pointer sample and only the
+    // newest one matters for an absolute move.
+    bool haveDragMotion = false;
+    int dragMotionRootX = 0, dragMotionRootY = 0;
 
     // Double-click detection. X11 has no WM_LBUTTONDBLCLK: the interval is the
     // conventional 400 ms, and the slop keeps a shaky hand from splitting a
@@ -1317,24 +1475,15 @@ static void PumpXEvents(AppXrSession& xr) {
                 break;
             }
             case Button3: {
-                // Right-drag moves the borderless overlay. Decorated windows
-                // have a title bar for that, so the gesture only starts while
-                // undecorated — matching the `active` gate on Windows.
+                // Right-drag moves the borderless overlay through the
+                // client-owned, phase-snapped drag (see WeaveSnap above).
+                // Decorated windows have a title bar for that (a WM-owned,
+                // unsnapped move — the deliberate B escape hatch), so the
+                // gesture only starts while undecorated, matching the `active`
+                // gate on Windows. Never in fullscreen: a stray gesture would
+                // slide the panel-sized weave off the panel.
                 if (g_decorated || g_fullscreen) break;
-                if (!StartWmMove(xr.xDisplay, xr.xWindow, ev.xbutton.x_root, ev.xbutton.y_root)) {
-                    Window gRoot; int gx = 0, gy = 0; unsigned int gw, gh, gbw, gd;
-                    if (XGetGeometry(xr.xDisplay, xr.xWindow, &gRoot, &gx, &gy, &gw, &gh, &gbw, &gd)) {
-                        // XGetGeometry reports coordinates relative to the
-                        // parent (the WM frame), so translate to the root.
-                        int rx = 0, ry = 0; Window child;
-                        XTranslateCoordinates(xr.xDisplay, xr.xWindow, gRoot, 0, 0, &rx, &ry, &child);
-                        s_manualDrag = true;
-                        s_dragRootX = ev.xbutton.x_root;
-                        s_dragRootY = ev.xbutton.y_root;
-                        s_dragWinX = rx;
-                        s_dragWinY = ry;
-                    }
-                }
+                BeginWindowDrag(xr, ev.xbutton.x_root, ev.xbutton.y_root);
                 break;
             }
             case Button4:   // wheel up
@@ -1360,17 +1509,23 @@ static void PumpXEvents(AppXrSession& xr) {
         }
 
         case ButtonRelease:
-            if (ev.xbutton.button == Button3) s_manualDrag = false;
+            if (ev.xbutton.button == Button3) {
+                // Apply the final coalesced position before ending, so the
+                // window lands where the button came up, not one sample short.
+                if (haveDragMotion && g_dragging) {
+                    MoveWindowSnapped(xr, g_dragOriginX + (dragMotionRootX - g_dragPtrX),
+                                      g_dragOriginY + (dragMotionRootY - g_dragPtrY));
+                    haveDragMotion = false;
+                }
+                EndWindowDrag(xr, "release");
+            }
             break;
 
         case MotionNotify:
-            if (s_manualDrag) {
-                // Coalesce: X11 delivers a motion event per pointer sample, and
-                // only the newest one matters for a move.
-                while (XCheckTypedWindowEvent(xr.xDisplay, xr.xWindow, MotionNotify, &ev)) {}
-                XMoveWindow(xr.xDisplay, xr.xWindow,
-                            s_dragWinX + (ev.xmotion.x_root - s_dragRootX),
-                            s_dragWinY + (ev.xmotion.y_root - s_dragRootY));
+            if (g_dragging) {
+                haveDragMotion = true;
+                dragMotionRootX = ev.xmotion.x_root;
+                dragMotionRootY = ev.xmotion.y_root;
             }
             break;
 
@@ -1387,7 +1542,8 @@ static void PumpXEvents(AppXrSession& xr) {
             // focus is perfectly stable, and clearing on a pointer crossing
             // would make WASD unusable whenever the cursor sat near an edge.
             g_keyW = g_keyA = g_keyS = g_keyD = g_keyQ = g_keyE = false;
-            s_manualDrag = false;
+            haveDragMotion = false;
+            EndWindowDrag(xr, "focus lost");
             break;
 
         case ConfigureNotify:
@@ -1396,10 +1552,21 @@ static void PumpXEvents(AppXrSession& xr) {
                 xr.xWinH = (unsigned int)ev.xconfigure.height;
                 g_clientPxW = xr.xWinW;
                 g_clientPxH = xr.xWinH;
+                // Only the rect OFFSET is snapped, but hand the DP the real
+                // size so a future size-aware snap is not fed a stale one.
+                g_weaveSnap.setExtent(xr.xWinW, xr.xWinH);
             }
             break;
         default: break;
         }
+    }
+
+    if (haveDragMotion && g_dragging) {
+        // Absolute, not incremental: origin + (pointer now - pointer at grab).
+        // A snap that holds the window back a few pixels therefore never makes
+        // the window lag the pointer permanently.
+        MoveWindowSnapped(xr, g_dragOriginX + (dragMotionRootX - g_dragPtrX),
+                          g_dragOriginY + (dragMotionRootY - g_dragPtrY));
     }
 }
 
@@ -1411,6 +1578,7 @@ static void PumpXEvents(AppXrSession& xr) {
 static void ToggleDecoration(AppXrSession& xr) {
     if (xr.xDisplay == nullptr || xr.xWindow == 0) return;
     if (g_fullscreen) return;   // decoration is meaningless in fullscreen
+    EndWindowDrag(xr, "decoration toggled");   // a WM frame now owns the move
     g_decorated = !g_decorated;
     SetMotifDecorations(xr.xDisplay, xr.xWindow, g_decorated);
     XFlush(xr.xDisplay);
@@ -1419,6 +1587,7 @@ static void ToggleDecoration(AppXrSession& xr) {
 
 static void ToggleFullscreen(AppXrSession& xr) {
     if (xr.xDisplay == nullptr || xr.xWindow == 0) return;
+    EndWindowDrag(xr, "fullscreen toggled");   // a fullscreen window is never dragged
     g_fullscreen = !g_fullscreen;
     SetNetWmState(xr.xDisplay, xr.xWindow, "_NET_WM_STATE_FULLSCREEN", g_fullscreen);
     LOG_INFO("%s fullscreen mode (F11)", g_fullscreen ? "Entered" : "Exited");
@@ -1447,6 +1616,7 @@ static bool InitializeOpenXR(AppXrSession& xr) {
         if (strcmp(ext.extensionName, XR_DXR_LOCAL_3D_ZONE_EXTENSION_NAME) == 0) hasLocal3DZone = true;
         if (strcmp(ext.extensionName, XR_DXR_DISPLAY_ZONES_EXTENSION_NAME) == 0) hasDisplayZones = true;
         if (strcmp(ext.extensionName, XR_DXR_ATLAS_CAPTURE_EXTENSION_NAME) == 0) hasAtlasCapture = true;
+        if (strcmp(ext.extensionName, XR_DXR_WEAVE_EXTENSION_NAME) == 0) xr.hasWeave = true;
         if (strcmp(ext.extensionName, XR_DXR_DEPTH_BUDGET_EXTENSION_NAME) == 0) {
             xr.hasDepthBudget = true;
             // The RUNTIME's version, not this app's vendored SPEC_VERSION — the
@@ -1465,6 +1635,7 @@ static bool InitializeOpenXR(AppXrSession& xr) {
     LOG_INFO("XR_DXR_atlas_capture: %s", hasAtlasCapture ? "AVAILABLE" : "NOT FOUND");
     LOG_INFO("XR_DXR_depth_budget: %s (v%u)", xr.hasDepthBudget ? "AVAILABLE" : "NOT FOUND",
              xr.depthBudgetVersion);
+    LOG_INFO("XR_DXR_weave (drag phase snap): %s", xr.hasWeave ? "AVAILABLE" : "NOT FOUND");
 
     std::vector<const char*> enabledExtensions;
     enabledExtensions.push_back(XR_KHR_VULKAN_ENABLE_EXTENSION_NAME);
@@ -1528,6 +1699,12 @@ static bool InitializeOpenXR(AppXrSession& xr) {
     // this leg did before.
     if (xr.hasDepthBudget) {
         enabledExtensions.push_back(XR_DXR_DEPTH_BUDGET_EXTENSION_NAME);
+    }
+    // XR_DXR_weave: enabled only for xrWeaveSnapWindowRectDXR, the snap the
+    // client-owned RMB drag routes every step through. Purely optional — absent,
+    // the drag runs unsnapped rather than failing.
+    if (xr.hasWeave) {
+        enabledExtensions.push_back(XR_DXR_WEAVE_EXTENSION_NAME);
     }
 
     XrInstanceCreateInfo createInfo = {XR_TYPE_INSTANCE_CREATE_INFO};
@@ -1876,6 +2053,18 @@ static bool CreateSession(AppXrSession& xr, VkInstance vkInstance, VkPhysicalDev
              useAppWindow ? (wantTransparent ? "app-owned window, transparent overlay (default)"
                                              : "app-owned window, opaque handle app (AVATAR_TRANSPARENT=0)")
                           : "hosted-NULL: runtime self-creates the window");
+
+    // Drag-time window-origin phase snap (runtime#1588), used by the
+    // client-owned RMB drag. Resolved defensively: identity when the runtime
+    // does not serve it, and then the drag is merely unsnapped.
+    if (useAppWindow) {
+        g_weaveSnap.attach(xr.hasWeave ? xr.instance : XR_NULL_HANDLE, xr.session,
+                           xr.xWinW, xr.xWinH);
+        LOG_INFO("xrWeaveSnapWindowRectDXR: %s — a window drag %s",
+                 g_weaveSnap.available() ? "RESOLVED" : "unavailable on this runtime",
+                 g_weaveSnap.available() ? "will be phase-snapped by the display processor"
+                                         : "lands on the raw pointer position (unsnapped)");
+    }
 
     // ADOPT the runtime's active rendering mode (display_info v13). This leg has
     // no mode-switch UI and never REQUESTS a mode — it only reads which one the
