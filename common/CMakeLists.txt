@@ -27,13 +27,12 @@ get_filename_component(_dxr_ext_includes
     "${CMAKE_CURRENT_SOURCE_DIR}/../openxr_includes" ABSOLUTE)
 set(DISPLAYXR_EXTENSIONS_INCLUDE_DIR "${_dxr_ext_includes}" CACHE PATH
     "DisplayXR OpenXR extension headers for displayxr::common")
-# TODO(runtime #1612): TEMPORARY pin to displayxr-common PR #50's commit. Repin to the release tag that contains DxrAliasInactiveViews (and restore GIT_SHALLOW TRUE) BEFORE this PR merges.
-# (Also pinned in android/src/main/cpp/CMakeLists.txt — repin both together.)
+# (Also pinned in android/src/main/cpp/CMakeLists.txt — keep both equal.)
 FetchContent_Declare(
     displayxr_common
     GIT_REPOSITORY https://github.com/DisplayXR/displayxr-common.git
-    GIT_TAG 7a5acac5b15b6826cd88aa9ef616a8b480270bed
-    GIT_SHALLOW FALSE
+    GIT_TAG v2.15.0
+    GIT_SHALLOW TRUE
 )
 FetchContent_MakeAvailable(displayxr_common)
 
