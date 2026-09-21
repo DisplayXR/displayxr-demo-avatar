@@ -263,19 +263,51 @@ Vulkan/MoltenVK via brew). Run via **`./scripts/run_macos_dev.sh`**, not the
 bare binary (the dev launcher aligns the app + runtime on one Vulkan loader).
 `./scripts/build_macos.sh --installer` builds the `.pkg`.
 
-### Linux (local dev — build-green only, #21)
+### Linux (local dev — on-screen, hardware-validated)
 `./scripts/build_linux.sh` (builds the OpenXR loader from source pinned to
 1.1.43, uses system `libvulkan-dev`). Produces `build/linux/avatar_handle_vk_linux`
 and runs via **`./scripts/run_avatar_linux.sh`**. The Linux entry point is
-`linux/main.cpp` — a minimal Vulkan + OpenXR frame loop driving the same
-cross-platform `model_common/ModelRenderer` the macOS/Windows peers use.
-Windowing is **hosted-NULL** (the runtime self-creates its window); the faithful
-app-owned X11 window via `XR_DXR_xlib_window_binding` (header already vendored in
-`openxr_includes/`) is **Phase-3** work, gated on the Linux runtime + a GPU + an
-X server. This is **build-green only** — CI compiles it on `ubuntu-latest`
-(`build-linux.yml`, dispatch/`linux*`-branch only, not required); on-screen
-validation is deferred. Recipe: `docs/guides/linux-demo-port.md` in
-`displayxr-runtime`.
+`linux/main.cpp` — a Vulkan + OpenXR frame loop driving the same cross-platform
+`model_common/ModelRenderer` the macOS/Windows peers use, with
+**`windows/main.cpp` as the parity spec** for everything above the renderer.
+
+Windowing is an **app-owned 32-bit ARGB X11 window** handed to the runtime via
+`XR_DXR_xlib_window_binding` with `transparentBackgroundEnabled`, so transparent
+pixels compose through to the desktop. It falls back to hosted-NULL only when
+there is no X server or the runtime lacks the extension (headless CI) — and on
+that path the Local2D bubble is suppressed, because `xrEndFrame` rejects a
+Local2D layer without an external window and would drop the whole frame.
+
+First ran on a real Leia panel (Acer SpatialLabs DS1, Ubuntu 26.04, GNOME
+Wayland with the app as an X11/XWayland client) in September 2026: transparent
+overlay confirmed (XWayland advertises non-opaque composite alpha, the swapchain
+comes up `PRE_MULTIPLIED`), the Leia plug-in selects compose-under-bg, and
+desktop capture via xdg-desktop-portal ScreenCast + PipeWire feeds the compose
+pipeline.
+
+At parity with the Windows leg: display-zone framing (avatar in the bottom 75%),
+the Local2D speech bubble, auto-fit against the zone rect, dynamic recenter,
+XShape silhouette click-through, `XR_DXR_depth_budget` v1 + v3, rendering-mode
+adoption **and switching**, and the full keyboard + mouse control set (the
+control table lives on `PumpXEvents` in `linux/main.cpp`). Still absent: the
+on-panel HUD/toast chips, `XR_DXR_mcp_tools`, drag-and-drop model load (Ctrl+O
+opens a zenity picker instead), and the `C` camera-rig round-trip (its converter
+is Windows-only code in displayxr-common).
+
+**App env vars** (also listed in `linux/main.cpp`'s header):
+`AVATAR_TRANSPARENT=0` starts opaque (Ctrl+T toggles live);
+`AVATAR_WINDOW=WxH+X+Y` overrides the window rect in absolute virtual-desktop px
+(W×H alone re-centres on the 3D panel); `DXR_RECENTER_PIN`, `DXR_ZONES_VALIDATE`,
+`DXR_DUMP_BUBBLE`, and the `DXR_AVATAR_SIL_*` silhouette levers.
+
+**`scripts/run_avatar_linux.sh` defaults to sim_display's anaglyph output, which
+validates nothing about weaving** — it degrades gracefully under resampling and
+cropping, so a plausible run proves plug-in discovery, session/swapchain
+creation and that an atlas reached the DP, and nothing about woven-texture size,
+pixel mapping or interlacing phase. Those need the Leia plug-in on real
+hardware. CI compiles this leg on `ubuntu-latest` (`build-linux.yml`,
+dispatch/`linux*`-branch only, not required). Recipe:
+`docs/guides/linux-demo-port.md` in `displayxr-runtime`.
 
 ### CI (`.github/workflows/`)
 `build-windows.yml` + `build-macos.yml` run on **`pull_request` + push to main**

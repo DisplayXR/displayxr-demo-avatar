@@ -48,17 +48,32 @@ renderer (`model_common/`), specialised into an avatar shell.
 | Input | Action |
 |---|---|
 | `W` / `S` | Dolly the avatar nearer / further in depth (clips at the display plane) |
-| Left-click drag | Rotate the avatar (overrides the billboard while dragging) |
+| `A` / `D`, `Q` / `E` | Slide the avatar left / right, up / down |
+| Right-click drag | Move the borderless window |
 | Double-click | Focus / re-pose toward the picked surface point |
 | Scroll | Zoom (virtual-display height) |
+| `Shift`+scroll, `-` / `+` | 3D-effect strength (IPD + parallax, in lockstep) |
 | `Space` | Reset to the auto-fit pose |
 | `V` (or `0`–`8`) | Cycle / select the rendering modes the display runtime advertises |
 | `N` / `K` | Next animation clip / play-pause |
+| `Ctrl+O` | Open a different model |
 | `Ctrl+T` | Toggle transparent background (desktop see-through) |
+| `T` | Toggle the eye-tracking mode (MANAGED ⇄ MANUAL) |
+| `G` | Toggle the alpha edge-softening post-pass |
+| `P` then `X`/`Y`/`Z` | Arm, then toggle, the per-axis dynamic-recenter pins |
 | `B` | Toggle window decoration — borderless ⇄ title bar for OS move/resize |
-| `I` | Capture the multi-view atlas to `%USERPROFILE%\Pictures\DisplayXR\` |
+| `I` | Capture the multi-view atlas (Windows: `%USERPROFILE%\Pictures\DisplayXR\`; Linux: `~/Pictures/DisplayXR/`) |
 | `F11` | Fullscreen |
 | `Esc` | Quit |
+
+Left-click **drag does not rotate** the avatar on any platform: the character
+faces the viewer via a head-tracked yaw billboard, which owns the heading, so
+the drag-accumulated yaw and pitch are pinned to zero. (An earlier revision of
+this table claimed otherwise.)
+
+The same set is wired on Windows, macOS and Linux except where a platform has
+no equivalent — the Linux leg has no on-panel HUD or toast chips, no
+drag-and-drop model load (`Ctrl+O` covers it) and no `C` camera-rig round-trip.
 
 There is **no in-app model-load UI** — the avatar auto-loads its bundled tiger.
 Pass a model path as the first CLI argument to float a different character
