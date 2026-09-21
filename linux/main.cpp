@@ -20,10 +20,11 @@
  * suppressed because xrEndFrame rejects it without an external window.
  *
  * What this leg does: display-zone framing (the avatar in the bottom 75%,
- * XR_DXR_display_zones), the Local2D speech bubble in the top 25%, auto-fit
+ * XR_DXR_display_zones), the yaw-only face-the-viewer billboard on the zone
+ * rig, the Local2D speech bubble in the top 25%, auto-fit
  * against the zone rect, dynamic recenter, XShape silhouette click-through
  * (clickthrough.cpp), XR_DXR_depth_budget v1 + v3, rendering-mode adoption and
- * switching, a client-owned RMB window drag phase-snapped through
+ * smooth switching (dxr::ModeSwitch), a client-owned RMB window drag phase-snapped through
  * xrWeaveSnapWindowRectDXR (XR_DXR_weave, runtime#1588), and the Windows leg's
  * keyboard + mouse controls (see the control table on PumpXEvents).
  *
@@ -2833,6 +2834,93 @@ static bool TryActivateTigerZone(AppXrSession& xr) {
 // ============================================================================
 static constexpr uint32_t kMaxViews = 8;
 
+// ============================================================================
+// Face-the-viewer billboard (yaw-only) — windows/main.cpp's zones-branch block
+// ============================================================================
+// The avatar turns horizontally to face the tracked viewer. The heading is
+// applied as the tiger-zone RIG's yaw (turning the virtual camera about the
+// avatar), exactly as Windows feeds s_faceYaw into tigerRig.pose.orientation.
+// Like Windows it lives on the ZONES path only: the full-tile fallback keeps an
+// identity rig (Windows' fallback is likewise un-billboarded).
+//
+// Input: the XrViewDisplayRawDXR readback chained on the zone-scoped locate —
+// the DP's eyes in DISPLAY space (panel-centre origin, +X right, +Z toward the
+// viewer, captured before the runtime's 2D centre-collapse) plus the canvas the
+// runtime resolved for the zone (canvasRectPx, panel-relative device px) and
+// the physical tracker lock. Windows reads the same eyes off a separate
+// un-chained locate and the canvas off LAST frame's zone locate; this leg takes
+// both from last frame's zone locate, one locate per frame instead of two. The
+// one frame of eye staleness is under the tau smoothing, as Windows says of its
+// own one-frame-stale canvas.
+static XrViewDisplayRawDXR g_zoneRaw = {};
+static bool  g_zoneRawValid = false;   // a zone locate has reported eyes
+static float g_faceYaw = 0.0f;         // smoothed heading (rad), applied to the rig
+
+//! Rig orientation for this frame's heading: pure yaw about +Y. The same
+//! quaternion XMQuaternionRotationRollPitchYaw(0, yaw, 0) yields on Windows.
+static XrQuaternionf FaceYawQuat() {
+    return {0.0f, sinf(0.5f * g_faceYaw), 0.0f, cosf(0.5f * g_faceYaw)};
+}
+
+/*!
+ * Advance the billboard heading by dt. One call per frame, before the zone
+ * render builds its rig. Constants and rules are windows/main.cpp's verbatim:
+ *  - head centroid = midpoint of eyes 0 and 1 (eye 0 alone for a 1-eye
+ *    readback), rebased from the PANEL centre to the zone CANVAS centre with
+ *    metres-per-pixel = displayWidthM / displayPixelWidth. The raw eyes are
+ *    panel-relative, so without the rebase the avatar would face the viewer's
+ *    offset from the panel centre, not from itself — wrong for any window that
+ *    is not centred on the panel. Panel px here are device px, the same unit
+ *    as canvasRectPx and as X11 client geometry.
+ *  - target = FACE_YAW_SIGN * atan2(hx, |hz|), |hz| floored at 1 mm.
+ *  - exponential shortest-angle smoothing, time-based (tau = 0.04 s).
+ *  - chase only while the tracker is LOCKED; warmup / nominal-fallback eyes
+ *    hold the current heading (forward until tracking first locks).
+ * No other input writes the heading: left-drag is inert (PumpXEvents) and this
+ * leg has no auto-orbit, so there is nothing for the billboard to fight.
+ */
+static void UpdateFaceYaw(const AppXrSession& xr, float dt) {
+    if (!g_zoneRawValid || g_zoneRaw.eyeCountOutput == 0) return;   // hold forward
+
+    // HARDWARE CHECK: -1 was confirmed by eye on the WINDOWS avatar. The Linux
+    // rig quaternion and raw-eye frame are meant to be identical (same runtime
+    // contract, same plain view convention), but this constant has not yet
+    // been confirmed on a Linux panel.
+    static constexpr float FACE_YAW_SIGN = -1.0f;  // viewer-confirmed (Windows)
+
+    float cx, cz;
+    if (g_zoneRaw.eyeCountOutput < 2) {
+        cx = g_zoneRaw.rawEyes[0].x;
+        cz = g_zoneRaw.rawEyes[0].z;
+    } else {
+        cx = (g_zoneRaw.rawEyes[0].x + g_zoneRaw.rawEyes[1].x) * 0.5f;
+        cz = (g_zoneRaw.rawEyes[0].z + g_zoneRaw.rawEyes[1].z) * 0.5f;
+    }
+    float hx = cx;
+    const float hz = cz;
+    if (g_zoneRaw.canvasRectPx.extent.width > 0 && xr.displayPixelWidth > 0 &&
+        xr.displayWidthM > 0.0f) {
+        // Canvas-centre offset from the display centre, in metres, +X right
+        // (panel px are y-down; yaw only needs X).
+        const float pxSizeX = xr.displayWidthM / (float)xr.displayPixelWidth;
+        const float canvasCxPx = (float)g_zoneRaw.canvasRectPx.offset.x +
+                                 (float)g_zoneRaw.canvasRectPx.extent.width * 0.5f;
+        hx = cx - (canvasCxPx - (float)xr.displayPixelWidth * 0.5f) * pxSizeX;
+    }
+    const float hzAbs = fabsf(hz) > 1e-3f ? fabsf(hz) : 1e-3f;
+    const float targetYaw = FACE_YAW_SIGN * atan2f(hx, hzAbs);
+
+    const float tau = 0.04f;  // seconds (settle ~ 3 tau)
+    float a = 1.0f - expf(-dt / tau);
+    if (a < 0.0f) a = 0.0f; else if (a > 1.0f) a = 1.0f;
+    if (g_zoneRaw.isTracking == XR_TRUE) {
+        float dy = targetYaw - g_faceYaw;
+        while (dy >  3.14159265f) dy -= 6.28318531f;
+        while (dy < -3.14159265f) dy += 6.28318531f;
+        g_faceYaw += dy * a;
+    }
+}
+
 //! Whatever the frame's render path produced: the matrices it drew with, the
 //! per-view shader far-cull dxr::ResolveClipPlanes resolved, and the client-px
 //! rect the 3D content occupies. The silhouette pass re-renders the outermost
@@ -2871,6 +2959,15 @@ static bool AppIsStandalone(const AppXrSession& xr) {
     return xr.renderingModeIsRequestable[i];
 }
 
+//! z of (rigPose^-1 * eyeWorld): v' = q^-1 * v * q with q^-1 the conjugate.
+static float RigLocalEyeZ(const float rigPos[3], const XrQuaternionf& q, const XrVector3f& eye) {
+    const float vx = eye.x - rigPos[0], vy = eye.y - rigPos[1], vz = eye.z - rigPos[2];
+    const float qx = -q.x, qy = -q.y, qz = -q.z, qw = q.w;   // conjugate
+    const float tx = 2.0f * (qy * vz - qz * vy);
+    const float ty = 2.0f * (qz * vx - qx * vz);
+    return vz + qw * (2.0f * (qx * vy - qy * vx)) + (qx * ty - qy * tx);
+}
+
 /*!
  * Fill one view's matrices from the runtime's render-ready pose/fov, resolving
  * near/far through the shared rear-depth-budget policy.
@@ -2886,11 +2983,14 @@ static bool AppIsStandalone(const AppXrSession& xr) {
  * function of the budget that produced it and would oscillate against it.
  */
 static void FillFrameView(FrameViews& fv, uint32_t i, const XrView& v,
-                          const float rigPos[3], float vHeight,
+                          const float rigPos[3], const XrQuaternionf& rigOri, float vHeight,
                           const XrRearDepthBudgetDXR* budget, bool standalone) {
     mat4_view_from_xr_pose(fv.view[i], v.pose);
-    // Identity rig orientation → RigLocalEyeZ reduces to the z difference.
-    const float ez = fabsf(v.pose.position.z - rigPos[2]);
+    // Display-local eye distance: z of (rigPose^-1 * eye), windows/main.cpp's
+    // RigLocalEyeZ. The billboard yaws the zone rig, so this is no longer the
+    // bare world-z difference (it still reduces to it for the identity rig the
+    // full-tile path uses).
+    const float ez = fabsf(RigLocalEyeZ(rigPos, rigOri, v.pose.position));
     const dxr::ClipPlanes clip =
         dxr::ResolveClipPlanes(ez, vHeight, budget, g_transparentBg, standalone);
     const dxr::ClipPlanes clipUnres =
@@ -2952,7 +3052,9 @@ static bool RenderTigerZone(AppXrSession& xr, const XrFrameState& frameState,
     // Zone rect = bottom 75% (client px, y-down); the top 25% is the bubble band.
     const int32_t topBand = (int32_t)((float)winH * (1.0f - kAvatarCanvasFrac) + 0.5f);
     XrDisplayRigDXR rig = {XR_TYPE_DISPLAY_RIG_DXR};
-    rig.pose.orientation = {0.0f, 0.0f, 0.0f, 1.0f};
+    // Yaw-only face-the-viewer heading (UpdateFaceYaw); PLAIN world frame, no
+    // Y negation — the zones path runs the plain view convention.
+    rig.pose.orientation = FaceYawQuat();
     float rigPos[3]; ComputeRigPosition(rigPos);
     rig.pose.position = {rigPos[0], rigPos[1], rigPos[2]};
     rig.virtualDisplayHeight = CurrentVHeight();   // auto-fit ÷ wheel zoom
@@ -2998,6 +3100,11 @@ static bool RenderTigerZone(AppXrSession& xr, const XrFrameState& frameState,
     // the discriminator, so a runtime that ignores the chain is told apart
     // from one that deliberately returned an all-zero-vH clip.
     XrRearDepthBudgetDXR budget = {};
+    // XR_DXR_view_rig raw readback: the display-space eyes + the canvas the
+    // runtime resolved for this zone, for the billboard. Chained FIRST so the
+    // depth-budget helper (which prepends) keeps it linked — Windows' order.
+    XrViewDisplayRawDXR zoneRaw = {(XrStructureType)XR_TYPE_VIEW_DISPLAY_RAW_DXR};
+    viewState.next = &zoneRaw;
     if (xr.hasDepthBudget) dxr::ChainRearDepthBudget(viewState, budget);
     uint32_t viewCountOut = 0;
     XrView zoneViews[kMaxViews];
@@ -3007,6 +3114,11 @@ static bool RenderTigerZone(AppXrSession& xr, const XrFrameState& frameState,
         static bool s_warned = false;
         if (!s_warned) { s_warned = true; LOG_WARN("[zones] zone-scoped xrLocateViews failed — full-tile fallback"); }
         return false;
+    }
+    if (zoneRaw.eyeCountOutput > 0) {
+        g_zoneRaw = zoneRaw;
+        g_zoneRaw.next = nullptr;
+        g_zoneRawValid = true;
     }
     // #1486/#1500 — RENDER min(active mode count, located, tiles). The tile
     // term is the active grid's cols x rows; the wanted term is the ADOPTED
@@ -3059,7 +3171,7 @@ static bool RenderTigerZone(AppXrSession& xr, const XrFrameState& frameState,
         // SBS, a 2x2 block for Quad, (0,0) alone for 2D.
         const uint32_t col = i % cols;
         const uint32_t row = i / cols;
-        FillFrameView(fv, i, zoneViews[i], rigPos, vHeight, pBudget, standalone);
+        FillFrameView(fv, i, zoneViews[i], rigPos, rig.pose.orientation, vHeight, pBudget, standalone);
         ModelRenderer::MaskProjections mp;
         mp.unrestricted = fv.projUnres[i];
         // Render the avatar into this view's tile of the zone swapchain, with
@@ -3252,6 +3364,8 @@ int main(int argc, char** argv) {
         // its rig; a request it fires is re-read synchronously, so the view
         // count this frame submits already follows it.
         UpdateModeSwitch(xr, dt);
+        // Face-the-viewer heading for the tiger-zone rig (zones path only).
+        UpdateFaceYaw(xr, dt);
 
         XrFrameState frameState = {XR_TYPE_FRAME_STATE};
         XrFrameWaitInfo waitInfo = {XR_TYPE_FRAME_WAIT_INFO};
@@ -3422,7 +3536,8 @@ int main(int argc, char** argv) {
                             // model center, sized to the model) owns the framing. No
                             // model-fit baked into the view.
                             const uint32_t fi = (i < kMaxViews) ? i : kMaxViews - 1;
-                            FillFrameView(fv, fi, views[i], rigPos, vHeight, pBudget, standalone);
+                            FillFrameView(fv, fi, views[i], rigPos, displayRig.pose.orientation,
+                                          vHeight, pBudget, standalone);
                             ModelRenderer::MaskProjections mp;
                             mp.unrestricted = fv.projUnres[fi];
                             // Draw the avatar into this eye's SBS viewport region.
