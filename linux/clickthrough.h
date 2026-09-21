@@ -36,10 +36,14 @@
  *     is skipped when scanning (nothing is drawn there) and the bubble rect is
  *     unioned in, so the bubble is not clipped away by the shaped window.
  *
- * Also note the destination-image usage fix: ModelRenderer::renderEye BLITS
- * into its target, so the scratch images need VK_IMAGE_USAGE_TRANSFER_DST_BIT.
- * The previous COLOR_ATTACHMENT|TRANSFER_SRC set was a spec violation that
- * happened to work.
+ * Also note the destination-image fixes. The scratch images need all three of
+ * COLOR_ATTACHMENT | TRANSFER_DST | TRANSFER_SRC — renderEye BLITS into its
+ * target (TRANSFER_DST, which the pre-port set omitted), the copy-out reads it
+ * (TRANSFER_SRC), and both the VkImageView modelCreateImage2D always creates
+ * and renderEye's declared COLOR_ATTACHMENT_OPTIMAL entry layout require
+ * COLOR_ATTACHMENT. That entry layout is also why EnsureTargets transitions the
+ * pair up front and the copy restores it: renderEye only assumes UNDEFINED for
+ * a viewport at (0,0), and the silhouette always renders into the bottom band.
  *
  * No-op when the window / Display is null (hosted-NULL fallback), and reports
  * once when the server has no XShape extension instead of silently doing
