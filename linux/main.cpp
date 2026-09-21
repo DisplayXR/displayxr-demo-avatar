@@ -1189,6 +1189,20 @@ static bool CreateAppWindow(AppXrSession& xr) {
         XSetWMNormalHints(dpy, win, &hints);
     }
 
+    // Always on top — the Windows leg creates the window WS_EX_TOPMOST and
+    // macOS uses NSFloatingWindowLevel; a desktop companion that sinks behind
+    // the first window clicked is not one. EWMH: a client states its initial
+    // _NET_WM_STATE by setting the property BEFORE the map (after the map it
+    // would have to be a ClientMessage to the root, as SetNetWmState does).
+    {
+        Atom netState = XInternAtom(dpy, "_NET_WM_STATE", False);
+        Atom above = XInternAtom(dpy, "_NET_WM_STATE_ABOVE", False);
+        if (netState != None && above != None) {
+            XChangeProperty(dpy, win, netState, XA_ATOM, 32, PropModeReplace,
+                            (unsigned char*)&above, 1);
+        }
+    }
+
     XMapWindow(dpy, win);
     XFlush(dpy);
 
