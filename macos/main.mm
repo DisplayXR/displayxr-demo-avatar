@@ -2243,6 +2243,38 @@ static bool g_silReady = false;
 static ModelImage  g_silImage = {};
 static ModelBuffer g_silReadback = {};
 static void*       g_silMapped = nullptr;
+// Set when the image is (re)created: UNDEFINED, not yet through RecordSilhouettePrep.
+static bool        g_silImageFresh = false;
+
+// avatar#99 (same fix as the Windows leg): renderEye picks its entry layout from
+// firstViewInImage = (viewportX == 0 && viewportY == 0), and the silhouette
+// renders into the bottom canvas band (viewportY != 0), so it always claims
+// COLOR_ATTACHMENT_OPTIMAL — while the image is UNDEFINED on first use and
+// TRANSFER_SRC_OPTIMAL after every readback copy. Keep the claim true: between
+// renderEye calls the scratch image sits cleared in COLOR_ATTACHMENT_OPTIMAL.
+static void RecordSilhouettePrep(VkCommandBuffer cmd, VkImage img, VkImageLayout oldLayout,
+                                 VkPipelineStageFlags srcStage, VkAccessFlags srcAccess) {
+    VkImageMemoryBarrier b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.image = img;
+    b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    b.srcAccessMask = srcAccess;
+    b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    b.oldLayout = oldLayout;
+    b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    vkCmdPipelineBarrier(cmd, srcStage, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        0, 0, nullptr, 0, nullptr, 1, &b);
+    const VkClearColorValue zero = {{0.0f, 0.0f, 0.0f, 0.0f}};
+    vkCmdClearColorImage(cmd, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &zero, 1,
+        &b.subresourceRange);
+    b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    b.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    b.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+}
 
 static bool EnsureSilhouetteTargets(VkDevice dev, VkPhysicalDevice phys, uint32_t w, uint32_t h) {
     if (g_silImage.image != VK_NULL_HANDLE && g_silImage.width == w && g_silImage.height == h)
@@ -2253,9 +2285,14 @@ static bool EnsureSilhouetteTargets(VkDevice dev, VkPhysicalDevice phys, uint32_
         modelDestroyBuffer(dev, g_silReadback);
         g_silMapped = nullptr;
     }
+    // avatar#99: COLOR_ATTACHMENT is required too — renderEye's barriers name
+    // COLOR_ATTACHMENT_OPTIMAL, and modelCreateImage2D always creates a view,
+    // which a TRANSFER-only image cannot have ("failed to create image view").
     g_silImage = modelCreateImage2D(dev, phys, w, h, VK_FORMAT_R8G8B8A8_UNORM,
-        VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+        VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
     if (g_silImage.image == VK_NULL_HANDLE) return false;
+    g_silImageFresh = true;
     g_silReadback = modelCreateBuffer(dev, phys, (VkDeviceSize)w * h * 4,
         VK_BUFFER_USAGE_TRANSFER_DST_BIT,
         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
@@ -2316,6 +2353,26 @@ static void UpdateSilhouette(VkDevice dev, VkPhysicalDevice phys, VkQueue queue,
     uint32_t w = winW / 3; if (w < 64) w = 64; if (w > 640) w = 640;
     uint32_t h = winH / 3; if (h < 64) h = 64; if (h > 360) h = 360;
     if (!EnsureSilhouetteTargets(dev, phys, w, h)) return;
+    if (g_silImageFresh) {
+        VkCommandBufferAllocateInfo pai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        pai.commandPool = pool; pai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        pai.commandBufferCount = 1;
+        VkCommandBuffer pcmd = VK_NULL_HANDLE;
+        if (vkAllocateCommandBuffers(dev, &pai, &pcmd) != VK_SUCCESS) return;
+        VkCommandBufferBeginInfo pbi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        pbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        vkBeginCommandBuffer(pcmd, &pbi);
+        RecordSilhouettePrep(pcmd, g_silImage.image, VK_IMAGE_LAYOUT_UNDEFINED,
+            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0);
+        vkEndCommandBuffer(pcmd);
+        VkSubmitInfo psi = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        psi.commandBufferCount = 1; psi.pCommandBuffers = &pcmd;
+        const bool ok = (vkQueueSubmit(queue, 1, &psi, VK_NULL_HANDLE) == VK_SUCCESS);
+        if (ok) vkQueueWaitIdle(queue);
+        vkFreeCommandBuffers(dev, pool, 1, &pcmd);
+        if (!ok) return;
+        g_silImageFresh = false;
+    }
 
     const uint32_t silIdx[2] = {0, numViews - 1};
     const uint32_t silPasses = (numViews > 1) ? 2u : 1u;
@@ -2364,6 +2421,9 @@ static void UpdateSilhouette(VkDevice dev, VkPhysicalDevice phys, VkQueue queue,
         region.imageExtent = {w, h, 1};
         vkCmdCopyImageToBuffer(cmd, g_silImage.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
             g_silReadback.buffer, 1, &region);
+        // avatar#99: back to cleared COLOR_ATTACHMENT_OPTIMAL for the next renderEye.
+        RecordSilhouettePrep(cmd, g_silImage.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
         vkEndCommandBuffer(cmd);
         VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
         si.commandBufferCount = 1; si.pCommandBuffers = &cmd;

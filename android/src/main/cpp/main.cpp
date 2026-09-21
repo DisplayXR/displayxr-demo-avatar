@@ -644,7 +644,13 @@ ensure_sil_targets(uint32_t w, uint32_t h)
 	}
 	g_sil_image = modelCreateImage2D(g_vk_device, g_vk_phys_device, w, h,
 	    VK_FORMAT_R8G8B8A8_UNORM,
-	    VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+	    // avatar#99: COLOR_ATTACHMENT too — renderEye's exit barrier names
+	    // COLOR_ATTACHMENT_OPTIMAL, and modelCreateImage2D always creates a view
+	    // (a TRANSFER-only image is not view-compatible). The entry layout is
+	    // already right here: the scratch is rendered at viewport (0,0), so
+	    // renderEye takes the UNDEFINED (discard) entry.
+	    VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+	        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
 	if (g_sil_image.image == VK_NULL_HANDLE) return false;
 	g_sil_readback = modelCreateBuffer(g_vk_device, g_vk_phys_device, (VkDeviceSize)w * h * 4,
 	    VK_BUFFER_USAGE_TRANSFER_DST_BIT,
