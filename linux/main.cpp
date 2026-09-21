@@ -88,6 +88,14 @@
 // Windows leg takes, used by /make-app-logos and for eyeballing the tile layout
 // without a 3D panel.
 #include <openxr/XR_DXR_atlas_capture.h>
+// XR_DXR_depth_budget (ADR-040): the runtime's advisory rear depth budget, read
+// off XrViewState at xrLocateViews. displayxr-common's clip_policy.h is the ONE
+// place that turns it (or its absence) into near/far + the shader far-cull, and
+// content_mask.h reduces the silhouette to the v3 occupancy grid.
+#include <openxr/XR_DXR_depth_budget.h>
+#include "clip_policy.h"
+#include "content_mask.h"
+
 #include "clickthrough.h" // XShape silhouette click-through for the overlay
 
 #include <cmath>
@@ -646,6 +654,11 @@ struct AppXrSession {
     bool hasAtlasCapture = false;
     PFN_xrCaptureAtlasDXR pfnCaptureAtlas = nullptr;
 
+    // XR_DXR_depth_budget (#81 / ADR-040). `version` is the RUNTIME's reported
+    // extensionVersion, never this app's vendored SPEC_VERSION: a v2 runtime
+    // must never be handed the v3 content-mask chain it cannot parse.
+    bool hasDepthBudget = false;
+    uint32_t depthBudgetVersion = 0;
 };
 
 // Default portrait client size (Windows parity: windows/main.cpp g_windowWidth ×
@@ -1388,6 +1401,12 @@ static bool InitializeOpenXR(AppXrSession& xr) {
         if (strcmp(ext.extensionName, XR_DXR_LOCAL_3D_ZONE_EXTENSION_NAME) == 0) hasLocal3DZone = true;
         if (strcmp(ext.extensionName, XR_DXR_DISPLAY_ZONES_EXTENSION_NAME) == 0) hasDisplayZones = true;
         if (strcmp(ext.extensionName, XR_DXR_ATLAS_CAPTURE_EXTENSION_NAME) == 0) hasAtlasCapture = true;
+        if (strcmp(ext.extensionName, XR_DXR_DEPTH_BUDGET_EXTENSION_NAME) == 0) {
+            xr.hasDepthBudget = true;
+            // The RUNTIME's version, not this app's vendored SPEC_VERSION — the
+            // v3 content-mask chain must never reach a v2 runtime.
+            xr.depthBudgetVersion = ext.extensionVersion;
+        }
     }
 
     LOG_INFO("XR_KHR_vulkan_enable: %s", hasVulkan ? "AVAILABLE" : "NOT FOUND");
@@ -1398,6 +1417,8 @@ static bool InitializeOpenXR(AppXrSession& xr) {
     LOG_INFO("XR_DXR_local_3d_zone: %s", hasLocal3DZone ? "AVAILABLE" : "NOT FOUND");
     LOG_INFO("XR_DXR_display_zones: %s", hasDisplayZones ? "AVAILABLE" : "NOT FOUND");
     LOG_INFO("XR_DXR_atlas_capture: %s", hasAtlasCapture ? "AVAILABLE" : "NOT FOUND");
+    LOG_INFO("XR_DXR_depth_budget: %s (v%u)", xr.hasDepthBudget ? "AVAILABLE" : "NOT FOUND",
+             xr.depthBudgetVersion);
 
     std::vector<const char*> enabledExtensions;
     enabledExtensions.push_back(XR_KHR_VULKAN_ENABLE_EXTENSION_NAME);
@@ -1453,6 +1474,14 @@ static bool InitializeOpenXR(AppXrSession& xr) {
     if (hasAtlasCapture) {
         enabledExtensions.push_back(XR_DXR_ATLAS_CAPTURE_EXTENSION_NAME);
         xr.hasAtlasCapture = true;
+    }
+    // XR_DXR_depth_budget (ADR-040): opt in so the runtime publishes its
+    // advisory rear budget on XrViewState. Without the opt-in the runtime keeps
+    // the conservative default and dxr::ResolveClipPlanes falls back to the
+    // hard ZDP clip — i.e. exactly the pre-extension behaviour, which is what
+    // this leg did before.
+    if (xr.hasDepthBudget) {
+        enabledExtensions.push_back(XR_DXR_DEPTH_BUDGET_EXTENSION_NAME);
     }
 
     XrInstanceCreateInfo createInfo = {XR_TYPE_INSTANCE_CREATE_INFO};
@@ -2390,27 +2419,61 @@ struct FrameViews {
     XrRect2Di contentRect = {{0, 0}, {0, 0}};
 };
 
+// XR_DXR_depth_budget v3 (#81 §6): the retained content-occupancy mask, reduced
+// from the renderer's UNCLIPPED coverage pass once per rendered frame and
+// re-chained verbatim on frames that skip rendering, so the runtime's ROI never
+// goes stale. Render-thread-owned (this loop is one thread).
+static std::vector<uint8_t> g_contentMaskCells;
+static bool g_contentMaskChaining = false;   // one-time log on start/stop, never per frame
+// Grid resolution for the chained mask: well under the extension's 512 cap and
+// its 256 recommended ceiling. The runtime dilates by its own disparity band
+// before measuring anything, so coarse is the point, not a shortcut.
+static constexpr uint32_t kContentMaskGridCells = 64;
+
 /*!
- * Fill one view's matrices from the runtime's render-ready pose/fov.
+ * The `standalone` predicate dxr::ResolveClipPlanes takes: true when no
+ * workspace controller is arbitrating behind us, which is when the hard
+ * clip-at-the-ZDP rule applies. Derived from display_info v13's
+ * `isRequestable` exactly as windows/main.cpp derives it — a non-controller
+ * session under a workspace cannot request modes, and its per-app transparent
+ * bridge is bypassed, so it must not self-clip.
+ */
+static bool AppIsStandalone(const AppXrSession& xr) {
+    if (xr.renderingModeCount == 0) return true;
+    const uint32_t i = (xr.activeRenderingMode < xr.renderingModeCount) ? xr.activeRenderingMode : 0u;
+    return xr.renderingModeIsRequestable[i];
+}
+
+/*!
+ * Fill one view's matrices from the runtime's render-ready pose/fov, resolving
+ * near/far through the shared rear-depth-budget policy.
  *
- * Foreground-only clip: far = the eye→display distance, so the far plane
- * coincides with the virtual display plane and only popping-out content shows
- * over the desktop. The coverage pass gets its OWN unrestricted-far projection
- * (runtime#1470) — the rasterizer's NDC z > 1 clip is a second clip the
- * fragment shader cannot see.
+ * `budget` is non-null only when the runtime actually filled the chained
+ * struct this locate; nullptr reproduces the pre-extension rule bit-for-bit
+ * (`farOffsetVH = transparent && standalone ? 0 : 1000`), which is what this
+ * leg hard-coded as `farZ = ez` before.
+ *
+ * The coverage pass gets its OWN unrestricted-far projection (runtime#1470):
+ * the rasterizer's NDC z > 1 clip is a second, budget-dependent clip the
+ * fragment shader cannot see, so a mask derived from the real pass would be a
+ * function of the budget that produced it and would oscillate against it.
  */
 static void FillFrameView(FrameViews& fv, uint32_t i, const XrView& v,
-                          const float rigPos[3], float vHeight) {
-    (void)vHeight;
+                          const float rigPos[3], float vHeight,
+                          const XrRearDepthBudgetDXR* budget, bool standalone) {
     mat4_view_from_xr_pose(fv.view[i], v.pose);
+    // Identity rig orientation → RigLocalEyeZ reduces to the z difference.
     const float ez = fabsf(v.pose.position.z - rigPos[2]);
-    const float farZ = (ez > 0.02f) ? ez : 100.0f;
-    mat4_from_xr_fov(fv.proj[i], v.fov, 0.01f, farZ);
-    mat4_from_xr_fov(fv.projUnres[i], v.fov, 0.01f, 100.0f);
+    const dxr::ClipPlanes clip =
+        dxr::ResolveClipPlanes(ez, vHeight, budget, g_transparentBg, standalone);
+    const dxr::ClipPlanes clipUnres =
+        dxr::ResolveClipPlanes(ez, vHeight, /*budget=*/nullptr, /*transparent=*/false, standalone);
+    mat4_from_xr_fov(fv.proj[i], v.fov, clip.near_z, clip.far_z);
+    mat4_from_xr_fov(fv.projUnres[i], v.fov, clipUnres.near_z, clipUnres.far_z);
     // mat4_from_xr_fov emits GL [-1,1] clip depth; Vulkan clips [0,1].
     convert_projection_gl_to_zero_to_one(fv.proj[i]);
     convert_projection_gl_to_zero_to_one(fv.projUnres[i]);
-    fv.clipFar[i] = 0.0f;
+    fv.clipFar[i] = clip.clipFar;
 }
 
 //! Publish the frame's CENTRE view/projection + content rect for the
@@ -2500,6 +2563,12 @@ static bool RenderTigerZone(AppXrSession& xr, const XrFrameState& frameState,
     locateInfo.displayTime = frameState.predictedDisplayTime;
     locateInfo.space = xr.localSpace;
     XrViewState viewState = {XR_TYPE_VIEW_STATE};
+    // XR_DXR_depth_budget: the runtime writes its advisory rear budget into
+    // this chained struct. Zero-init means "untouched" — the `type` field is
+    // the discriminator, so a runtime that ignores the chain is told apart
+    // from one that deliberately returned an all-zero-vH clip.
+    XrRearDepthBudgetDXR budget = {};
+    if (xr.hasDepthBudget) dxr::ChainRearDepthBudget(viewState, budget);
     uint32_t viewCountOut = 0;
     XrView zoneViews[kMaxViews];
     for (uint32_t i = 0; i < kMaxViews; i++) zoneViews[i] = {XR_TYPE_VIEW};
@@ -2538,13 +2607,18 @@ static bool RenderTigerZone(AppXrSession& xr, const XrFrameState& frameState,
         return false;
     }
 
+    // XR_DXR_depth_budget: the runtime's advisory value, or nullptr when it
+    // left the chained struct untouched (see ChainRearDepthBudget above).
+    const XrRearDepthBudgetDXR* pBudget =
+        (budget.type == (XrStructureType)XR_TYPE_REAR_DEPTH_BUDGET_DXR) ? &budget : nullptr;
+    const bool standalone = AppIsStandalone(xr);
     const float vHeight = rig.virtualDisplayHeight;
 
     fv.count = n;
     fv.contentRect = outZone.rect;
     projViews.assign(n, {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW});
     for (uint32_t i = 0; i < n; i++) {
-        FillFrameView(fv, i, zoneViews[i], rigPos, vHeight);
+        FillFrameView(fv, i, zoneViews[i], rigPos, vHeight, pBudget, standalone);
         ModelRenderer::MaskProjections mp;
         mp.unrestricted = fv.projUnres[i];
         // Render the avatar into this eye's tile of the zone swapchain.
@@ -2791,6 +2865,10 @@ int main(int argc, char** argv) {
             }
 
             XrViewState viewState = {XR_TYPE_VIEW_STATE};
+            // XR_DXR_depth_budget — see the zone locate for the type-field
+            // "untouched" discriminator.
+            XrRearDepthBudgetDXR budget = {};
+            if (xr.hasDepthBudget) dxr::ChainRearDepthBudget(viewState, budget);
             uint32_t viewCount = 0;
             xrLocateViews(xr.session, &locateInfo, &viewState, 0, &viewCount, nullptr);
             if (viewCount == 0) viewCount = 2;
@@ -2869,6 +2947,14 @@ int main(int argc, char** argv) {
                         if (eyeW > xr.swapchain.width / eyeCount) eyeW = xr.swapchain.width / eyeCount;
                         if (eyeH > xr.swapchain.height) eyeH = xr.swapchain.height;
                         projViews.resize(eyeCount, {});
+                        // Foreground clip: far = eye→display distance, so the far
+                        // plane coincides with the virtual display plane, with the
+                        // runtime's advisory rear budget allowed to push it back.
+                        // dxr::ResolveClipPlanes owns that whole rule — nullptr
+                        // budget reproduces the old hard `farZ = ez` exactly.
+                        const XrRearDepthBudgetDXR* pBudget =
+                            (budget.type == (XrStructureType)XR_TYPE_REAR_DEPTH_BUDGET_DXR) ? &budget : nullptr;
+                        const bool standalone = AppIsStandalone(xr);
                         const float vHeight = displayRig.virtualDisplayHeight;
                         float rigPos[3];
                         ComputeRigPosition(rigPos);
@@ -2883,7 +2969,7 @@ int main(int argc, char** argv) {
                             // model center, sized to the model) owns the framing. No
                             // model-fit baked into the view.
                             const uint32_t fi = (i < kMaxViews) ? i : kMaxViews - 1;
-                            FillFrameView(fv, fi, views[i], rigPos, vHeight);
+                            FillFrameView(fv, fi, views[i], rigPos, vHeight, pBudget, standalone);
                             ModelRenderer::MaskProjections mp;
                             mp.unrestricted = fv.projUnres[fi];
                             // Draw the avatar into this eye's SBS viewport region.
@@ -2939,6 +3025,18 @@ int main(int argc, char** argv) {
         // XShape input region decides where the window exists at all, so a
         // stale one clips the leading edge of a moving avatar.
         if (rendered && xr.usingAppWindow && fv.count > 0) {
+            // runtime#1470: arm the renderer's coverage-only pass for exactly
+            // the two views the silhouette pass is about to render. It redraws
+            // the avatar with the far clip absent, so the content mask
+            // describes the silhouette AS IT WOULD RENDER AT AN UNRESTRICTED
+            // BUDGET — the rendered alpha cannot, because it is a function of
+            // the budget the runtime published and the two oscillate against
+            // each other. beginFrame() disarms. Gated on the RUNTIME's
+            // reported version, never this app's vendored SPEC_VERSION.
+            const bool wantContentMask =
+                xr.hasDepthBudget && xr.depthBudgetVersion >= 3 && zonesFrame;
+            g_modelRenderer.beginContentMaskFrame(wantContentMask);
+
             ClickthroughParams cp;
             cp.dev = vkDevice;
             cp.phys = physDevice;
@@ -2969,6 +3067,41 @@ int main(int argc, char** argv) {
             cp.bubbleH = bubbleBandH;
             ClickthroughUpdate(cp);
 
+            // XR_DXR_depth_budget v3 (#81 §6): reduce the frame's UNCLIPPED
+            // coverage to the extension's occupancy grid. Deliberately NOT the
+            // click-through coverage — that one legitimately wants the
+            // post-clip alpha (the window must not be drawn or clickable where
+            // nothing rendered); the budget mask must not, or it feeds the
+            // runtime's own hysteresis (runtime#1470). Null until the first
+            // armed frame has been read back — chain nothing rather than fall
+            // back to the clipped alpha, so the runtime uses its coarser but
+            // clip-independent fallback.
+            if (wantContentMask) {
+                std::vector<uint8_t> maskCells;
+                bool haveMask = false;
+                const uint8_t* cov = g_modelRenderer.contentMaskCoverage();
+                if (cov != nullptr) {
+                    haveMask = dxr::ContentMaskFromCoverage(
+                        cov, ModelRenderer::kContentMaskCovW, ModelRenderer::kContentMaskCovH,
+                        ModelRenderer::kContentMaskCovW, (uint32_t)winPxW, (uint32_t)winPxH,
+                        &fv.contentRect, kContentMaskGridCells, kContentMaskGridCells, maskCells);
+                }
+                const uint32_t occupied = haveMask ? dxr::ContentMaskCoverageCells(maskCells) : 0;
+                if (occupied > 0) {
+                    g_contentMaskCells.swap(maskCells);
+                    if (!g_contentMaskChaining) {
+                        g_contentMaskChaining = true;
+                        LOG_INFO("XR_DXR_depth_budget v3: content mask chaining started "
+                                 "(%ux%u cells, %u occupied)",
+                                 kContentMaskGridCells, kContentMaskGridCells, occupied);
+                    }
+                } else if (g_contentMaskChaining) {
+                    g_contentMaskChaining = false;
+                    g_contentMaskCells.clear();
+                    LOG_INFO("XR_DXR_depth_budget v3: content mask chaining stopped "
+                             "(no coverage) — falling back to the runtime's own ROI");
+                }
+            }
         }
 
         XrFrameEndInfo endInfo = {XR_TYPE_FRAME_END_INFO};
@@ -3036,6 +3169,17 @@ int main(int argc, char** argv) {
             zonesEnd.flags = XR_DISPLAY_ZONES_FRAME_END_VALIDATE_BIT_DXR;
             zonesEnd.wishMask = XR_NULL_HANDLE;
             endInfo.next = &zonesEnd;
+        }
+        // XR_DXR_depth_budget v3: chain the retained content mask AFTER the
+        // zones struct (ChainContentMask prepends, keeping whatever was linked
+        // reachable). Chained on EVERY frame it is non-empty, including frames
+        // that skipped rendering — the runtime's ROI must not go stale just
+        // because we had nothing new to draw. The vector is file-scope, so it
+        // outlives the xrEndFrame call as the helper requires.
+        XrContentMaskDXR contentMaskDXR = {};
+        if (xr.hasDepthBudget && xr.depthBudgetVersion >= 3 && !g_contentMaskCells.empty()) {
+            dxr::ChainContentMask(endInfo, contentMaskDXR, g_contentMaskCells,
+                                  kContentMaskGridCells, kContentMaskGridCells);
         }
         xrEndFrame(xr.session, &endInfo);
     }
