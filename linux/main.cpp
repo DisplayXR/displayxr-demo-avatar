@@ -934,7 +934,7 @@ static bool CreateAppWindow(AppXrSession& xr) {
     // had no RMB window-move, no wheel zoom and no double-click focus.
     attrs.event_mask = StructureNotifyMask | KeyPressMask | KeyReleaseMask |
                        ButtonPressMask | ButtonReleaseMask | PointerMotionMask |
-                       LeaveWindowMask;
+                       FocusChangeMask;
 
     // Portrait default, centered on the 3D panel (RandR). Fall back to centering
     // on the default screen if Xrandr yields nothing.
@@ -1349,10 +1349,14 @@ static void PumpXEvents(AppXrSession& xr) {
             }
             break;
 
-        case LeaveNotify:
-            // Losing the pointer means losing the keys: a held W that is
-            // released over another window never reaches us, and the avatar
-            // would pan forever.
+        case FocusOut:
+            // Losing KEYBOARD focus means losing the keys: a held W released
+            // over another window never reaches us, and the avatar would pan
+            // forever. Deliberately FocusOut and not LeaveNotify — the XShape
+            // input region is rebuilt every frame as the avatar animates, so
+            // the pointer crosses its boundary constantly while the keyboard
+            // focus is perfectly stable, and clearing on a pointer crossing
+            // would make WASD unusable whenever the cursor sat near an edge.
             g_keyW = g_keyA = g_keyS = g_keyD = g_keyQ = g_keyE = false;
             s_manualDrag = false;
             break;
