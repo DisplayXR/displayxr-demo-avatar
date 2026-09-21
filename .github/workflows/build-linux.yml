@@ -16,8 +16,10 @@ name: Build Linux
 # success in seconds without building.
 #
 # Build-green scope: compile avatar_handle_vk_linux. CI has no display/GPU, so
-# the app is never run here; on-screen validation is a separate pass gated on
-# the runtime's Linux Phase 1b/3b + hardware.
+# the app is never run here. On-screen operation is NOT gated any more — the
+# leg runs on real hardware (see CLAUDE.md § Linux) — but validating it stays a
+# separate manual pass, because weave geometry cannot be checked without a
+# vendor panel.
 
 on:
   workflow_dispatch: {}
@@ -104,10 +106,12 @@ jobs:
       # renderer with NO media deps, so — unlike the mediaplayer — no FFmpeg.
       #
       # X11 / Wayland / ALSA dev headers + the GLX-flip pair (libxxf86vm-dev +
-      # libxcb-glx0-dev): the app itself is hosted-NULL (links no window toolkit
-      # yet), but these are the standard demo-port deps and guard the from-source
-      # OpenXR-SDK loader build against the GLX-flip gotcha should GL/EGL headers
-      # ever be pulled in (see the playbook).
+      # libxcb-glx0-dev). The app creates its OWN X11 window, so libx11-dev
+      # (Xlib + XKBlib), libxext-dev (XShape click-through) and libxrandr-dev
+      # (panel rect) are hard requirements, not just standard demo-port deps;
+      # the rest guard the from-source OpenXR-SDK loader build against the
+      # GLX-flip gotcha should GL/EGL headers ever be pulled in (see the
+      # playbook).
       # SUDO shim so the same step works on hosted runners (non-root, has sudo)
       # and in the container (root, no sudo).
       - name: Install dependencies
