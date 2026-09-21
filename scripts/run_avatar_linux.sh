@@ -7,10 +7,25 @@
 # discovery, the native Vulkan compositor path, and an anaglyph weave so output
 # is eyeball-checkable without 3D hardware.
 #
-# NOTE: on-screen operation is gated on the runtime's Linux Phase 1b/3b
-# hardware bring-up. The app is currently HOSTED-NULL (the runtime self-creates
-# its window); the faithful app-owned X11 window via XR_DXR_xlib_window_binding
-# is Phase-3 work (the header is already vendored in openxr_includes/).
+# The app creates its own 32-bit ARGB X11 window and hands it to the runtime via
+# XR_DXR_xlib_window_binding (transparent overlay); it only falls back to
+# hosted-NULL when there is no X server or the runtime lacks the extension.
+#
+# SIM_DISPLAY_OUTPUT below defaults to the sim-display anaglyph weave, which
+# EXERCISES THE PIPELINE AND VALIDATES NOTHING ABOUT WEAVING. sim_display
+# composites the views in a way that degrades gracefully under resampling,
+# cropping or a wrong origin, so a plausible-looking anaglyph run proves only
+# plug-in discovery, session/swapchain creation and that the compositor handed
+# the display processor an atlas. Geometric correctness — the exact woven
+# texture size, the 1:1 physical-pixel mapping and the interlacing phase a real
+# lenticular panel needs — can only be established on vendor hardware. For a
+# hardware run, point XRT_PLUGIN_SEARCH_PATH at the Leia plug-in and leave
+# SIM_DISPLAY_OUTPUT unset.
+#
+# App environment (see linux/main.cpp's header for the full list):
+#   AVATAR_TRANSPARENT=0     start opaque; Ctrl+T toggles at runtime
+#   AVATAR_WINDOW=WxH+X+Y    override the window rect (absolute desktop px);
+#                            W×H alone re-centres on the 3D panel
 #
 # Usage: scripts/run_avatar_linux.sh [model.glb|.gltf|.fbx] [extra args...]
 set -euo pipefail
@@ -32,8 +47,9 @@ export XRT_PLUGIN_SEARCH_PATH
 # Native Vulkan compositor (Phase 1 vk_native + VK_KHR_xcb_surface path).
 export OXR_ENABLE_VK_NATIVE_COMPOSITOR="${OXR_ENABLE_VK_NATIVE_COMPOSITOR:-1}"
 
-# Sim-display weave for eyeball checks without 3D hardware.
-export SIM_DISPLAY_OUTPUT="${SIM_DISPLAY_OUTPUT:-anaglyph}"
+# Sim-display weave for eyeball checks without 3D hardware. NOT a weave-geometry
+# check — see the header. Set SIM_DISPLAY_OUTPUT= (empty) to leave it alone.
+export SIM_DISPLAY_OUTPUT="${SIM_DISPLAY_OUTPUT-anaglyph}"
 
 # Script-built OpenXR loader (scripts/build_linux.sh installs it here). Unlike
 # Windows/macOS, the exe-adjacent copy isn't on the Linux search path.

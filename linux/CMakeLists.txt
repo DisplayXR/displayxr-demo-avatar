@@ -7,12 +7,15 @@
 # added ../common and ../model_common as subdirectories, exposing the
 # `sr_common_base` and `model_renderer` targets.
 #
-# linux/main.cpp is the desktop-Linux entry point: a minimal Vulkan + OpenXR
-# frame loop (HOSTED-NULL windowing — the runtime self-creates its window; the
-# app-owned X11 window via XR_DXR_xlib_window_binding is Phase-3 work) driving
-# the same cross-platform model_common/ModelRenderer the macOS/Windows peers
-# use. Build-green vehicle for the M8 Linux epic (#21, meta runtime #699); see
-# docs/guides/linux-demo-port.md in displayxr-runtime.
+# linux/main.cpp is the desktop-Linux entry point: a Vulkan + OpenXR frame loop
+# driving the same cross-platform model_common/ModelRenderer the macOS/Windows
+# peers use. Windowing is an APP-OWNED 32-bit ARGB X11 window handed over via
+# XR_DXR_xlib_window_binding (transparent overlay), falling back to hosted-NULL
+# only when there is no X server or the extension is absent (headless CI).
+# Feature parity with windows/main.cpp: display-zone framing, Local2D speech
+# bubble, XShape click-through, XR_DXR_depth_budget, keyboard + mouse controls.
+# M8 Linux epic (#21, meta runtime #699); see docs/guides/linux-demo-port.md in
+# displayxr-runtime.
 
 cmake_minimum_required(VERSION 3.21)
 

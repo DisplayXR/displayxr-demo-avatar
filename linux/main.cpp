@@ -2,32 +2,45 @@
 // SPDX-License-Identifier: Apache-2.0
 /*!
  * @file
- * @brief  Linux entry point for the DisplayXR avatar demo (build-green, #21).
+ * @brief  Linux entry point for the DisplayXR avatar demo.
  *
  * The avatar demo has per-platform entry points — macos/main.mm (Cocoa) and
  * windows/main.cpp (Win32). This is the Linux sibling. It drives the SAME
  * vendor-neutral, cross-platform ModelRenderer (model_common/) through a
- * minimal Vulkan + OpenXR frame loop, so a Linux CI job compiles and links the
- * heavy renderer stack (tinygltf / tinyusdz / ufbx / glm / SPIR-V shaders) that
- * is the real portability surface of this demo.
+ * Vulkan + OpenXR frame loop. windows/main.cpp is the parity spec for
+ * everything above the renderer.
  *
  * Windowing — APP-OWNED X11 WINDOW (transparent overlay, runtime#757). The app
  * creates a 32-bit ARGB X11 window and hands it to the runtime via
  * XR_DXR_xlib_window_binding with transparentBackgroundEnabled, so transparent
  * pixels compose through to the desktop — the transparent/click-through avatar
  * (the Lenovo use case). Falls back to hosted-NULL (graphics binding chained
- * straight in, runtime self-creates its window) when no X server / the extension
- * is absent (e.g. headless CI). Click-through is wired via an XShape input region
- * refreshed each frame from the avatar silhouette (clickthrough.cpp). The
- * macOS/Windows peers'
- * speech-bubble window-space layer (XR_DXR_local_3d_zone /
- * XrCompositionLayerWindowSpaceDXR) is likewise deferred to Phase 3 — this
- * build-green vehicle submits only the base projection layer.
+ * straight in, runtime self-creates its window) when no X server / the
+ * extension is absent (e.g. headless CI), where the Local2D bubble is
+ * suppressed because xrEndFrame rejects it without an external window.
  *
- * NOT a full port of the macOS/Windows app: no HUD, input, MCP tools, mode
- * switching, or auto-fit. Those live in the platform entry points and are added
- * when on-screen Linux support lands. This file exists to keep the demo
- * build-green on ubuntu-latest.
+ * What this leg does: display-zone framing (the avatar in the bottom 75%,
+ * XR_DXR_display_zones), the Local2D speech bubble in the top 25%, auto-fit
+ * against the zone rect, dynamic recenter, XShape silhouette click-through
+ * (clickthrough.cpp), XR_DXR_depth_budget v1 + v3, rendering-mode adoption and
+ * switching, and the Windows leg's keyboard + mouse controls (see the control
+ * table on PumpXEvents).
+ *
+ * What it still does not do: no on-panel HUD or toast chips (the bubble is the
+ * only overlay), no XR_DXR_mcp_tools agent surface, no drag-and-drop model
+ * load (Ctrl+O opens a zenity picker instead), no camera-rig round-trip (C).
+ *
+ * Environment:
+ *   AVATAR_TRANSPARENT=0        start opaque (Ctrl+T toggles at runtime)
+ *   AVATAR_WINDOW=WxH+X+Y       override the window rect; X,Y are absolute
+ *                               virtual-desktop px. W×H alone re-centres on
+ *                               the 3D panel.
+ *   DXR_RECENTER_PIN=XYZ|XY|Z|- initial recenter pins (P then X/Y/Z at runtime)
+ *   DXR_ZONES_VALIDATE=1        strict zone locate/submit pairing check
+ *   DXR_DUMP_BUBBLE=1           dump the rasterised bubble to /tmp
+ *   DXR_AVATAR_SIL_TEXEL_PX / _DILATE / _ALPHA, DXR_VK_NO_HOST_CACHED=1
+ *                               click-through silhouette levers
+ *                               (see clickthrough.cpp)
  */
 
 #include <vulkan/vulkan.h>
@@ -1809,6 +1822,10 @@ static bool CreateSession(AppXrSession& xr, VkInstance vkInstance, VkPhysicalDev
         const char* e = getenv("AVATAR_TRANSPARENT");
         return e == nullptr || e[0] == '\0' || e[0] != '0';
     }();
+    // Seed the Ctrl+T state from the same flag: the session's transparency is
+    // fixed here, and drawing a transparent frame into an OPAQUE session gives
+    // black where the desktop should be, not see-through.
+    g_transparentBg = wantTransparent;
     XrXlibWindowBindingCreateInfoDXR xlibBinding = {XR_TYPE_XLIB_WINDOW_BINDING_CREATE_INFO_DXR};
     xlibBinding.next = &vkBinding;
     xlibBinding.xDisplay = xr.xDisplay;
@@ -3024,7 +3041,20 @@ int main(int argc, char** argv) {
         // fence and HOST_CACHED, and the region is not only a hit mask — the
         // XShape input region decides where the window exists at all, so a
         // stale one clips the leading edge of a moving avatar.
-        if (rendered && xr.usingAppWindow && fv.count > 0) {
+        // DXR_AVATAR_SIL_EVERY_N=<n> restores a throttle (n=1, every frame, is
+        // the default and the Windows behaviour). Kept as an escape hatch
+        // because the every-frame cost has been measured on Windows hardware
+        // but not yet on Linux; at n>1 the region lags a moving avatar.
+        static const uint32_t s_silEveryN = []() {
+            const char* e = getenv("DXR_AVATAR_SIL_EVERY_N");
+            if (e == nullptr || e[0] == '\0') return 1u;
+            const long v = strtol(e, nullptr, 10);
+            return (v >= 1 && v <= 60) ? (uint32_t)v : 1u;
+        }();
+        static uint32_t s_silFrame = 0;
+        const bool silThisFrame = (s_silEveryN == 1) || ((s_silFrame++ % s_silEveryN) == 0);
+
+        if (rendered && xr.usingAppWindow && fv.count > 0 && silThisFrame) {
             // runtime#1470: arm the renderer's coverage-only pass for exactly
             // the two views the silhouette pass is about to render. It redraws
             // the avatar with the far clip absent, so the content mask
@@ -3033,8 +3063,12 @@ int main(int argc, char** argv) {
             // the budget the runtime published and the two oscillate against
             // each other. beginFrame() disarms. Gated on the RUNTIME's
             // reported version, never this app's vendored SPEC_VERSION.
-            const bool wantContentMask =
-                xr.hasDepthBudget && xr.depthBudgetVersion >= 3 && zonesFrame;
+            // Opaque or decorated frames are excluded: ResolveClipPlanes leaves
+            // an opaque frame unrestricted (so the ROI is moot) and
+            // ClickthroughUpdate returns without rendering in both cases, which
+            // would leave the coverage stale.
+            const bool wantContentMask = xr.hasDepthBudget && xr.depthBudgetVersion >= 3 &&
+                                         zonesFrame && g_transparentBg && !g_decorated;
             g_modelRenderer.beginContentMaskFrame(wantContentMask);
 
             ClickthroughParams cp;
@@ -3095,11 +3129,16 @@ int main(int argc, char** argv) {
                                  "(%ux%u cells, %u occupied)",
                                  kContentMaskGridCells, kContentMaskGridCells, occupied);
                     }
-                } else if (g_contentMaskChaining) {
+                } else {
+                    g_contentMaskCells.clear();
+                }
+            }
+            if (!wantContentMask || g_contentMaskCells.empty()) {
+                if (g_contentMaskChaining) {
                     g_contentMaskChaining = false;
                     g_contentMaskCells.clear();
                     LOG_INFO("XR_DXR_depth_budget v3: content mask chaining stopped "
-                             "(no coverage) — falling back to the runtime's own ROI");
+                             "— falling back to the runtime's own ROI");
                 }
             }
         }
