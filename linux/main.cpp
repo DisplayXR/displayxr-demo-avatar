@@ -445,6 +445,24 @@ static void ComputeRigPosition(float out[3]) {
     out[2] += g_panZ;
 }
 
+//! The rig position BEFORE the user's pan is added — the fit centre on an
+//! unpinned axis, the smoothed animated centroid on a pinned one. PickFocus
+//! needs it: solving for a pan that lands the rig on a point requires knowing
+//! what the pan is measured from, and with the default X+Y pins that is the
+//! anchor, not g_fitCenter.
+static void ComputeRigBase(float out[3]) {
+    out[0] = g_fitCenter[0];
+    out[1] = g_fitCenter[1];
+    out[2] = g_fitCenter[2];
+    float anchor[3];
+    if (g_fitValid && g_modelRenderer.getAnimatedAnchor(anchor)) {
+        const dxr::RecenterPins pins = g_recenter.pins();
+        if (pins.x) out[0] = anchor[0];
+        if (pins.y) out[1] = anchor[1];
+        if (pins.z) out[2] = anchor[2];
+    }
+}
+
 // Advance the keyboard pan/dolly and the double-click focus ease. One call per
 // frame from the main loop. Speed is windows/main.cpp's exactly:
 // 0.1 · m2v / zoom virtual units per second, where m2v converts metres of
@@ -571,15 +589,22 @@ static bool PickFocus(int clientX, int clientY) {
         LOG_INFO("Focus: no surface under the cursor");
         return false;
     }
-    // Land the RIG on the hit point. ComputeRigPosition applies kPanSign = -1 to
-    // X (so D slides the avatar right), so the X target is pre-negated for the
-    // rig to end up centred on the hit rather than mirrored about the fit
-    // centre. windows/main.cpp routes its teleport through the same kPanSign
-    // without that correction and therefore focuses the mirrored point in X;
-    // this is a deliberate, documented divergence, not an oversight.
-    g_focusTarget[0] = -(hit[0] - g_fitCenter[0]);
-    g_focusTarget[1] =  (hit[1] - g_fitCenter[1]);
-    g_focusTarget[2] =  (hit[2] - g_fitCenter[2]);
+    // Solve for the pan that lands the RIG on the hit point. Two corrections
+    // over the naive (hit - fitCentre):
+    //   - the base is ComputeRigBase, not g_fitCenter. A pinned axis (X and Y
+    //     by default) tracks the smoothed animated centroid, so the pan is
+    //     measured from the anchor and targeting the fit centre would miss by
+    //     (anchor - fitCentre) in exactly the axes that matter;
+    //   - X is pre-negated because ComputeRigPosition applies kPanSign = -1 to
+    //     it (so D slides the avatar right).
+    // windows/main.cpp makes neither correction — it routes teleport through
+    // the same kPanSign against cameraPos — so it focuses the point mirrored in
+    // X and offset by the anchor. A deliberate, documented divergence.
+    float base[3];
+    ComputeRigBase(base);
+    g_focusTarget[0] = -(hit[0] - base[0]);
+    g_focusTarget[1] =  (hit[1] - base[1]);
+    g_focusTarget[2] =  (hit[2] - base[2]);
     g_focusActive = true;
     LOG_INFO("Focus on surface (%.3f, %.3f, %.3f)", hit[0], hit[1], hit[2]);
     return true;
@@ -1350,6 +1375,10 @@ static void PumpXEvents(AppXrSession& xr) {
             break;
 
         case FocusOut:
+            // A grab (a WM keybinding overlay, another client grabbing the
+            // keyboard) reports focus out and straight back in; only a real
+            // focus change should drop the keys.
+            if (ev.xfocus.mode == NotifyGrab || ev.xfocus.mode == NotifyUngrab) break;
             // Losing KEYBOARD focus means losing the keys: a held W released
             // over another window never reaches us, and the avatar would pan
             // forever. Deliberately FocusOut and not LeaveNotify — the XShape
