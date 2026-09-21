@@ -2882,11 +2882,9 @@ static XrQuaternionf FaceYawQuat() {
 static void UpdateFaceYaw(const AppXrSession& xr, float dt) {
     if (!g_zoneRawValid || g_zoneRaw.eyeCountOutput == 0) return;   // hold forward
 
-    // HARDWARE CHECK: -1 was confirmed by eye on the WINDOWS avatar. The Linux
-    // rig quaternion and raw-eye frame are meant to be identical (same runtime
-    // contract, same plain view convention), but this constant has not yet
-    // been confirmed on a Linux panel.
-    static constexpr float FACE_YAW_SIGN = -1.0f;  // viewer-confirmed (Windows)
+    // -1 confirmed by eye on BOTH legs: the Windows avatar, and this Linux leg
+    // on a Leia DS1 (the avatar turns toward the viewer as they step sideways).
+    static constexpr float FACE_YAW_SIGN = -1.0f;  // viewer-confirmed (Windows + Linux)
 
     float cx, cz;
     if (g_zoneRaw.eyeCountOutput < 2) {
