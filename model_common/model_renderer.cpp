@@ -42,6 +42,27 @@
 #include <glm/gtc/quaternion.hpp>      // glm::quat, slerp, mat4_cast
 #include <glm/gtc/matrix_transform.hpp>
 
+// Standard sRGB EOTF: display-referred [0,1] → scene-linear [0,1].
+//
+// The PBR pass renders into an internal UNORM colour image (colorFormat_,
+// R8G8B8A8_UNORM) that a LATER vkCmdBlitImage copies into the per-view
+// swapchain image — and since displayxr-common v2.15.0 (#49) that swapchain is
+// `_SRGB` by default, so the blit's write is what ENCODES.
+//
+// The rule (displayxr-common's dxr::DisplayReferredToSceneLinear;
+// displayxr-runtime #1647 / #1644): the target's format answers "which space do
+// I write?" only when that target is the thing that encodes. Where a later blit
+// encodes, the CALLER must state the space. The shaders already do (they are
+// handed swapchainIsSrgb_ and emit scene-linear) — but a literal
+// display-referred colour written into the intermediate outside a shader must
+// be converted here, or the blit encodes it a second time.
+//
+// Kept as a local 5-liner rather than linking displayxr-common: model_common is
+// vendor-neutral and links only Vulkan + the loaders (see model_common/CMakeLists.txt).
+static float display_referred_to_scene_linear(float c) {
+    return c <= 0.04045f ? c / 12.92f : std::pow((c + 0.055f) / 1.055f, 2.4f);
+}
+
 namespace {
 
 VkShaderModule createShaderModule(VkDevice device, const uint32_t* code, size_t sizeBytes) {
@@ -2583,8 +2604,26 @@ void ModelRenderer::renderEye(VkImage swapchainImage,
     // MSAA path has 3 attachments: [0]=MSAA color (CLEAR), [1]=depth (CLEAR),
     // [2]=resolve (DONT_CARE — slot must exist but value is ignored by the driver).
     VkClearValue clears[3];
-    if (transparentBg) clears[0].color = {{0.0f, 0.0f, 0.0f, 0.0f}};
-    else               clears[0].color = {{0.05f, 0.05f, 0.06f, 1.0f}};
+    if (transparentBg) {
+        // (0,0,0,0) is a fixed point of the sRGB EOTF — nothing to convert.
+        clears[0].color = {{0.0f, 0.0f, 0.0f, 0.0f}};
+    } else {
+        // The opaque background is an authored DISPLAY-REFERRED colour, and it
+        // is written straight into the UNORM intermediate — no shader sees it.
+        // When the swapchain is _SRGB the blit below encodes on write, so the
+        // literal has to go in as scene-linear or it is encoded a second time:
+        // measured (64,64,69) unconverted vs (13,13,13) converted, against
+        // (13,13,15) on a UNORM swapchain. (B lands on 13 rather than 15
+        // because the intermediate is 8-bit: linear 0.05 and 0.06 both quantise
+        // to code 1.) Alpha is not an EOTF channel; it passes through untouched.
+        // See display_referred_to_scene_linear() above (runtime #1647 / #1644).
+        constexpr float kBg[3] = {0.05f, 0.05f, 0.06f};
+        clears[0].color = swapchainIsSrgb_
+            ? VkClearColorValue{{display_referred_to_scene_linear(kBg[0]),
+                                 display_referred_to_scene_linear(kBg[1]),
+                                 display_referred_to_scene_linear(kBg[2]), 1.0f}}
+            : VkClearColorValue{{kBg[0], kBg[1], kBg[2], 1.0f}};
+    }
     clears[1].depthStencil = {1.0f, 0};
     clears[2] = {};
 
