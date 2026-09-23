@@ -37,7 +37,10 @@ FetchContent_Declare(
     # native Wayland in one binary, chosen by capability; transparency,
     # click-through, the phase-snapped drag), shared with the runtime's test
     # apps and the other demos.
-    GIT_TAG v2.20.0
+    # v2.21.0 adds the native-Wayland drag-lattice follow-ups: a table when a
+    # drag reaches the 3D panel, probing off the render thread, a per-drag
+    # summary (displayxr-common#59, runtime#1697).
+    GIT_TAG v2.21.0
     GIT_SHALLOW TRUE
 )
 FetchContent_MakeAvailable(displayxr_common)
