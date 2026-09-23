@@ -30,8 +30,13 @@ message(STATUS "Found Vulkan: ${Vulkan_LIBRARY}")
 # libx11-dev is already a CI dep; the window path falls back to hosted-NULL at
 # runtime when no X server is present (e.g. headless CI), so this only adds a
 # link-time dependency, not a runtime one.
-find_package(X11 REQUIRED)
-message(STATUS "Found X11: ${X11_X11_LIB}")
+# The window — X11 and native Wayland, transparency, click-through, the drag —
+# is displayxr-common's displayxr::linux_window (added by ../common), which
+# detects and links its own window-system libraries.
+if(NOT TARGET displayxr::linux_window)
+    message(FATAL_ERROR "displayxr::linux_window is not available — install libx11-dev "
+                        "(and libwayland-dev libxkbcommon-dev libdbus-1-dev for the native-Wayland leg)")
+endif()
 
 # OpenXR loader — CMake package (e.g. from a from-source /tmp/openxr-install via
 # CMAKE_PREFIX_PATH) → system library → hard error.
@@ -71,7 +76,7 @@ FetchContent_MakeAvailable(stb)
 
 add_executable(avatar_handle_vk_linux
     main.cpp
-    # XShape silhouette click-through for the transparent overlay (runtime#757).
+    # Silhouette click-through for the transparent overlay (runtime#757).
     clickthrough.cpp
     # stb_image (read) implementation TU: displayxr::common only ships a
     # macOS-gated impl, so Linux supplies its own (see the file).
@@ -93,9 +98,7 @@ target_link_libraries(avatar_handle_vk_linux PRIVATE
     model_renderer
     OpenXR::openxr_loader
     Vulkan::Vulkan
-    ${X11_LIBRARIES}
-    ${X11_Xext_LIB}     # XShape — click-through input region
-    ${X11_Xrandr_LIB}   # Xrandr — panel rect for portrait window centering (needs libxrandr-dev)
+    displayxr::linux_window # the ONE Linux window: X11 or Wayland, drag, click-through
 )
 
 # Copy the OpenXR loader .so next to the exe when it's an imported target, so a

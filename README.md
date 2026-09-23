@@ -75,11 +75,12 @@ The same set is wired on Windows, macOS and Linux except where a platform has
 no equivalent — the Linux leg has no on-panel HUD or toast chips, no
 drag-and-drop model load (`Ctrl+O` covers it) and no `C` camera-rig round-trip.
 
-On Linux (X11) the right-click window drag is owned by the app, not the window
-manager: every step goes through the runtime's `xrWeaveSnapWindowRectDXR`
-(`XR_DXR_weave`) so the window only lands on positions where the weave phase is
-unchanged. A window-manager move (the `B` title bar) cannot be snapped on X11
-and will make the 3D shimmer while it moves.
+On Linux one binary runs on X11 or native Wayland (`--platform=x11|wayland|auto`).
+The right-click window drag keeps the weave phase unchanged. On X11 the app
+owns the drag, and every step goes through the runtime's
+`xrWeaveSnapWindowRectDXR` (`XR_DXR_weave`). On Wayland the compositor runs the
+drag, constrained to the same positions. A window-manager move (the `B` title
+bar on X11) cannot be snapped and will make the 3D shimmer while it moves.
 
 There is **no in-app model-load UI** — the avatar auto-loads its bundled tiger.
 Pass a model path as the first CLI argument to float a different character

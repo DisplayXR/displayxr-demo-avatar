@@ -7,9 +7,10 @@
 # discovery, the native Vulkan compositor path, and an anaglyph weave so output
 # is eyeball-checkable without 3D hardware.
 #
-# The app creates its own 32-bit ARGB X11 window and hands it to the runtime via
-# XR_DXR_xlib_window_binding (transparent overlay); it only falls back to
-# hosted-NULL when there is no X server or the runtime lacks the extension.
+# The app creates its own transparent window, X11 or native Wayland
+# (--platform=x11|wayland|auto; default auto = native Wayland when the
+# compositor is ready, else X11), and hands it to the runtime; it only falls
+# back to hosted-NULL when no window system answers.
 #
 # SIM_DISPLAY_OUTPUT below defaults to the sim-display anaglyph weave, which
 # EXERCISES THE PIPELINE AND VALIDATES NOTHING ABOUT WEAVING. sim_display

@@ -2,10 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 /*!
  * @file
- * @brief  X11 XShape click-through from the avatar silhouette (runtime#757).
+ * @brief  Click-through from the avatar silhouette (runtime#757).
  *
  * Ported from windows/main.cpp UpdateSilhouette + UpdateClickRegion (which use
- * SetWindowRgn); the X11 equivalent is an XShape ShapeInput region. See
+ * SetWindowRgn); here the region goes through displayxr::linux_window's
+ * set_input_region() (XShape ShapeInput on X11, the surface input region on
+ * Wayland). See
  * clickthrough.h for what this port fixes relative to the first Linux cut.
  */
 
@@ -14,7 +16,7 @@
 #include "model_renderer.h"
 #include "model_vulkan_utils.h"
 
-#include <X11/extensions/shape.h>
+#include "dxr_linux_window.h" // set_input_region / clear_input_region
 
 #include <vector>
 #include <cstring>
@@ -199,24 +201,6 @@ EnsureTargets(VkDevice dev, VkPhysicalDevice phys, VkQueue queue, VkCommandPool 
 	return true;
 }
 
-//! Is XShape present on this server? Queried once; a server without it gets a
-//! single WARN rather than a silent no-op (the old code never checked).
-static bool
-HaveShapeExtension(Display *dpy)
-{
-	static int s_state = -1; // -1 unknown, 0 absent, 1 present
-	if (s_state < 0) {
-		int eventBase = 0, errorBase = 0;
-		s_state = XShapeQueryExtension(dpy, &eventBase, &errorBase) ? 1 : 0;
-		if (s_state == 0) {
-			fprintf(stderr, "[WARN]  clickthrough: the X server has no SHAPE extension — "
-			                "the overlay will swallow clicks over its whole window "
-			                "instead of passing them through to the desktop.\n");
-		}
-	}
-	return s_state == 1;
-}
-
 //! Fold the previous invocation's readback into the published coverage:
 //! union both planes' alpha, threshold, dilate.
 static void
@@ -300,15 +284,15 @@ ConsumePendingReadback(VkDevice dev, uint32_t dilate, uint8_t alphaMin)
 	g_covReady = true;
 }
 
-//! Turn the published coverage (+ the bubble rect) into the window's XShape
-//! input region.
+//! Turn the published coverage (+ the bubble rect) into the window's input
+//! region.
 static void
 ApplyRegion(const ClickthroughParams &p)
 {
 	if (!g_covReady || g_covW == 0 || g_covH == 0 || p.winW == 0 || p.winH == 0) {
 		return;
 	}
-	std::vector<XRectangle> rects;
+	std::vector<DxrWindowRect> rects;
 
 	// Scale against the LIVE window, not the size the coverage was captured at.
 	// The coverage is a normalised silhouette, so mapping it onto the current
@@ -355,7 +339,7 @@ ApplyRegion(const ClickthroughParams &p)
 		}
 		if (bandFirst != (size_t)-1 && runs == prevRuns) {
 			for (size_t i = bandFirst; i < rects.size(); ++i) {
-				rects[i].height = (unsigned short)(bottom - (int64_t)rects[i].y);
+				rects[i].height = (uint32_t)(bottom - (int64_t)rects[i].y);
 			}
 			continue;
 		}
@@ -364,11 +348,11 @@ ApplyRegion(const ClickthroughParams &p)
 		for (size_t i = 0; i + 1 < runs.size(); i += 2) {
 			const int64_t left = (int64_t)runs[i] * winW / cw;
 			const int64_t right = (int64_t)runs[i + 1] * winW / cw;
-			XRectangle r;
-			r.x = (short)left;
-			r.y = (short)top;
-			r.width = (unsigned short)(right > left ? right - left : 1);
-			r.height = (unsigned short)(bottom > top ? bottom - top : 1);
+			DxrWindowRect r;
+			r.x = (int32_t)left;
+			r.y = (int32_t)top;
+			r.width = (uint32_t)(right > left ? right - left : 1);
+			r.height = (uint32_t)(bottom > top ? bottom - top : 1);
 			rects.push_back(r);
 		}
 		prevRuns = runs;
@@ -378,11 +362,11 @@ ApplyRegion(const ClickthroughParams &p)
 	// the shaped window makes it unclickable (and, on a shaped window, the
 	// region is a VISUAL clip too).
 	if (p.bubbleVisible && p.bubbleW > 0 && p.bubbleH > 0) {
-		XRectangle r;
-		r.x = (short)p.bubbleX;
-		r.y = (short)p.bubbleY;
-		r.width = (unsigned short)p.bubbleW;
-		r.height = (unsigned short)p.bubbleH;
+		DxrWindowRect r;
+		r.x = p.bubbleX;
+		r.y = p.bubbleY;
+		r.width = (uint32_t)p.bubbleW;
+		r.height = (uint32_t)p.bubbleH;
 		rects.push_back(r);
 	}
 
@@ -404,19 +388,14 @@ ApplyRegion(const ClickthroughParams &p)
 	// Set the window's INPUT shape to just the avatar (+ bubble): clicks land
 	// on it, the transparent rest passes through to the desktop. An empty
 	// region means fully click-through (nothing drawn this frame).
-	XShapeCombineRectangles(p.dpy, p.win, ShapeInput, 0, 0, rects.empty() ? nullptr : rects.data(),
-	                        (int)rects.size(), ShapeSet, Unsorted);
-	XFlush(p.dpy);
+	p.window->set_input_region(rects.empty() ? nullptr : rects.data(), rects.size());
 }
 
 void
 ClickthroughUpdate(const ClickthroughParams &p)
 {
-	if (p.dpy == nullptr || p.win == 0 || p.winW == 0 || p.winH == 0 || p.renderer == nullptr ||
+	if (p.window == nullptr || p.winW == 0 || p.winH == 0 || p.renderer == nullptr ||
 	    !p.renderer->hasModel() || p.numViews == 0 || p.viewMats == nullptr || p.projMats == nullptr) {
-		return;
-	}
-	if (!HaveShapeExtension(p.dpy)) {
 		return;
 	}
 
@@ -426,8 +405,7 @@ ClickthroughUpdate(const ClickthroughParams &p)
 	static bool s_shapeCleared = false;
 	if (p.decorated || !p.transparentBg) {
 		if (!s_shapeCleared) {
-			XShapeCombineMask(p.dpy, p.win, ShapeInput, 0, 0, None, ShapeSet);
-			XFlush(p.dpy);
+			p.window->clear_input_region();
 			s_shapeCleared = true;
 		}
 		return;
