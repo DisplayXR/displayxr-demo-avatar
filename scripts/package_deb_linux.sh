@@ -124,23 +124,91 @@ Terminal=false
 Categories=$DESKTOP_CATEGORIES
 EOF
 
-# --- Depends: displayxr-runtime (OpenXR runtime + DP) + the binary's + the
-# loader's DT_NEEDED system libs (usr-merge-safe; excludes 32-bit multiarch). --
-compute_lib_depends() {
-  local sonames so pkg pkgs=""
-  sonames="$(objdump -p "$APPDIR/$BINARY" "$APPDIR"/libopenxr_loader.so* 2>/dev/null | awk '/NEEDED/{print $2}' | sort -u)"
-  for so in $sonames; do
-    # skip the bundled loader itself
+# --- Depends: ONE .deb for Ubuntu 22.04, 24.04 and 26.04 --------------------
+# Two independent things decide whether a .deb installs AND runs on a release,
+# and neither is trusted to the build host here (runtime #1656, its PR #1659):
+#
+#   1. The glibc / libstdc++ floor is the BUILD host's. Release artifacts are
+#      built on the OLDEST supported release (the CI Deb job runs in an
+#      ubuntu:22.04 container), and dpkg-shlibdeps turns the symbol versions
+#      the binaries actually reference into VERSIONED Depends. A package built
+#      on a newer host then says `libc6 (>= 2.38)` and apt REFUSES it on 22.04,
+#      instead of installing a demo that dies at exec with
+#      "version `GLIBC_2.38' not found" (what the unversioned `libc6` from the
+#      old dpkg -S mapping did).
+#      DXR_DEB_MAX_GLIBC (CI sets 2.35 = Ubuntu 22.04) makes a floor above the
+#      oldest supported release a hard error at package time.
+#
+#   2. The package NAME of a system library is not stable across releases (the
+#      t64 transition renamed many: libcurl4 -> libcurl4t64, and the FFmpeg
+#      sonames move every release). So every DT_NEEDED soname must be on
+#      STABLE_SONAMES — libraries whose package name is identical on 22.04,
+#      24.04 and 26.04. A newly linked library fails the build here rather than
+#      silently narrowing the releases the package can install on. Adding an
+#      entry is a claim about all three releases, and CI's DebInstall matrix
+#      (scripts/verify_deb_install_linux.sh) is what proves it.
+STABLE_SONAMES=(
+    libc.so.6 libm.so.6 libdl.so.2 libpthread.so.0 librt.so.1 ld-linux-x86-64.so.2
+    libstdc++.so.6 libgcc_s.so.1
+    libvulkan.so.1                  # libvulkan1
+    libX11.so.6 libX11-xcb.so.1     # libx11-6, libx11-xcb1
+    libXext.so.6                    # libxext6
+    libXrandr.so.2                  # libxrandr2
+    libxcb.so.1                     # libxcb1
+    libz.so.1                       # zlib1g
+)
+
+command -v dpkg-shlibdeps >/dev/null 2>&1 || { echo "error: dpkg-shlibdeps not found — install dpkg-dev." >&2; exit 1; }
+command -v objdump >/dev/null 2>&1 || { echo "error: objdump not found — install binutils." >&2; exit 1; }
+
+# Every ELF the .deb ships: the demo binary plus the bundled OpenXR loader.
+mapfile -t ELF_FILES < <(find "$APPDIR" -type f \( -name "$BINARY" -o -name 'lib*.so*' \) ! -type l | sort)
+[ "${#ELF_FILES[@]}" -ge 1 ] || { echo "error: no ELF payload found under $APPDIR." >&2; exit 1; }
+
+bad=""
+for so in $(objdump -p "${ELF_FILES[@]}" | awk '/NEEDED/{print $2}' | sort -u); do
+    # The OpenXR loader is bundled inside the package, not a system dependency.
     case "$so" in libopenxr_loader.so*) continue ;; esac
-    pkg="$(dpkg -S "$so" 2>/dev/null \
-           | awk -F': ' -v s="$so" '$2 ~ /^\/(usr\/)?lib(32|64)?\// && $2 !~ /(i386-linux-gnu|\/lib32\/|\/libx32\/)/ {n=split($2,a,"/"); if (a[n]==s){p=$1; sub(/:.*/,"",p); print p; exit}}')"
-    [ -n "$pkg" ] && pkgs="$pkgs $pkg"
-  done
-  echo "libc6 $pkgs" | tr ' ' '\n' | sed '/^$/d' | sort -u | paste -sd, - | sed 's/,/, /g'
-}
-LIB_DEPENDS="$(compute_lib_depends)"
+    ok=0
+    for s in "${STABLE_SONAMES[@]}"; do [ "$so" = "$s" ] && ok=1 && break; done
+    [ "$ok" = 1 ] || bad="$bad $so"
+done
+if [ -n "$bad" ]; then
+    echo "error: DT_NEEDED on system libraries not known to share a package name across" >&2
+    echo "       Ubuntu 22.04/24.04/26.04:$bad" >&2
+    echo "       Drop the dependency, link it statically, bundle it, or add it to" >&2
+    echo "       STABLE_SONAMES once CI's DebInstall matrix proves the package exists" >&2
+    echo "       under that name on all three releases." >&2
+    exit 1
+fi
+
+# dpkg-shlibdeps wants a debian/control to read; give it a throwaway one. It
+# resolves each soname through the linker search path and the owning package's
+# shlibs/symbols files, so the result carries real version floors.
+# -l"$APPDIR": the bundled OpenXR loader lives there (the launcher puts it on
+# LD_LIBRARY_PATH); --ignore-missing-info keeps that package-less private lib
+# from aborting the run — an unknown SYSTEM soname is caught by STABLE_SONAMES
+# above, not here.
+SHLIBS_TMP="$(mktemp -d)"
+mkdir -p "$SHLIBS_TMP/debian"
+printf 'Source: %s\n\nPackage: %s\nArchitecture: any\n' "$PKG" "$PKG" >"$SHLIBS_TMP/debian/control"
+LIB_DEPENDS="$(cd "$SHLIBS_TMP" && dpkg-shlibdeps -l"$APPDIR" --ignore-missing-info \
+    -O "${ELF_FILES[@]}" | sed -n 's/^shlibs:Depends=//p')"
+rm -rf "$SHLIBS_TMP"
+[ -n "$LIB_DEPENDS" ] || { echo "error: dpkg-shlibdeps produced no Depends." >&2; exit 1; }
 DEPENDS="displayxr-runtime, $LIB_DEPENDS"
 echo "==> Depends: $DEPENDS"
+
+GLIBC_FLOOR="$(objdump -T "${ELF_FILES[@]}" | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -uV | tail -1)"
+GLIBCXX_FLOOR="$(objdump -T "${ELF_FILES[@]}" | grep -o 'GLIBCXX_[0-9.]*' | sed 's/GLIBCXX_//' | sort -uV | tail -1)"
+echo "==> glibc floor: GLIBC_$GLIBC_FLOOR, GLIBCXX_$GLIBCXX_FLOOR"
+if [ -n "${DXR_DEB_MAX_GLIBC:-}" ] &&
+    [ "$(printf '%s\n%s\n' "$GLIBC_FLOOR" "$DXR_DEB_MAX_GLIBC" | sort -V | tail -1)" != "$DXR_DEB_MAX_GLIBC" ]; then
+    echo "error: the binaries need GLIBC_$GLIBC_FLOOR, above DXR_DEB_MAX_GLIBC=$DXR_DEB_MAX_GLIBC" >&2
+    echo "       (the oldest supported release). Build the .deb on that release —" >&2
+    echo "       CI does this in an ubuntu:22.04 container." >&2
+    exit 1
+fi
 INSTALLED_KB="$(du -sk "$STAGE/usr" | cut -f1)"
 
 cat > "$STAGE/DEBIAN/control" <<EOF

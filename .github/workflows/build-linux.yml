@@ -143,17 +143,43 @@ jobs:
           test -x build/linux/avatar_handle_vk_linux || {
             echo "::error::avatar_handle_vk_linux was not produced"; exit 1; }
 
-  # Build the demo .deb and, on a v* tag, attach it to the GitHub Release — the
-  # asset the Linux meta-bundle fetches (runtime #781 Phase 3). Runs on every PR
-  # too (build-only) so a broken package_deb_linux.sh is caught before release.
-  # Single base (24.04) on a VM, not the tri-LTS matrix — one artifact.
+  # Build the ONE demo .deb and, once DebInstall has proved it, attach it to the
+  # GitHub Release on a v* tag — the asset the Linux meta-bundle fetches
+  # (runtime #781 Phase 3). Runs on every PR too so a broken
+  # package_deb_linux.sh is caught before release.
+  #
+  # PORTABLE BY CONSTRUCTION (runtime #1656 / its PR #1659): the same .deb must
+  # install AND run on Ubuntu 22.04, 24.04 and 26.04, so it is built on the
+  # OLDEST — an ubuntu:22.04 container (glibc 2.35 / GCC 11 floor). v0.12.0 was
+  # built on the 24.04 runner, needed GLIBC_2.38 / GLIBCXX_3.4.32, and declared
+  # an unversioned `libc6`, so apt installed it on 22.04 and the demo then died
+  # at exec with "version `GLIBC_2.38' not found". package_deb_linux.sh now
+  # derives versioned Depends with dpkg-shlibdeps, refuses a DT_NEEDED outside
+  # its cross-release STABLE_SONAMES list, and — with DXR_DEB_MAX_GLIBC —
+  # refuses a glibc floor above 22.04's.
+  #
+  # The container deliberately uses 22.04's apt cmake (3.22.1), which is above
+  # this repo's 3.21 floor: a runner image's modern CMake would hide the real
+  # floor.
   Deb:
     needs: DetectChanges
     runs-on: ubuntu-latest
+    container: ubuntu:22.04
+    env:
+      DXR_DEB_MAX_GLIBC: "2.35" # Ubuntu 22.04 — the oldest supported release
     steps:
       - name: Docs-only short-circuit
         if: needs.DetectChanges.outputs.docs_only == 'true'
         run: echo "Doc-only change — skipping .deb build."
+
+      # Bare image, root: git must land BEFORE actions/checkout, or it falls
+      # back to a tarball with no tags and git describe cannot version the .deb.
+      - name: Bootstrap container (git for checkout)
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y --no-install-recommends git ca-certificates curl
 
       - uses: actions/checkout@v5
         if: needs.DetectChanges.outputs.docs_only != 'true'
@@ -163,15 +189,16 @@ jobs:
       - name: Install dependencies
         if: needs.DetectChanges.outputs.docs_only != 'true'
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential cmake ninja-build pkg-config git ca-certificates curl \
-            libvulkan-dev vulkan-validationlayers glslang-tools \
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build pkg-config python3 \
+            libvulkan-dev glslang-tools \
             libx11-dev libxext-dev libxcb1-dev libx11-xcb-dev \
             libwayland-dev libasound2-dev \
             libxxf86vm-dev libxcb-glx0-dev \
             libxrandr-dev \
-            dpkg-dev fakeroot
+            file binutils dpkg-dev fakeroot
+          cmake --version | head -1
 
       - name: Build + package the demo .deb
         if: needs.DetectChanges.outputs.docs_only != 'true'
@@ -188,8 +215,66 @@ jobs:
           path: dist/*.deb
           if-no-files-found: error
 
-      - name: Attach .deb to the GitHub Release (tags only)
-        if: needs.DetectChanges.outputs.docs_only != 'true' && startsWith(github.ref, 'refs/tags/v')
+  # Install the .deb from the Deb job into a PRISTINE container of every
+  # supported release, alongside the latest released runtime .deb (the demo
+  # Depends on displayxr-runtime), and exercise it there
+  # (scripts/verify_deb_install_linux.sh): apt must resolve Depends from that
+  # release's archive without Recommends, every Depends/Recommends/Suggests
+  # name must exist there, `ldd -r` must be clean on every shipped ELF, the
+  # launcher must get past the dynamic loader, and `displayxr-cli selftest`
+  # must pass env-free on the packaged sim-display.
+  DebInstall:
+    name: DebInstall (Ubuntu ${{ matrix.lts }})
+    needs: [DetectChanges, Deb]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        lts: ["22.04", "24.04", "26.04"]
+    steps:
+      - name: Docs-only short-circuit
+        if: needs.DetectChanges.outputs.docs_only == 'true'
+        run: echo "Doc-only change — no .deb to verify."
+
+      - uses: actions/checkout@v5
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+
+      - uses: actions/download-artifact@v4
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        with:
+          name: displayxr-avatar-deb
+          path: dist
+
+      - name: Fetch the latest released runtime .deb
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download --repo DisplayXR/displayxr-runtime \
+            --pattern 'displayxr-runtime_*_amd64.deb' --dir runtime-deb
+          ls runtime-deb
+
+      - name: apt install + ldd -r + launch smoke in clean ubuntu:${{ matrix.lts }}
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: |
+          docker run --rm -v "$PWD:/w" -w /w "ubuntu:${{ matrix.lts }}" \
+            ./scripts/verify_deb_install_linux.sh \
+              dist/displayxr-avatar_*_amd64.deb runtime-deb/*.deb
+
+  # Attach the .deb to the GitHub Release on a v* tag — only once DebInstall
+  # has proved it on every supported release, so a non-portable package can
+  # never be published.
+  DebRelease:
+    needs: [DetectChanges, Deb, DebInstall]
+    if: needs.DetectChanges.outputs.docs_only != 'true' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: displayxr-avatar-deb
+          path: dist
+
+      - name: Attach .deb to the GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: dist/*.deb
