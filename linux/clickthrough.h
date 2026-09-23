@@ -2,13 +2,17 @@
 // SPDX-License-Identifier: Apache-2.0
 /*!
  * @file
- * @brief  X11 click-through for the transparent avatar overlay (runtime#757).
+ * @brief  Click-through for the transparent avatar overlay (runtime#757),
+ *         X11 and native Wayland.
  *
  * The Linux analogue of the Windows SetWindowRgn / macOS setIgnoresMouseEvents
  * silhouette click-through: render a downscaled view of the avatar into scratch
- * images, read their alpha back, and set the window's XShape INPUT region to
- * just the avatar pixels — so clicks land on the avatar and pass through the
- * transparent regions to the desktop underneath.
+ * images, read their alpha back, and set the window's INPUT region to just
+ * the avatar pixels — so clicks land on the avatar and pass through the
+ * transparent regions to the desktop underneath. The region is applied by
+ * displayxr::linux_window's set_input_region(): an XShape ShapeInput region
+ * on X11, the surface input region on Wayland. This file owns only the
+ * coverage.
  *
  * Ported feature-for-feature from windows/main.cpp's UpdateSilhouette +
  * UpdateClickRegion, which the Linux version previously only approximated:
@@ -23,7 +27,7 @@
  *   - the alpha threshold is LOW (8, not 40) and the result is DILATED by one
  *     texel. The error is asymmetric: an over-large region leaves a few
  *     transparent pixels clickable, an under-large one deletes content — and
- *     on X11, as on Win32, the input shape is what makes the window reachable
+ *     on Linux, as on Win32, the input region is what makes the window reachable
  *     at all;
  *   - the readback is PIPELINED behind a fence and HOST_CACHED, instead of a
  *     synchronous vkQueueWaitIdle. That synchronous stall is the whole reason
@@ -45,18 +49,17 @@
  * pair up front and the copy restores it: renderEye only assumes UNDEFINED for
  * a viewport at (0,0), and the silhouette always renders into the bottom band.
  *
- * No-op when the window / Display is null (hosted-NULL fallback), and reports
- * once when the server has no XShape extension instead of silently doing
- * nothing. Requires libXext.
+ * No-op when there is no window (hosted-NULL fallback); the helper reports
+ * once when the window system cannot express an input region.
  */
 
 #pragma once
 
 #include <vulkan/vulkan.h>
-#include <X11/Xlib.h>
 #include <cstdint>
 
 class ModelRenderer;
+class DxrLinuxWindow;
 
 //! Everything one click-through update needs. Grouped because the argument
 //! list grew past the point where positional floats are readable.
@@ -67,8 +70,8 @@ struct ClickthroughParams {
 	uint32_t queueFamily = 0;
 	ModelRenderer *renderer = nullptr;
 
-	Display *dpy = nullptr;
-	Window win = 0;
+	//! The app window (displayxr::linux_window); it applies the region.
+	DxrLinuxWindow *window = nullptr;
 	uint32_t winW = 0; //!< live client width in px
 	uint32_t winH = 0; //!< live client height in px
 
@@ -101,7 +104,7 @@ struct ClickthroughParams {
 	int32_t bubbleX = 0, bubbleY = 0, bubbleW = 0, bubbleH = 0;
 };
 
-//! Render the avatar silhouette and set the window's XShape input region from
+//! Render the avatar silhouette and set the window's input region from
 //! it. Call once per frame, after the eye render.
 void ClickthroughUpdate(const ClickthroughParams &p);
 

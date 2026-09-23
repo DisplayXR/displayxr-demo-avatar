@@ -27,11 +27,17 @@ get_filename_component(_dxr_ext_includes
     "${CMAKE_CURRENT_SOURCE_DIR}/../openxr_includes" ABSOLUTE)
 set(DISPLAYXR_EXTENSIONS_INCLUDE_DIR "${_dxr_ext_includes}" CACHE PATH
     "DisplayXR OpenXR extension headers for displayxr::common")
-# (Also pinned in android/src/main/cpp/CMakeLists.txt — keep both equal.)
+# (Also pinned in android/src/main/cpp/CMakeLists.txt. That one deliberately
+# stays at v2.15.0 for now: the desktop pin moves for displayxr::linux_window,
+# which Android does not use, and the Android leg is left untouched.)
 FetchContent_Declare(
     displayxr_common
     GIT_REPOSITORY https://github.com/DisplayXR/displayxr-common.git
-    GIT_TAG v2.15.0
+    # v2.20.0 ships displayxr::linux_window — the one Linux window (X11 or
+    # native Wayland in one binary, chosen by capability; transparency,
+    # click-through, the phase-snapped drag), shared with the runtime's test
+    # apps and the other demos.
+    GIT_TAG v2.20.0
     GIT_SHALLOW TRUE
 )
 FetchContent_MakeAvailable(displayxr_common)

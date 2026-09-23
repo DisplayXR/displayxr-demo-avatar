@@ -281,15 +281,27 @@ and runs via **`./scripts/run_avatar_linux.sh`**. The Linux entry point is
 `model_common/ModelRenderer` the macOS/Windows peers use, with
 **`windows/main.cpp` as the parity spec** for everything above the renderer.
 
-Windowing is an **app-owned 32-bit ARGB X11 window** handed to the runtime via
-`XR_DXR_xlib_window_binding` with `transparentBackgroundEnabled`, so transparent
-pixels compose through to the desktop. It falls back to hosted-NULL only when
-there is no X server or the runtime lacks the extension (headless CI) — and on
-that path the Local2D bubble is suppressed, because `xrEndFrame` rejects a
+Windowing is an **app-owned transparent window, X11 or native Wayland in one
+binary**: displayxr-common's `displayxr::linux_window` (`dxr_linux_window.h`),
+the one Linux window implementation shared with the runtime's test apps and
+the other demos. **Never copy window code back into this repo.**
+
+The platform is chosen by capability at startup, never from session
+environment variables: `--platform=x11|wayland|auto`. The default `auto` picks
+native Wayland when the compositor is ready (fractional-scale + viewporter +
+the window-geometry extension on D-Bus), else X11. The helper hands the
+runtime `XR_DXR_xlib_window_binding` (a 32-bit ARGB window) or
+`XR_DXR_wayland_surface_binding`, with `transparentBackgroundEnabled`, so
+transparent pixels compose through to the desktop. On both backends the
+window is borderless with no title bar, stays on top (X11 only), moves with a
+right-button drag, and gets the silhouette click-through as its input region.
+
+It falls back to hosted-NULL only when no window system answers (headless CI).
+On that path the Local2D bubble is suppressed, because `xrEndFrame` rejects a
 Local2D layer without an external window and would drop the whole frame.
 
-First ran on a real Leia panel (Acer SpatialLabs DS1, Ubuntu 26.04, GNOME
-Wayland with the app as an X11/XWayland client) in September 2026: transparent
+First ran on a real 3D panel (Ubuntu 26.04, GNOME Wayland, with the app as an
+X11/XWayland client) in September 2026: transparent
 overlay confirmed (XWayland advertises non-opaque composite alpha, the swapchain
 comes up `PRE_MULTIPLIED`), the Leia plug-in selects compose-under-bg, and
 desktop capture via xdg-desktop-portal ScreenCast + PipeWire feeds the compose
@@ -297,9 +309,9 @@ pipeline.
 
 At parity with the Windows leg: display-zone framing (avatar in the bottom 75%),
 the Local2D speech bubble, auto-fit against the zone rect, dynamic recenter,
-XShape silhouette click-through, `XR_DXR_depth_budget` v1 + v3, rendering-mode
+silhouette click-through, `XR_DXR_depth_budget` v1 + v3, rendering-mode
 adoption **and switching**, and the full keyboard + mouse control set (the
-control table lives on `PumpXEvents` in `linux/main.cpp`). Still absent: the
+control table lives on `HandleWindowEvent` in `linux/main.cpp`). Still absent: the
 on-panel HUD/toast chips, `XR_DXR_mcp_tools`, drag-and-drop model load (Ctrl+O
 opens a zenity picker instead), and the `C` camera-rig round-trip (its converter
 is Windows-only code in displayxr-common).

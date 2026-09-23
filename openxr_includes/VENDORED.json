@@ -15,6 +15,7 @@
     "XR_DXR_mcp_tools.h": "a71979a4d1385841a224eccd64ae973385300b1f",
     "XR_DXR_spatial_workspace.h": "a71979a4d1385841a224eccd64ae973385300b1f",
     "XR_DXR_view_rig.h": "a71979a4d1385841a224eccd64ae973385300b1f",
+    "XR_DXR_wayland_surface_binding.h": "98d46018d16f226e021fb4e6b9ac6e8ee9cd3647",
     "XR_DXR_weave.h": "a71979a4d1385841a224eccd64ae973385300b1f",
     "XR_DXR_win32_window_binding.h": "a71979a4d1385841a224eccd64ae973385300b1f",
     "XR_DXR_workspace_file_dialog.h": "a71979a4d1385841a224eccd64ae973385300b1f",
