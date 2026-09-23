@@ -15,6 +15,11 @@ name: Build Linux
 # docs_only short-circuit the macOS/Windows jobs use so doc-only PRs report
 # success in seconds without building.
 #
+# Packaging gate: the "Linux Packaging" aggregator job (below) is the single
+# required context for the Deb + DebInstall (Ubuntu 22.04 / 24.04 / 26.04)
+# lane, so a .deb that installs but cannot run on a supported release blocks
+# the merge, not just the release (runtime #1656 / #1684).
+#
 # Build-green scope: compile avatar_handle_vk_linux. CI has no display/GPU, so
 # the app is never run here. On-screen operation is NOT gated any more — the
 # leg runs on real hardware (see CLAUDE.md § Linux) — but validating it stays a
@@ -260,6 +265,66 @@ jobs:
           docker run --rm -v "$PWD:/w" -w /w "ubuntu:${{ matrix.lts }}" \
             ./scripts/verify_deb_install_linux.sh \
               dist/displayxr-avatar_*_amd64.deb runtime-deb/*.deb
+
+  # Single stable required context for the whole Linux packaging lane —
+  # "Linux Packaging" (mirrors displayxr-runtime's, PR #1684).
+  #
+  # Why an aggregator rather than requiring the legs directly: DebInstall is a
+  # matrix, so its contexts are "DebInstall (Ubuntu 22.04)", "… 24.04",
+  # "… 26.04" — names that change the moment a release is added or dropped, and
+  # a ruleset still demanding a context no job produces blocks every PR forever.
+  # This job's name is fixed, so the matrix can grow or shrink freely.
+  #
+  # The gap it closes: DebInstall proves the .deb installs AND runs on every
+  # supported release, but nothing stopped a PR MERGING with it red — the
+  # runtime #1656 shape (a .deb that apt installs on 22.04 and that then fails
+  # at exec / dlopen) was only caught at release time, if at all.
+  #
+  # Doc-only PRs: Deb / DebInstall still RUN on the docs_only path and skip
+  # every step, so this job's needs are satisfied and it reports success in
+  # seconds without asserting anything.
+  #
+  # `if: always()` is load-bearing: without it a failed leg would SKIP this job,
+  # and a skipped check counts as green for a required context — the aggregator
+  # would silently stop gating exactly when it matters.
+  LinuxPackaging:
+    name: Linux Packaging
+    needs: [DetectChanges, Deb, DebInstall]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Docs-only short-circuit
+        if: needs.DetectChanges.outputs.docs_only == 'true'
+        run: echo "Doc-only change — packaging legs short-circuited; reporting success without asserting."
+
+      - name: Assert every packaging leg succeeded
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        env:
+          # DetectChanges is included on purpose: if it failed, docs_only is ''
+          # (!= 'true'), so we land here — and must fail rather than green-light
+          # a run whose change classification never happened.
+          RESULT_DETECTCHANGES: ${{ needs.DetectChanges.result }}
+          RESULT_DEB: ${{ needs.Deb.result }}
+          # Matrix job: 'success' only when every leg succeeded (fail-fast is
+          # off, so one red release still surfaces here).
+          RESULT_DEBINSTALL: ${{ needs.DebInstall.result }}
+        run: |
+          set -u
+          rc=0
+          for leg in DETECTCHANGES DEB DEBINSTALL; do
+            var="RESULT_${leg}"
+            result="${!var}"
+            printf '%-14s %s\n' "$leg" "${result:-<missing>}"
+            # Anything that is not an outright success fails the gate —
+            # including 'skipped', which on the non-docs_only path can only
+            # mean a leg was bypassed by a condition it should not have been.
+            [ "$result" = "success" ] || rc=1
+          done
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::Linux packaging lane is not green — see the leg results above."
+            exit 1
+          fi
+          echo "All Linux packaging legs succeeded."
 
   # Attach the .deb to the GitHub Release on a v* tag — only once DebInstall
   # has proved it on every supported release, so a non-portable package can
