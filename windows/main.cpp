@@ -35,6 +35,7 @@
 #include "display3d_view.h"
 #include "projection_depth.h"
 #include "auto_fit.h"       // dxr::AutoFitVHeight / FitTransition — shared framing rule
+#include "vk_clear.h"       // dxr::VkDisplayReferredClearColor — clear-space policy (#1647)
 #include "auto_fit_canvas.h" // dxr::AutoFitCanvas — the runtime-resolved zone canvas
 #include "clip_policy.h"     // dxr::ResolveClipPlanes / ChainRearDepthBudget (#81)
 #include "content_bounds.h"  // dxr::ProjectAabbToWindowBounds / ChainContentBounds (#81 v2; #82 zone rebase)
@@ -1715,7 +1716,8 @@ static void UpdatePerformanceStats(PerformanceStats& stats) {
 
 // Render a simple "no scene" placeholder by clearing to dark gray
 static void RenderPlaceholder(VkDevice device, VkQueue queue, VkCommandPool cmdPool,
-                               VkImage image, uint32_t width, uint32_t height) {
+                               VkImage image, VkFormat imageFormat,
+                               uint32_t width, uint32_t height) {
     VkCommandBufferAllocateInfo allocInfo = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
     allocInfo.commandPool = cmdPool;
     allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
@@ -1741,7 +1743,14 @@ static void RenderPlaceholder(VkDevice device, VkQueue queue, VkCommandPool cmdP
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
 
-    VkClearColorValue clearColor = {{0.1f, 0.1f, 0.12f, 1.0f}};
+    // This clear lands DIRECTLY on the swapchain image — no intermediate, no
+    // blit — so unlike ModelRenderer's clear the target's own format IS the
+    // answer, and the format-derived helper is the right one (clear_policy.h;
+    // runtime #1647/#1644). On an `_SRGB` swapchain the clear is taken as
+    // scene-linear and encoded on write, so the authored display-referred
+    // slate must be linearised first or it comes out washed out.
+    static constexpr float kSlate[4] = {0.1f, 0.1f, 0.12f, 1.0f};
+    VkClearColorValue clearColor = dxr::VkDisplayReferredClearColor(imageFormat, kSlate);
     VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
     vkCmdClearColorImage(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clearColor, 1, &range);
 
@@ -3611,7 +3620,7 @@ static void RenderThreadFunc(
                                 }
                             } else {
                                 RenderPlaceholder(vkDevice, graphicsQueue, renderCmdPool,
-                                    targetImage, targetW, targetH);
+                                    targetImage, colorFormat, targetW, targetH);
                             }
 
                             // 'I' key: snapshot the multi-view atlas the runtime

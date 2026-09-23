@@ -61,6 +61,7 @@
 #include "camera3d_view.h"
 #include "projection_depth.h"
 #include "auto_fit.h"    // dxr::AutoFitVHeight — shared load-time framing rule
+#include "vk_clear.h"    // dxr::VkDisplayReferredClearColor — clear-space policy (#1647)
 #include "model_renderer.h"
 #include "model_vulkan_utils.h"   // scratch image/buffer for the click-through silhouette
 
@@ -1976,7 +1977,8 @@ static void CleanupOpenXR(AppXrSession& xr) {
 // ============================================================================
 
 static void RenderPlaceholder(VkDevice dev, VkQueue queue, VkCommandPool pool,
-                               VkImage image, uint32_t w, uint32_t h,
+                               VkImage image, VkFormat imageFormat,
+                               uint32_t w, uint32_t h,
                                float yaw, float pitch) {
     VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
     ai.commandPool = pool; ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; ai.commandBufferCount = 1;
@@ -1994,10 +1996,21 @@ static void RenderPlaceholder(VkDevice dev, VkQueue queue, VkCommandPool pool,
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
         0, 0, nullptr, 0, nullptr, 1, &barrier);
 
-    // Tint color based on camera direction so drag-rotation gives visual feedback
+    // Tint color based on camera direction so drag-rotation gives visual feedback.
+    //
+    // This clear lands DIRECTLY on the swapchain image — no intermediate, no
+    // blit — so unlike ModelRenderer's clear the target's own format IS the
+    // answer, and the format-derived helper is the right one (clear_policy.h;
+    // runtime #1647/#1644). On an `_SRGB` swapchain the clear is taken as
+    // scene-linear and encoded on write, so the authored display-referred
+    // literal must be linearised first or the placeholder comes out washed
+    // out. This leg picks a UNORM swapchain today (see CreateSwapchains), so
+    // the helper resolves to "store verbatim" and the bytes are unchanged —
+    // which is the point: the rule is stated, not the current answer.
     float ny = (yaw / 3.14159f) * 0.5f + 0.5f;   // 0..1 over ±π
     float np = (pitch / 1.5f) * 0.5f + 0.5f;       // 0..1 over ±1.5 rad
-    VkClearColorValue cc = {{0.05f + ny * 0.15f, 0.08f + np * 0.12f, 0.15f, 1.0f}};
+    const float slate[4] = {0.05f + ny * 0.15f, 0.08f + np * 0.12f, 0.15f, 1.0f};
+    VkClearColorValue cc = dxr::VkDisplayReferredClearColor(imageFormat, slate);
     VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
     vkCmdClearColorImage(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &cc, 1, &range);
 
@@ -3369,7 +3382,8 @@ int main(int argc, char** argv) {
                                 }
                             } else {
                                 RenderPlaceholder(vkDevice, graphicsQueue, cmdPool,
-                                    targetImage, xr.swapchain.width, xr.swapchain.height,
+                                    targetImage, swapFormat,
+                                    xr.swapchain.width, xr.swapchain.height,
                                     g_input.yaw, g_input.pitch);
                             }
 

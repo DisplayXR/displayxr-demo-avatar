@@ -45,15 +45,19 @@ FetchContent_Declare(stb
     GIT_TAG        master)
 FetchContent_MakeAvailable(stb)
 
-# ── displayxr-common (header-only rules: dxr_view_config.h) ──────────────
-# DxrSelectViewConfigType + DxrAliasInactiveViews (ADR-041) — the ONE shared
-# implementation the desktop legs reach through sr_common_base. Sources only:
-# its CMake builds a STATIC lib with desktop platform deps, so it is not run
-# here; the header-only common/ dir is appended to the include path below.
-# Keep equal to the pin in common/CMakeLists.txt.
+# ── displayxr-common (header-only rules: dxr_view_config.h, vk_clear.h) ──
+# DxrSelectViewConfigType + DxrAliasInactiveViews (ADR-041) and the clear-space
+# policy (clear_policy.h + vk_clear.h, displayxr-common#56 — model_renderer.cpp
+# includes it) — the ONE shared implementation the desktop legs reach through
+# sr_common_base. Sources only: its CMake builds a STATIC lib with desktop
+# platform deps, so it is not run here; the header-only common/ dir is appended
+# to the include path below.
+# Keep equal to the pin in common/CMakeLists.txt — this leg compiles the same
+# model_common sources, so a skew is a header that exists on one leg and not
+# the other.
 FetchContent_Declare(displayxr_common_rules
     GIT_REPOSITORY https://github.com/DisplayXR/displayxr-common.git
-    GIT_TAG        v2.15.0
+    GIT_TAG        v2.19.0
     GIT_SHALLOW    TRUE)
 FetchContent_GetProperties(displayxr_common_rules)
 if(NOT displayxr_common_rules_POPULATED)

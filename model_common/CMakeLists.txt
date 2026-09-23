@@ -173,6 +173,27 @@ target_include_directories(model_renderer PRIVATE
     ${tinyusdz_SOURCE_DIR}/src        # tinyusdz.hh + tydra/render-data.hh
 )
 
+# displayxr-common's clear-space policy (clear_policy.h + vk_clear.h) is
+# HEADER-ONLY, so model_renderer gets its headers WITHOUT linking the library —
+# the link closure below stays Vulkan + the loaders. `common/` has already
+# populated the dependency (the root CMakeLists adds that subdirectory first),
+# and the Android leg puts the same directory on the same sources' include path.
+#
+# tinygltf's directory is named FIRST and explicitly: it owns the stb_image.h
+# these sources resolve today and displayxr-common ships one too, so the order
+# has to be stated here rather than inherited from link-interface ordering
+# (a target's own include dirs always precede those of the libraries it links).
+FetchContent_GetProperties(displayxr_common)
+if(NOT displayxr_common_SOURCE_DIR)
+    message(FATAL_ERROR
+        "displayxr-common is not populated — the root CMakeLists must "
+        "add_subdirectory(common) before add_subdirectory(model_common).")
+endif()
+target_include_directories(model_renderer PRIVATE
+    ${tinygltf_SOURCE_DIR}
+    ${displayxr_common_SOURCE_DIR}/common
+)
+
 target_link_libraries(model_renderer PUBLIC
     Vulkan::Vulkan
     glm::glm
