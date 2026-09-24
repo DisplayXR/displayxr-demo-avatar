@@ -43,7 +43,10 @@ FetchContent_Declare(
     # v2.22.0 declares an opaque window's Wayland surface opaque, which lets
     # the compositor scan a fullscreen weave out directly (displayxr-common#60,
     # runtime#1698).
-    GIT_TAG v2.22.0
+    # v2.23.0: the native-Wayland drag stays phase-snapped at ANY output scale
+    # (150 %, 166.67 %, ...), not only 100/200 % (displayxr-common#61,
+    # runtime#1709).
+    GIT_TAG v2.23.0
     GIT_SHALLOW TRUE
 )
 FetchContent_MakeAvailable(displayxr_common)
