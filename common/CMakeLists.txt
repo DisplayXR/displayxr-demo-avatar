@@ -40,7 +40,10 @@ FetchContent_Declare(
     # v2.21.0 adds the native-Wayland drag-lattice follow-ups: a table when a
     # drag reaches the 3D panel, probing off the render thread, a per-drag
     # summary (displayxr-common#59, runtime#1697).
-    GIT_TAG v2.21.0
+    # v2.22.0 declares an opaque window's Wayland surface opaque, which lets
+    # the compositor scan a fullscreen weave out directly (displayxr-common#60,
+    # runtime#1698).
+    GIT_TAG v2.22.0
     GIT_SHALLOW TRUE
 )
 FetchContent_MakeAvailable(displayxr_common)
