@@ -46,7 +46,10 @@ FetchContent_Declare(
     # v2.23.0: the native-Wayland drag stays phase-snapped at ANY output scale
     # (150 %, 166.67 %, ...), not only 100/200 % (displayxr-common#61,
     # runtime#1709).
-    GIT_TAG v2.23.0
+    # v2.24.0: the Wayland drag sends the compositor move at once and builds the
+    # first lattice table on a worker; an optional bulk snap-grid provider is
+    # added and not used here (displayxr-common#62, #63, runtime#1609, #1723).
+    GIT_TAG v2.24.0
     GIT_SHALLOW TRUE
 )
 FetchContent_MakeAvailable(displayxr_common)
