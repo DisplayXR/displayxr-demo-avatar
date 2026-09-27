@@ -49,7 +49,11 @@ FetchContent_Declare(
     # v2.24.0: the Wayland drag sends the compositor move at once and builds the
     # first lattice table on a worker; an optional bulk snap-grid provider is
     # added and not used here (displayxr-common#62, #63, runtime#1609, #1723).
-    GIT_TAG v2.24.0
+    # v2.25.0: the drag fixes: a dense Wayland drag-lattice table, no lattice
+    # while the runtime move-syncs the window, a drag that ends on its button's
+    # release, X11 drag steps that land exactly, and X11 header-bar double-click
+    # maximise (displayxr-common#64-#68, runtime#1748).
+    GIT_TAG v2.25.0
     GIT_SHALLOW TRUE
 )
 FetchContent_MakeAvailable(displayxr_common)
