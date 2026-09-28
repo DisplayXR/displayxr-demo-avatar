@@ -34,6 +34,7 @@
 #include <openxr/XR_DXR_local_3d_zone.h>   // XrCompositionLayerLocal2DDXR (speech bubble)
 #include "dxr_view_config.h"   // displayxr-common: DxrSelectViewConfigType (#1486) + DxrAliasInactiveViews (ADR-041)
 #include "dxr_submit_views.h"              // DxrClampSubmitViewCount — INV-3.1 submit gate
+#include "color_policy.h"                  // displayxr-common: _SRGB swapchain rule (ADR-021 / INV-4.6)
 
 #include <cmath>
 #include <atomic>
@@ -1554,20 +1555,24 @@ static bool CreateSwapchains(AppXrSession& xr) {
     std::vector<int64_t> fmts(fmtCount);
     xrEnumerateSwapchainFormats(xr.session, fmtCount, &fmtCount, fmts.data());
 
-    // Prefer a UNORM swapchain on macOS. ModelRenderer renders to an internal
-    // UNORM target and BLITS to the swapchain; with an sRGB swapchain it relies
-    // on "the blit's HW linear→sRGB encode" — which MoltenVK skips for a same-
-    // size copy, so the linear bytes reach the sRGB image unencoded and the
-    // Metal compositor's sRGB sample-decode darkens them again (very dark
-    // avatar). With a UNORM swapchain swapchainIsSrgb_=false → the shader does
-    // the linear→sRGB encode itself, and the bytes pass straight through the
-    // BGRA8Unorm CAMetalLayer with no hidden decode. (gauss avoids this by
-    // writing its final pixels directly to the swapchain, no blit.)
-    int64_t selectedFmt = fmts.empty() ? VK_FORMAT_B8G8R8A8_UNORM : fmts[0];
-    for (auto f : fmts) {
-        if (f == VK_FORMAT_B8G8R8A8_UNORM || f == VK_FORMAT_R8G8B8A8_UNORM) { selectedFmt = f; break; }
-        if (f == VK_FORMAT_B8G8R8A8_SRGB || f == VK_FORMAT_R8G8B8A8_SRGB) selectedFmt = f;
-    }
+    // Honest `_SRGB` colour swapchain (ADR-021 / INV-4.6, runtime #1589).
+    // Since runtime v2.21.7 vk_native reads a UNORM swapchain as holding LINEAR
+    // values and encodes it on output. The UNORM choice this used to make had
+    // the PBR shader write display-referred bytes (swapchainIsSrgb_=false ->
+    // linearToSrgb in pbr.frag), so they were encoded twice: a washed-out,
+    // lifted-black avatar. With `_SRGB` the shader emits scene-linear and the
+    // renderer's blit into the swapchain does the one encode. (The old note
+    // here said MoltenVK skipped that encode; that was a runtime that backed
+    // an `_SRGB` request with a UNORM image. Since runtime #1559 the images are
+    // really `_SRGB` — verified with a vk_native atlas capture on this leg.)
+    // DXR_SWAPCHAIN_ENCODING=unorm restores the old choice for A/B.
+    const dxr::ColorFormatChoice fmtChoice = dxr::ChooseColorSwapchainFormat(
+        fmts, dxr::ColorEncodingPreferenceFromEnvironment());
+    int64_t selectedFmt = fmtChoice.format ? fmtChoice.format : (int64_t)VK_FORMAT_B8G8R8A8_SRGB;
+    dxr::NoteColorSwapchainFormat(selectedFmt);
+    LOG_INFO("Colour swapchain format %lld (%s)%s", (long long)selectedFmt,
+             fmtChoice.isSrgb ? "_SRGB" : "not _SRGB",
+             fmtChoice.fellBack ? " [fell back to formats[0]]" : "");
 
     // Size the swapchain at init from the largest atlas any rendering mode
     // could produce when the app is running full-screen — atlas dims per
@@ -2497,12 +2502,19 @@ static bool CreateBubbleSwapchain(AppXrSession& xr, VkDevice dev, VkPhysicalDevi
     xrEnumerateSwapchainFormats(xr.session, 0, &fc, nullptr);
     std::vector<int64_t> fmts(fc);
     if (fc) xrEnumerateSwapchainFormats(xr.session, fc, &fc, fmts.data());
-    // Prefer UNORM (RGBA8) so the CoreText-drawn sRGB bytes pass through the
-    // BGRA8Unorm CAMetalLayer with no hidden sRGB decode (same reason the main
-    // swapchain uses UNORM). VK_FORMAT_R8G8B8A8_UNORM = 37, B8G8R8A8_UNORM = 44.
-    int64_t fmt = fmts.empty() ? VK_FORMAT_R8G8B8A8_UNORM : fmts[0];
-    for (auto f : fmts) { if (f == VK_FORMAT_R8G8B8A8_UNORM) { fmt = f; break; }
-                          if (f == VK_FORMAT_B8G8R8A8_UNORM) fmt = f; }
+    // The CoreText bitmap is RGBA8 display-referred (sRGB-encoded) bytes,
+    // copied verbatim into the image (vkCmdCopyBufferToImage never converts).
+    // They are honest only in an `_SRGB` image — a UNORM one is now read as
+    // linear and encoded again (washed-out pill). Follow the main swapchain's
+    // encoding (dxr::ColorSwapchainIsSrgb(), so DXR_SWAPCHAIN_ENCODING=unorm
+    // A/Bs both); RGBA before BGRA because the bitmap is RGBA-ordered.
+    // VK_FORMAT_R8G8B8A8_UNORM = 37, B8G8R8A8_UNORM = 44, _SRGB = 43 / 50.
+    const bool bubbleSrgb = dxr::ColorSwapchainIsSrgb();
+    const int64_t wantRgba = bubbleSrgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
+    const int64_t wantBgra = bubbleSrgb ? VK_FORMAT_B8G8R8A8_SRGB : VK_FORMAT_B8G8R8A8_UNORM;
+    int64_t fmt = fmts.empty() ? wantRgba : fmts[0];
+    for (auto f : fmts) { if (f == wantRgba) { fmt = f; break; }
+                          if (f == wantBgra) fmt = f; }
     g_bubbleFormat = fmt;
 
     XrSwapchainCreateInfo ci = {XR_TYPE_SWAPCHAIN_CREATE_INFO};

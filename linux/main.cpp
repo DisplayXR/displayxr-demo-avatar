@@ -116,6 +116,7 @@
 // Optional: absent, the drag is merely unsnapped.
 #include <openxr/XR_DXR_weave.h>
 #include "clip_policy.h"
+#include "color_policy.h" // displayxr-common: _SRGB swapchain rule (ADR-021 / INV-4.6)
 #include "content_mask.h"
 
 #include "clickthrough.h" // silhouette click-through for the overlay (X11 + Wayland)
@@ -1947,16 +1948,23 @@ static bool CreateSwapchain(AppXrSession& xr) {
     XR_CHECK(xrEnumerateSwapchainFormats(xr.session, 0, &formatCount, nullptr));
     std::vector<int64_t> formats(formatCount);
     XR_CHECK(xrEnumerateSwapchainFormats(xr.session, formatCount, &formatCount, formats.data()));
-    // Prefer a UNORM swapchain (matches the macOS avatar). ModelRenderer draws to
-    // an internal UNORM target and its shader gamma-encodes explicitly; an sRGB
-    // swapchain instead relies on the blit to sRGB-encode, which it doesn't — so
-    // colors come out washed-out / desaturated (Suki's DS1 report). Pick UNORM if
-    // offered, else sRGB, else the R8G8B8A8_UNORM fallback.
-    int64_t selectedFormat = formats.empty() ? (int64_t)VK_FORMAT_R8G8B8A8_UNORM : formats[0];
-    for (int64_t f : formats) {
-        if (f == VK_FORMAT_B8G8R8A8_UNORM || f == VK_FORMAT_R8G8B8A8_UNORM) { selectedFormat = f; break; }
-        if (f == VK_FORMAT_B8G8R8A8_SRGB || f == VK_FORMAT_R8G8B8A8_SRGB) selectedFormat = f;
-    }
+    // Honest `_SRGB` colour swapchain (ADR-021 / INV-4.6, runtime #1589).
+    // Since runtime v2.21.7 vk_native reads a UNORM swapchain as holding LINEAR
+    // values and encodes it on output. With the UNORM choice this used to make,
+    // ModelRenderer's shader wrote display-referred bytes (swapchainIsSrgb_ =
+    // false -> linearToSrgb in pbr.frag), so they were encoded twice (washed
+    // out, lifted blacks). With `_SRGB` the shader emits scene-linear and the
+    // renderer's blit into the swapchain does the one encode. (The old note
+    // here blamed the blit for a washed-out sRGB swapchain on a DS1; that
+    // predates the runtime honouring `_SRGB` images, #1559/#1589.)
+    // DXR_SWAPCHAIN_ENCODING=unorm restores the old choice for A/B.
+    const dxr::ColorFormatChoice fmtChoice = dxr::ChooseColorSwapchainFormat(
+        formats, dxr::ColorEncodingPreferenceFromEnvironment());
+    int64_t selectedFormat = fmtChoice.format ? fmtChoice.format : (int64_t)VK_FORMAT_R8G8B8A8_SRGB;
+    dxr::NoteColorSwapchainFormat(selectedFormat);
+    LOG_INFO("Colour swapchain format %lld (%s)%s", (long long)selectedFormat,
+             fmtChoice.isSrgb ? "_SRGB" : "not _SRGB",
+             fmtChoice.fellBack ? " [fell back to formats[0]]" : "");
 
     const auto& view = xr.configViews[0];
     uint32_t scWidth = view.recommendedImageRectWidth * 2; // stereo SBS atlas
@@ -2058,12 +2066,19 @@ static bool CreateBubbleSwapchain(AppXrSession& xr, VkDevice dev, VkPhysicalDevi
     xrEnumerateSwapchainFormats(xr.session, 0, &fc, nullptr);
     std::vector<int64_t> fmts(fc);
     if (fc) xrEnumerateSwapchainFormats(xr.session, fc, &fc, fmts.data());
-    // Prefer UNORM RGBA8 so the CPU-drawn sRGB bytes pass through with no hidden
-    // sRGB decode (same reason the atlas swapchain uses UNORM).
-    int64_t fmt = fmts.empty() ? (int64_t)VK_FORMAT_R8G8B8A8_UNORM : fmts[0];
+    // The CPU-drawn bubble is RGBA8 display-referred (sRGB-encoded) bytes,
+    // copied verbatim into the image (vkCmdCopyBufferToImage never converts).
+    // They are honest only in an `_SRGB` image — a UNORM one is now read as
+    // linear and encoded again (washed-out pill). Follow the atlas swapchain's
+    // encoding (dxr::ColorSwapchainIsSrgb(), so DXR_SWAPCHAIN_ENCODING=unorm
+    // A/Bs both); RGBA before BGRA because the bitmap is RGBA-ordered.
+    const bool bubbleSrgb = dxr::ColorSwapchainIsSrgb();
+    const int64_t wantRgba = bubbleSrgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
+    const int64_t wantBgra = bubbleSrgb ? VK_FORMAT_B8G8R8A8_SRGB : VK_FORMAT_B8G8R8A8_UNORM;
+    int64_t fmt = fmts.empty() ? wantRgba : fmts[0];
     for (int64_t f : fmts) {
-        if (f == VK_FORMAT_R8G8B8A8_UNORM) { fmt = f; break; }
-        if (f == VK_FORMAT_B8G8R8A8_UNORM) fmt = f;
+        if (f == wantRgba) { fmt = f; break; }
+        if (f == wantBgra) fmt = f;
     }
     g_bubbleFormat = fmt;
 
