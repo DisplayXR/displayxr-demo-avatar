@@ -1404,7 +1404,17 @@ create_swapchains()
 		log_xr_result("xrEnumerateSwapchainFormats(fill)", res);
 		return false;
 	}
-	const int64_t preferred[] = {VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_B8G8R8A8_UNORM};
+	// Honest `_SRGB` colour swapchain (ADR-021 / INV-4.6, runtime #1589/#1623).
+	// Since runtime v2.21.7 vk_native reads a UNORM swapchain as holding LINEAR
+	// values and encodes it on output. With UNORM, ModelRenderer's shader writes
+	// display-referred bytes (swapchainIsSrgb_ = false -> linearToSrgb in
+	// pbr.frag) and the speech bubble uploads display-referred bytes, so both
+	// were encoded twice (washed out). With `_SRGB` the shader emits scene-linear
+	// and the renderer's blit does the one encode; the bubble's byte copy lands
+	// honestly-declared encoded bytes (hud_bar_init reuses g_swapchain_format).
+	// RGBA before BGRA: hud_bar's CPU bitmap is RGBA-ordered.
+	const int64_t preferred[] = {VK_FORMAT_R8G8B8A8_SRGB, VK_FORMAT_B8G8R8A8_SRGB,
+	                             VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_B8G8R8A8_UNORM};
 	for (int64_t pref : preferred) {
 		for (uint32_t i = 0; i < format_count && g_swapchain_format == VK_FORMAT_UNDEFINED; ++i) {
 			if (formats[i] == pref) {
@@ -1418,7 +1428,9 @@ create_swapchains()
 	if (g_swapchain_format == VK_FORMAT_UNDEFINED) {
 		g_swapchain_format = (VkFormat)formats[0];
 	}
-	LOGI("Chose swapchain format: 0x%x", (uint32_t)g_swapchain_format);
+	LOGI("Chose swapchain format: 0x%x (%s)", (uint32_t)g_swapchain_format,
+	     (g_swapchain_format == VK_FORMAT_R8G8B8A8_SRGB || g_swapchain_format == VK_FORMAT_B8G8R8A8_SRGB)
+	         ? "_SRGB" : "not _SRGB -- display-referred bytes land in a non-sRGB swapchain");
 
 	// ONE atlas swapchain, sized worst-case over all modes × orientations
 	// (multiview-tiling invariant). Allocated once here and never reallocated on a
