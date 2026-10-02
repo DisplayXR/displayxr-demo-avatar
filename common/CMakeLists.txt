@@ -53,7 +53,10 @@ FetchContent_Declare(
     # while the runtime move-syncs the window, a drag that ends on its button's
     # release, X11 drag steps that land exactly, and X11 header-bar double-click
     # maximise (displayxr-common#64-#68, runtime#1748).
-    GIT_TAG v2.25.0
+    # v2.27.0: window-space / HUD swapchains are created as the _SRGB sibling
+    # of R8G8B8A8 (displayxr-common#72, runtime ADR-044 §7) — the HUD, toasts and
+    # button bar no longer wash out on D3D11/D3D12/GL.
+    GIT_TAG v2.27.0
     GIT_SHALLOW TRUE
 )
 FetchContent_MakeAvailable(displayxr_common)
