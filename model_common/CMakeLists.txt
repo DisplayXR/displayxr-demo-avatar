@@ -175,9 +175,13 @@ target_include_directories(model_renderer PRIVATE
     ${tinyusdz_SOURCE_DIR}/src        # tinyusdz.hh + tydra/render-data.hh
 )
 
+# displayxr::rules (header-only, from ../common's displayxr-common fetch, which
+# the top-level CMakeLists adds BEFORE this directory) carries vk_frame_ring.h —
+# the shared N-in-flight / one-submit-per-frame Vulkan frame ring (>= v2.28.0).
 target_link_libraries(model_renderer PUBLIC
     Vulkan::Vulkan
     glm::glm
+    displayxr::rules
 )
 target_link_libraries(model_renderer PRIVATE
     tinygltf
