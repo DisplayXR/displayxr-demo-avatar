@@ -1349,6 +1349,19 @@ bool ModelRenderer::finalizeModel(ModelData& md) {
     // animations_/skins_ (set above) plus the still-intact CPU verts + indices.
     recomputeAnimatedBounds(md.vertices, md.indices);
 
+    // CPU ray cast for the depth-aware cursor: per-cluster BVHs over the base
+    // geometry (before md's CPU arrays go out of scope), bind-pose transforms.
+    {
+        const auto t0 = std::chrono::steady_clock::now();
+        raycaster_.build(md.vertices, md.indices, primitives_);
+        jointMatsCpu_.clear();
+        raycaster_.updateTransforms(primitives_, nullptr, 0);
+        const double ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t0).count();
+        std::printf("ModelRenderer: ray-cast BVH %u triangles in %u clusters, built in %.1f ms\n",
+                    raycaster_.triangleCount(), raycaster_.clusterCount(), ms);
+    }
+
     // Apply the rest-pose morph once so a model with nonzero default weights and
     // no clip still shows its morphed shape (animated models re-blend per frame).
     blendMorphs();
@@ -1715,6 +1728,7 @@ void ModelRenderer::updateAnimation(float dtSeconds) {
         uint32_t base = 0;
         glm::dvec3 centroid(0.0);   // accumulate joint world positions for the rig bind
         uint32_t jointTotal = 0;
+        jointMatsCpu_.resize((size_t)jointCount_ * 16);   // the CPU ray cast's copy
         for (const ModelSkin& s : skins_) {
             for (size_t j = 0; j < s.joints.size(); ++j) {
                 const int node = s.joints[j];
@@ -1723,6 +1737,8 @@ void ModelRenderer::updateAnimation(float dtSeconds) {
                 const glm::mat4 jm = nw * glm::make_mat4(&s.inverseBind[j * 16]);
                 std::memcpy((char*)mapped + (base + j) * 16 * sizeof(float),
                             glm::value_ptr(jm), 16 * sizeof(float));
+                if ((size_t)(base + j) * 16 + 16 <= jointMatsCpu_.size())
+                    std::memcpy(&jointMatsCpu_[(size_t)(base + j) * 16], glm::value_ptr(jm), 16 * sizeof(float));
                 centroid += glm::dvec3(nw[3]);   // joint world translation
                 ++jointTotal;
             }
@@ -1744,6 +1760,9 @@ void ModelRenderer::updateAnimation(float dtSeconds) {
             anchorValid = true;
         }
     }
+
+    raycaster_.updateTransforms(primitives_, jointMatsCpu_.empty() ? nullptr : jointMatsCpu_.data(),
+                                (uint32_t)(jointMatsCpu_.size() / 16));
 
     // 5) Re-blend morph targets into the (host-visible) vertex buffer. Runs
     //    after the node walk so the Weights channels above are applied; morphed
@@ -2967,6 +2986,8 @@ void ModelRenderer::renderEye(VkImage swapchainImage,
 }
 
 void ModelRenderer::cleanupModel() {
+    raycaster_.clear();
+    jointMatsCpu_.clear();
     if (vertexBuffer_.buffer != VK_NULL_HANDLE) modelDestroyBuffer(device_, vertexBuffer_);
     if (indexBuffer_.buffer != VK_NULL_HANDLE) modelDestroyBuffer(device_, indexBuffer_);
     for (auto& t : modelTextures_)
