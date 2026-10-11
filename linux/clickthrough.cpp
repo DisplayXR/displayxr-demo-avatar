@@ -15,6 +15,7 @@
 
 #include "model_renderer.h"
 #include "model_vulkan_utils.h"
+#include "sil_readback.h" // frame-ring-pipelined readback (INV-4.10)
 
 #include "dxr_linux_window.h" // set_input_region / clear_input_region
 
@@ -46,27 +47,20 @@ SilEnvUInt(const char *name, uint32_t def, uint32_t lo, uint32_t hi)
 	return (uint32_t)v;
 }
 
-// Scratch GPU images + host-visible readback for the silhouette pass (lazily
-// created, resized with the window). TWO images: the coverage is the union of
-// the outermost views and both halves must come from the SAME frame, or the
-// union is stale in one eye. Single-threaded — driven from the frame loop.
-static ModelImage g_silImage = {};  // first view
-static ModelImage g_silImage2 = {}; // last view (stereo only)
-static ModelBuffer g_silReadback = {};
-static void *g_silMapped = nullptr;
-static VkCommandPool g_pool = VK_NULL_HANDLE;
-
-// Pipelined readback state (#837 on the Windows leg): each invocation submits
-// its renders + copies behind a fence and does NOT wait; the NEXT invocation
-// consumes the bytes. Staleness is exactly one frame — against the ~16 ms
-// synchronous stall the old vkQueueWaitIdle cost, which is what forced the
-// 4 Hz throttle.
-static VkFence g_silFence = VK_NULL_HANDLE;
-static bool g_silPending = false;
-static uint32_t g_silPendingW = 0, g_silPendingH = 0;
-static bool g_silPendingTwo = false;
-static uint32_t g_silPendingY0 = 0;   // first raster row the avatar was drawn into
-static VkCommandBuffer g_silPrevCmd = VK_NULL_HANDLE;
+// Scratch GPU images + per-frame-ring-slot readback bands (model_common/
+// sil_readback.h), lazily created and resized with the window. TWO images: the
+// coverage is the union of the outermost views and both halves must come from
+// the SAME frame, or the union is stale in one eye. Single-threaded — driven
+// from the frame loop.
+//
+// Readback pipelined by the renderer's FRAME RING (INV-4.10): the passes and
+// their copies are recorded into the renderer's ONE frame command buffer; a
+// band is consumed when its ring slot opens again, framesInFlight frames later
+// (the renderer has waited the slot's fence by then). This replaces #837's
+// private command buffer + fence — a second vkQueueSubmit per frame, waited one
+// frame later — and the vkQueueWaitIdle the scratch-image init used. user[0] =
+// the first raster row the avatar was drawn into.
+static SilReadback g_silRb;
 
 // Published coverage: one byte per texel, 1 = avatar present.
 static std::vector<uint8_t> g_covBits;
@@ -78,142 +72,17 @@ static uint32_t g_covW = 0, g_covH = 0;
 static uint32_t g_covY0 = 0;
 static bool g_covReady = false;
 
-static bool
-EnsureTargets(VkDevice dev, VkPhysicalDevice phys, VkQueue queue, VkCommandPool pool, uint32_t w, uint32_t h)
-{
-	// Every handle, not just the first image: a partial failure below used to
-	// leave g_silImage valid and the rest null, and the NEXT call would
-	// short-circuit to "ready" and blit into VK_NULL_HANDLE. An allocation
-	// failure should degrade to "no click-through", never to a crash.
-	if (g_silImage.image != VK_NULL_HANDLE && g_silImage2.image != VK_NULL_HANDLE &&
-	    g_silReadback.buffer != VK_NULL_HANDLE && g_silMapped != nullptr && g_silImage.width == w &&
-	    g_silImage.height == h) {
-		return true;
-	}
-	if (g_silImage.image != VK_NULL_HANDLE) {
-		modelDestroyImage(dev, g_silImage);
-	}
-	if (g_silImage2.image != VK_NULL_HANDLE) {
-		modelDestroyImage(dev, g_silImage2);
-	}
-	if (g_silReadback.buffer != VK_NULL_HANDLE) {
-		if (g_silMapped) {
-			vkUnmapMemory(dev, g_silReadback.memory);
-			g_silMapped = nullptr;
-		}
-		modelDestroyBuffer(dev, g_silReadback);
-	}
-
-	// All three usages are load-bearing, and dropping any one is a spec
-	// violation the drivers we happen to run on tolerate:
-	//   TRANSFER_DST  — ModelRenderer::renderEye BLITS into its target (it
-	//                   renders to its own MSAA targets and resolves out).
-	//                   The pre-port set omitted this.
-	//   TRANSFER_SRC  — the copy-out reads it.
-	//   COLOR_ATTACHMENT — renderEye leaves the target in
-	//                   COLOR_ATTACHMENT_OPTIMAL and declares that layout on
-	//                   entry, which requires the usage
-	//                   (VUID-VkImageMemoryBarrier-oldLayout-01197); and
-	//                   modelCreateImage2D unconditionally creates a
-	//                   VkImageView, which a TRANSFER-only image is not
-	//                   compatible with (VUID-VkImageViewCreateInfo-image-04441).
-	//                   windows/main.cpp's EnsureSilhouetteTargets has the same
-	//                   gap and silently logs "failed to create image view".
-	const VkImageUsageFlags usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
-	                                VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
-	g_silImage = modelCreateImage2D(dev, phys, w, h, VK_FORMAT_R8G8B8A8_UNORM, usage);
-	if (g_silImage.image == VK_NULL_HANDLE) {
-		return false;
-	}
-	g_silImage2 = modelCreateImage2D(dev, phys, w, h, VK_FORMAT_R8G8B8A8_UNORM, usage);
-	if (g_silImage2.image == VK_NULL_HANDLE) {
-		return false;
-	}
-
-	// HOST_CACHED: this buffer is READ back every frame, and
-	// HOST_VISIBLE|HOST_COHERENT alone is typically WRITE-COMBINED on a
-	// discrete GPU — fast to write, pathologically slow to read. Measured on
-	// the Windows leg (RTX 3080): ~127 ms/frame write-combined against
-	// ~0.86 ms cached. That cost is what made this pass look too expensive to
-	// run at frame rate. DXR_VK_NO_HOST_CACHED=1 forces the legacy allocation
-	// so the pathology stays reproducible.
-	const VkDeviceSize bytes = (VkDeviceSize)w * h * 4 * 2;
-	static const bool s_noCached = getenv("DXR_VK_NO_HOST_CACHED") != nullptr;
-	g_silReadback = modelCreateBuffer(
-	    dev, phys, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-	    s_noCached ? (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
-	               : (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
-	                  VK_MEMORY_PROPERTY_HOST_CACHED_BIT));
-	if (g_silReadback.buffer == VK_NULL_HANDLE) {
-		fprintf(stderr, "[WARN]  clickthrough: no HOST_CACHED memory type — using write-combined; "
-		                "the per-frame coverage read will be slower on this driver.\n");
-		g_silReadback = modelCreateBuffer(dev, phys, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-		                                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-		                                      VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-	}
-	if (g_silReadback.buffer == VK_NULL_HANDLE) {
-		return false;
-	}
-	if (vkMapMemory(dev, g_silReadback.memory, 0, bytes, 0, &g_silMapped) != VK_SUCCESS) {
-		g_silMapped = nullptr;
-		return false;
-	}
-
-	// Put both images into COLOR_ATTACHMENT_OPTIMAL before first use.
-	// renderEye picks its entry layout from
-	// `firstViewInImage = (viewportX == 0 && viewportY == 0)`, and the
-	// silhouette pass renders at a non-zero viewportY (the avatar sits in the
-	// bottom band), so it ALWAYS declares COLOR_ATTACHMENT_OPTIMAL — never
-	// UNDEFINED. Freshly created images are UNDEFINED, so without this the very
-	// first frame's barrier lies about the layout. The copy-out below restores
-	// the same layout on every subsequent frame.
-	VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-	ai.commandPool = pool;
-	ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-	ai.commandBufferCount = 1;
-	VkCommandBuffer cmd = VK_NULL_HANDLE;
-	if (vkAllocateCommandBuffers(dev, &ai, &cmd) != VK_SUCCESS) {
-		return false;
-	}
-	VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-	bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-	vkBeginCommandBuffer(cmd, &bi);
-	VkImageMemoryBarrier init = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-	init.srcAccessMask = 0;
-	init.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-	init.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-	init.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-	init.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	init.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	init.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-	VkImageMemoryBarrier inits[2] = {init, init};
-	inits[0].image = g_silImage.image;
-	inits[1].image = g_silImage2.image;
-	vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-	                     VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr, 2, inits);
-	vkEndCommandBuffer(cmd);
-	VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
-	si.commandBufferCount = 1;
-	si.pCommandBuffers = &cmd;
-	vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE);
-	vkQueueWaitIdle(queue);   // once per (re)size only, not per frame
-	vkFreeCommandBuffers(dev, pool, 1, &cmd);
-	return true;
-}
-
-//! Fold the previous invocation's readback into the published coverage:
-//! union both planes' alpha, threshold, dilate.
+//! Fold the band this ring slot wrote framesInFlight frames ago into the
+//! published coverage: union both planes' alpha, threshold, dilate.
 static void
-ConsumePendingReadback(VkDevice dev, uint32_t dilate, uint8_t alphaMin)
+ConsumeLandedReadback(ModelRenderer &r, uint32_t dilate, uint8_t alphaMin)
 {
-	if (!g_silPending || g_silFence == VK_NULL_HANDLE) {
+	const uint8_t *px = nullptr;
+	SilReadback::Meta m;
+	if (!g_silRb.take(r, &px, &m)) {
 		return;
 	}
-	vkWaitForFences(dev, 1, &g_silFence, VK_TRUE, UINT64_MAX);
-	g_silPending = false;
-
-	const uint8_t *px = (const uint8_t *)g_silMapped;
-	const uint32_t cw = g_silPendingW, ch = g_silPendingH;
+	const uint32_t cw = m.w, ch = m.h;
 	const size_t n = (size_t)cw * ch;
 	if (px == nullptr || n == 0) {
 		return;
@@ -230,7 +99,7 @@ ConsumePendingReadback(VkDevice dev, uint32_t dilate, uint8_t alphaMin)
 		for (uint32_t x = 0; x < cw; ++x) {
 			out[x] = rowBuf[(size_t)x * 4 + 3];
 		}
-		if (g_silPendingTwo) {
+		if (m.planes > 1) {
 			memcpy(rowBuf.data(), px + n * 4 + (size_t)y * cw * 4, (size_t)cw * 4);
 			for (uint32_t x = 0; x < cw; ++x) {
 				const uint8_t a = rowBuf[(size_t)x * 4 + 3];
@@ -280,7 +149,7 @@ ConsumePendingReadback(VkDevice dev, uint32_t dilate, uint8_t alphaMin)
 	g_covBits.swap(bits);
 	g_covW = cw;
 	g_covH = ch;
-	g_covY0 = (g_silPendingY0 < ch) ? g_silPendingY0 : 0;
+	g_covY0 = ((uint32_t)m.user[0] < ch) ? (uint32_t)m.user[0] : 0;
 	g_covReady = true;
 }
 
@@ -434,29 +303,27 @@ ClickthroughUpdate(const ClickthroughParams &p)
 		h = kSilMaxH;
 	}
 
-	// 1. Consume the previous invocation's readback BEFORE EnsureTargets may
-	//    recreate the image/buffer under an in-flight copy.
-	ConsumePendingReadback(p.dev, s_dilate, s_alphaMin);
+	// 1. Consume the band this ring slot wrote framesInFlight frames ago (the
+	//    renderer waited the slot's fence when this frame opened).
+	ConsumeLandedReadback(*p.renderer, s_dilate, s_alphaMin);
 
-	// The pool must exist before EnsureTargets — it submits the images' initial
-	// layout transition.
-	if (g_pool == VK_NULL_HANDLE) {
-		VkCommandPoolCreateInfo pci = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
-		pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-		pci.queueFamilyIndex = p.queueFamily;
-		if (vkCreateCommandPool(p.dev, &pci, nullptr, &g_pool) != VK_SUCCESS) {
-			return;
-		}
-	}
-	if (!EnsureTargets(p.dev, p.phys, p.queue, g_pool, w, h)) {
+	static const bool s_noCached = getenv("DXR_VK_NO_HOST_CACHED") != nullptr;
+	if (!g_silRb.ensure(*p.renderer, p.dev, p.phys, w, h, 2, /*preferHostCached=*/!s_noCached)) {
 		return;
 	}
-	if (g_silFence == VK_NULL_HANDLE) {
-		VkFenceCreateInfo fci = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-		if (vkCreateFence(p.dev, &fci, nullptr, &g_silFence) != VK_SUCCESS) {
-			return;
+	if (!g_silRb.hostCached && !s_noCached) {
+		static bool s_warned = false;
+		if (!s_warned) {
+			s_warned = true;
+			fprintf(stderr, "[WARN]  clickthrough: no HOST_CACHED memory type — using write-combined; "
+			                "the per-frame coverage read will be slower on this driver.\n");
 		}
 	}
+	// Fresh images → cleared COLOR_ATTACHMENT_OPTIMAL, inside the frame:
+	// renderEye picks its entry layout from (viewportX == 0 && viewportY == 0),
+	// and the silhouette renders at a non-zero viewportY (the avatar sits in the
+	// bottom band), so it ALWAYS declares COLOR_ATTACHMENT_OPTIMAL.
+	g_silRb.prepFresh(*p.renderer);
 
 	// 2. Publish the region built from the readback we just consumed, then kick
 	//    this frame's pair. Applying before the kick keeps the X round-trip off
@@ -481,120 +348,30 @@ ClickthroughUpdate(const ClickthroughParams &p)
 		                      (p.clipFars != nullptr) ? p.clipFars[view] : 0.0f,
 		                      /*edgeFadePx=*/0.0f, &mp);
 	};
-	renderView(vFirst, g_silImage.image);
+	renderView(vFirst, g_silRb.image(0));
 	if (twoViews) {
-		renderView(vLast, g_silImage2.image);
+		renderView(vLast, g_silRb.image(1));
 	}
 
-	// 4. Copy both planes out behind the fence — no wait. renderEye leaves the
-	//    target in COLOR_ATTACHMENT_OPTIMAL.
-	VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-	ai.commandPool = g_pool;
-	ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-	ai.commandBufferCount = 1;
-	VkCommandBuffer cmd = VK_NULL_HANDLE;
-	if (vkAllocateCommandBuffers(p.dev, &ai, &cmd) != VK_SUCCESS) {
-		return;
+	// 4. Record both planes' copies into this frame's band — no submit, no
+	//    wait. renderEye leaves the target in COLOR_ATTACHMENT_OPTIMAL; each
+	//    image is handed back cleared in COLOR_ATTACHMENT_OPTIMAL, the layout
+	//    renderEye declares on entry for a non-(0,0) viewport.
+	const uint32_t s0 = g_silRb.record(*p.renderer, 0, 0, /*restoreCleared=*/true);
+	const uint32_t s1 = twoViews ? g_silRb.record(*p.renderer, 1, 1, true) : s0;
+	if (s0 == UINT32_MAX || s1 != s0) {
+		return; // failed, or a target resize rolled the frame onto another slot
 	}
-	VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-	bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-	vkBeginCommandBuffer(cmd, &bi);
-	VkImageMemoryBarrier toSrc = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-	toSrc.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-	toSrc.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-	toSrc.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-	toSrc.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-	toSrc.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	toSrc.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	toSrc.image = g_silImage.image;
-	toSrc.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-	vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0,
-	                     nullptr, 0, nullptr, 1, &toSrc);
-	VkBufferImageCopy region = {};
-	region.bufferRowLength = w;
-	region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-	region.imageExtent = {w, h, 1};
-	region.bufferOffset = 0;
-	vkCmdCopyImageToBuffer(cmd, g_silImage.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g_silReadback.buffer, 1,
-	                       &region);
-	if (twoViews) {
-		toSrc.image = g_silImage2.image;
-		vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-		                     0, 0, nullptr, 0, nullptr, 1, &toSrc);
-		region.bufferOffset = (VkDeviceSize)w * h * 4;
-		vkCmdCopyImageToBuffer(cmd, g_silImage2.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-		                       g_silReadback.buffer, 1, &region);
-	}
-	// Hand the images back in COLOR_ATTACHMENT_OPTIMAL. renderEye declares that
-	// as its entry layout for any viewport whose origin is not (0,0) — which is
-	// every silhouette render, since the avatar sits in the bottom band — so
-	// leaving them in TRANSFER_SRC_OPTIMAL would make next frame's barrier
-	// describe a layout the image is not in.
-	VkImageMemoryBarrier back = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-	back.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-	back.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-	back.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-	back.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-	back.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	back.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	back.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-	VkImageMemoryBarrier backs[2] = {back, back};
-	backs[0].image = g_silImage.image;
-	backs[1].image = g_silImage2.image;
-	vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
-	                     VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr,
-	                     twoViews ? 2 : 1, backs);
-	vkEndCommandBuffer(cmd);
-
-	VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
-	si.commandBufferCount = 1;
-	si.pCommandBuffers = &cmd;
-	vkResetFences(p.dev, 1, &g_silFence);
-	if (vkQueueSubmit(p.queue, 1, &si, g_silFence) == VK_SUCCESS) {
-		g_silPending = true;
-		g_silPendingTwo = twoViews;
-		g_silPendingW = w;
-		g_silPendingH = h;
-		g_silPendingY0 = avatarY;
-	}
-	// `cmd` is consumed on the NEXT invocation's fence wait; freeing it here
-	// while in flight would be invalid. Free the previous one instead.
-	if (g_silPrevCmd != VK_NULL_HANDLE) {
-		vkFreeCommandBuffers(p.dev, g_pool, 1, &g_silPrevCmd);
-	}
-	g_silPrevCmd = cmd;
+	SilReadback::Meta m;
+	m.w = w;
+	m.h = h;
+	m.planes = twoViews ? 2u : 1u;
+	m.user[0] = (int32_t)avatarY;
+	g_silRb.commit(s0, m);
 }
 
 void
 ClickthroughDestroy(VkDevice dev)
 {
-	if (g_silFence != VK_NULL_HANDLE) {
-		if (g_silPending) {
-			vkWaitForFences(dev, 1, &g_silFence, VK_TRUE, UINT64_MAX);
-			g_silPending = false;
-		}
-		vkDestroyFence(dev, g_silFence, nullptr);
-		g_silFence = VK_NULL_HANDLE;
-	}
-	if (g_silPrevCmd != VK_NULL_HANDLE && g_pool != VK_NULL_HANDLE) {
-		vkFreeCommandBuffers(dev, g_pool, 1, &g_silPrevCmd);
-		g_silPrevCmd = VK_NULL_HANDLE;
-	}
-	if (g_silMapped) {
-		vkUnmapMemory(dev, g_silReadback.memory);
-		g_silMapped = nullptr;
-	}
-	if (g_silReadback.buffer != VK_NULL_HANDLE) {
-		modelDestroyBuffer(dev, g_silReadback);
-	}
-	if (g_silImage.image != VK_NULL_HANDLE) {
-		modelDestroyImage(dev, g_silImage);
-	}
-	if (g_silImage2.image != VK_NULL_HANDLE) {
-		modelDestroyImage(dev, g_silImage2);
-	}
-	if (g_pool != VK_NULL_HANDLE) {
-		vkDestroyCommandPool(dev, g_pool, nullptr);
-		g_pool = VK_NULL_HANDLE;
-	}
+	g_silRb.destroy(dev);
 }

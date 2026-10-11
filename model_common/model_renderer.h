@@ -24,11 +24,20 @@
 #include <cstdint>
 #include <vector>
 #include <atomic>
+#include <functional>
+#include <mutex>
 #include "model_vulkan_utils.h"
 #include "model_loader.h"
 #include "model_raycast.h"
+#include "vk_frame_ring.h"   // displayxr-common >= v2.28.0 (displayxr::rules)
 
 struct ModelRenderer {
+    //! Frames in flight for the frame ring; call BEFORE init(). 0 = the ring's
+    //! default (3). DXR_VK_FRAMES_IN_FLIGHT, when set, still wins (A/B knob);
+    //! Android has no usable environment, so its leg feeds a system property
+    //! through here instead. 1 reproduces the old submit→wait shape.
+    void setFramesInFlight(uint32_t n) { framesInFlightRequest_ = n; }
+
     bool init(VkInstance instance,
               VkPhysicalDevice physicalDevice,
               VkDevice device,
@@ -49,12 +58,60 @@ struct ModelRenderer {
     // still recomputed, so a clip switch / pause shows the correct frame).
     void updateAnimation(float dtSeconds);
 
-    // Frame boundary — call once per frame BEFORE updateAnimation and any
-    // renderEye. Waits for the previous frame's per-view submissions so their
-    // ring slots and the joint-matrix SSBO can be safely rewritten. Skipping
-    // this call would race the GPU; it is what replaces the old per-view
-    // vkQueueWaitIdle.
+    // ── Frame ring (runtime INV-4.10; displayxr-common dxr::VkFrameRing) ─────
+    //
+    // ONE command buffer and ONE vkQueueSubmit per frame, N frames in flight
+    // (default 3; DXR_VK_FRAMES_IN_FLIGHT=1..8 overrides for A/B). Every
+    // renderEye() of a frame — all views AND the silhouette pass — records into
+    // the same command buffer; nothing waits on the frame just submitted. The
+    // only CPU wait on the frame path is the ring waiting the fence of the frame
+    // that used the same slot N frames ago (normally long signalled).
+    //
+    // Per frame, in this order:
+    //   beginFrame()              frame boundary (cheap; opens nothing yet)
+    //   updateAnimation(dt)       CPU pose — uploaded into the frame's slot
+    //   renderEye() x views       first call opens the frame (slot wait, reads
+    //                             back what that slot produced N frames ago)
+    //   renderEye() x silhouette  + recordColorReadback() for the coverage
+    //   endFrame()                ONE submit — BEFORE xrReleaseSwapchainImage
+    //   xrReleaseSwapchainImage / xrEndFrame
+    //
+    // beginFrame() submits a frame a caller left open (a missed endFrame()), so
+    // the pairing cannot leak across frames. Why it matters: a submit→wait loop
+    // never looks busy to a mobile GPU governor (Adreno msm-adreno-tz parks the
+    // clock at ~1/3), displayxr-demo-modelviewer#170 went 13 → 30 fps on it.
     void beginFrame();
+    //! Submit everything recorded since the frame opened — exactly one
+    //! vkQueueSubmit, the slot's fence, no wait. Call BEFORE
+    //! xrReleaseSwapchainImage (the runtime composes on the same queue). No-op
+    //! (VK_SUCCESS) when nothing opened the frame.
+    VkResult endFrame();
+    //! The open frame's command buffer, opening the frame if needed. For
+    //! callers that record their own commands into the frame (silhouette
+    //! readback, scratch-image clears). VK_NULL_HANDLE if not initialised.
+    VkCommandBuffer frameCommandBuffer();
+    //! Ring slot of the open frame (valid after frameCommandBuffer()/renderEye).
+    //! Bytes a frame copied into a per-slot region are readable once a later
+    //! frame opens on the same slot — the ring has waited that slot's fence.
+    uint32_t frameSlot() const { return ring_.slotIndex(); }
+    uint32_t framesInFlight() const { return ring_.framesInFlight(); }
+    //! Destroy something an in-flight frame may still read once every frame
+    //! submitted so far has retired. Render thread only.
+    void deferDestroy(std::function<void()> fn);
+    //! Wait for every in-flight frame (resize/teardown only — never per frame).
+    void waitIdle();
+    //! The one sanctioned blocking submit, for genuine one-offs (a static
+    //! layer upload): own command buffer allocated once, waits its own fence.
+    VkResult submitImmediate(const std::function<void(VkCommandBuffer)>& record);
+    //! Record into the open frame: `image` (COLOR_ATTACHMENT_OPTIMAL, as
+    //! renderEye leaves it) → TRANSFER_SRC, copied tightly packed (RGBA8,
+    //! w×h) to `dst` at `dstOffset`, made visible to the host. The image is left
+    //! in TRANSFER_SRC_OPTIMAL. Returns the slot it was recorded in (whose
+    //! fence releases the bytes), or UINT32_MAX on failure. Choose the region
+    //! from the RETURNED slot, never one read earlier: a target resize inside
+    //! renderEye can roll the frame onto the next slot.
+    uint32_t recordColorReadback(VkImage image, uint32_t w, uint32_t h, VkBuffer dst,
+                                 VkDeviceSize slotStride, VkDeviceSize extraOffset = 0);
 
     // ── Playback control (Phase 4). All no-op without animations. ────────────
     void setActiveAnimation(int index);   // clamps/wraps; resets time + bind pose
@@ -203,12 +260,12 @@ struct ModelRenderer {
     // and nothing else pays for the extra draw. `beginFrame()` disarms, so a
     // frame that never arms never records.
     //
-    // The readback is ONE FRAME PIPELINED, matching the click-through
-    // coverage: the pass rides on renderEye's own ring submission (which
-    // deliberately does not drain the queue), so the bytes are consumed in the
-    // next `beginFrame()`, after the fence wait that already guards the ring.
-    // `contentMaskCoverage()` therefore returns the PREVIOUS armed frame's
-    // union, and returns nullptr until the first one has landed.
+    // The readback is PIPELINED BY THE FRAME RING: the pass rides in the
+    // frame's one command buffer, copies into that ring slot's band of the
+    // readback buffer, and is folded in when the same slot next opens (the ring
+    // has waited its fence) — framesInFlight frames later, never by waiting.
+    // `contentMaskCoverage()` therefore returns the union of the armed frame
+    // framesInFlight frames back, and nullptr until the first one has landed.
 
     //! Coverage raster dimensions. Fixed, not aspect-matched to the zone: the
     //! grid is mapped onto a window-client rect by normalised position
@@ -254,6 +311,7 @@ private:
 
     bool createRenderTargets();
     bool ensureTargets(uint32_t w, uint32_t h);   // (re)create color+depth+framebuffer at this size
+    bool rebuildTargets(uint32_t w, uint32_t h);  // ensureTargets' body, nothing in flight
     bool createPipeline();
     bool createSamplerAndDefaults();
     bool createIbl();   // generate BRDF LUT + irradiance + prefiltered cubes from the analytic sky
@@ -273,21 +331,56 @@ private:
     // vertex buffer using each owning node's current weights. No-op without morph.
     // trackAnchor → also accumulate the morphed verts' world centroid (rig bind).
     void blendMorphs(bool trackAnchor = false);
-    //! Write one UniformBlock into `uboSlot` of uniformBuffer_. Slots
-    //! [0, kRingSlots) are the per-view render ring; slots [kRingSlots,
-    //! kRingSlots + kMaskSlots) belong to the content-mask coverage pass,
-    //! which needs its own viewProj (see MaskProjections).
+    //! Fill one UniformBlock at `dst` (a slice of the ring's per-slot UBO, see
+    //! allocUboSlice). The content-mask coverage pass takes its own slice — it
+    //! needs its own viewProj (see MaskProjections).
     void updateUniforms(const float viewMatrix[16], const float projMatrix[16], float clipFar,
-                        uint32_t uboSlot);
+                        void* dst);
+    //! Next free UBO slice of the open frame (null when the frame's
+    //! kUboSlicesPerFrame budget is spent — the draw is skipped, logged once).
+    void* allocUboSlice(uint32_t* outDynOffset);
+    //! Retire the loaded model's GPU objects (deferred destroy, see retired_).
     void cleanupModel();
+    //! Open the ring frame (slot wait) and run the per-frame prologue.
+    bool openFrame();
+    //! After the ring opened a slot: fold that slot's N-frame-old readbacks in,
+    //! hand retired objects to the ring, reset per-frame cursors, upload the
+    //! CPU pose (joints, morphs) into the slot, reset the slot's timestamps.
+    void framePrologue(VkCommandBuffer cmd);
+    //! Run `fn` with nothing in flight. If a frame is open it is submitted
+    //! first and a fresh one is opened afterwards (target resize mid-frame).
+    template <typename F> void quiesced(F&& fn);
+    //! One-off staged upload through the ring's immediate command buffer.
+    bool uploadBuffer(ModelBuffer& dst, const void* data, VkDeviceSize size);
+    //! Fold DXR_AVATAR_GPUTIME samples of the slot just reopened into buckets.
+    void collectGpuTimes(uint32_t slot);
 
     // ── Core Vulkan handles (not owned, from OpenXR runtime) ─────────────
     VkInstance instance_ = VK_NULL_HANDLE;
     VkPhysicalDevice physDevice_ = VK_NULL_HANDLE;
     VkDevice device_ = VK_NULL_HANDLE;
     VkQueue queue_ = VK_NULL_HANDLE;
-    VkCommandPool cmdPool_ = VK_NULL_HANDLE;
     uint32_t queueFamily_ = 0;
+
+    // ── Frame ring ─────────────────────────────────────────────────────────
+    // Owns the per-slot command buffers + fences + the per-view UBO, all
+    // allocated once. UBO slices per frame: the views (up to 4 for a 2x2 quad)
+    // + the silhouette pass (2) + the content-mask probes (kMaskSlots), with
+    // headroom; beyond it a draw is skipped rather than overwriting a slice an
+    // in-flight frame reads.
+    static constexpr uint32_t kUboSlicesPerFrame = 32;
+    dxr::VkFrameRing ring_;
+    uint32_t framesInFlightRequest_ = 0;   // setFramesInFlight (0 = default)
+    uint32_t uboCursor_ = 0;          // slices used in the open frame
+    bool     uboOverflowLogged_ = false;
+    // Retired model objects (cleanupModel). A load can run on another thread
+    // than the render loop (Windows: the message thread / MCP), so the old
+    // model is never destroyed in place — it is queued here and handed to the
+    // ring's deferred-destroy at the next frame open, which runs it only after
+    // every frame that could have referenced it has retired. modelMtx_ guards
+    // retired_, the immediate-submit command buffer and the model swap.
+    std::mutex modelMtx_;
+    std::vector<std::function<void()>> retired_;
     uint32_t width_ = 0;
     uint32_t height_ = 0;
     bool initialized_ = false;
@@ -333,7 +426,7 @@ private:
     // than the 2 the shipping path uses so that the DXR_AVATAR_MASKPASS_TEST
     // leg (which arms every view) has headroom; beyond it recording is skipped
     // rather than allowed to overwrite.
-    static constexpr uint32_t kMaskSlots = 4;
+    static constexpr uint32_t kMaskSlots = 12;
     //! Probe identity of each recorded slot. Probe 0 is the shipping mask (the
     //! one that feeds maskCoverage_ and therefore XrContentMaskDXR); probes 1
     //! and 2 exist only under DXR_AVATAR_MASKPASS_TEST and are counted, never
@@ -348,36 +441,37 @@ private:
     VkPipeline    maskPipeline_ = VK_NULL_HANDLE;
     ModelImage    maskImage_[kMaskSlots];
     VkFramebuffer maskFramebuffer_[kMaskSlots] = {};
-    ModelBuffer   maskReadback_;              // host-visible, kMaskSlots regions
+    // Host-visible, framesInFlight x kMaskSlots regions: each ring slot copies
+    // into its own band, read back when that slot next opens (its fence
+    // waited), so no in-flight frame's copy is ever read or overwritten.
+    ModelBuffer   maskReadback_;
     void*         maskMapped_ = nullptr;      // persistently mapped
-    VkFence       maskFence_[kMaskSlots] = {};   // the RING fence each slot rode on
-    bool          maskPending_[kMaskSlots] = {}; // written, not yet read back
+    bool          maskPending_[dxr::detail::kMaxFramesInFlight][kMaskSlots] = {};
     std::vector<uint8_t> maskCoverage_;       // CPU accumulator, OR-ed per view
     uint32_t maskSlotCount_ = 0;              // slots recorded since the arm
     bool maskArmed_ = false;                  // record on the next renderEye
     bool maskFailed_ = false;                 // creation failed once; never retry
     bool maskHasCoverage_ = false;            // maskCoverage_ holds a real union
-    // DXR_AVATAR_MASKPASS_TEST=1 — arm the coverage pass unconditionally, wait
-    // on each view's fence inline and log the covered-texel count every ~60
-    // frames. The pass is otherwise reachable only from the Windows
-    // transparent/borderless leg, which is the one leg that cannot be
+    // DXR_AVATAR_MASKPASS_TEST=1 — arm the coverage pass unconditionally (every
+    // view, up to kMaskSlots probes a frame) and log the covered-texel count
+    // every ~60 consumed frames. The pass is otherwise reachable only from the
+    // Windows transparent/borderless leg, which is the one leg that cannot be
     // exercised on a macOS or Linux box; this makes the Vulkan objects, the
-    // draw and the readback testable everywhere the renderer runs at all. Like
-    // gpuTimeOn_ it serialises a path the shipping build pipelines, so do not
-    // read frame rates off a MASKPASS_TEST run. Diagnostics only — it changes
-    // no output.
+    // draw and the readback testable everywhere the renderer runs at all. It
+    // rides the same ring-pipelined readback as the shipping path (no inline
+    // wait). Diagnostics only — it changes no output.
     bool maskTestForce_ = false;
     uint32_t maskTestFrames_ = 0;
-    uint8_t maskSlotProbe_[kMaskSlots] = {};      //!< which probe each recorded slot is
+    uint8_t maskSlotProbe_[dxr::detail::kMaxFramesInFlight][kMaskSlots] = {};  //!< probe per slot
     size_t  maskProbeCovered_[kMaskProbeCount] = {};  //!< covered texels, per probe
     bool    maskProbeSeen_[kMaskProbeCount] = {};     //!< probe recorded this consume
     bool ensureMaskPass();
-    void recordMaskPass(VkCommandBuffer cmd, uint32_t slot, uint32_t uboDynOffset);
-    //! Fold every pending slot into maskCoverage_. `waitFences` waits on each
-    //! slot's ring fence first (the MASKPASS_TEST path, which cannot rely on
-    //! beginFrame's wait); the shipping path passes false because beginFrame
-    //! has already waited on the whole ring.
-    void consumeMaskReadbacks(bool waitFences);
+    void recordMaskPass(VkCommandBuffer cmd, uint32_t slot, uint32_t frameSlot,
+                        uint32_t uboDynOffset);
+    //! Fold ring slot `frameSlot`'s pending mask regions into maskCoverage_.
+    //! Called from the frame prologue, right after the ring waited that slot's
+    //! fence — so the coverage is framesInFlight frames old.
+    void consumeMaskReadbacks(uint32_t frameSlot);
     void destroyMaskPass();
 
     // Target sizing is driven by the largest VIEWPORT any caller has asked for
@@ -396,12 +490,17 @@ private:
     static constexpr uint32_t kSizeObsWindow = 256;  // ~2 s at 2 views + silhouette
 
     // ── GPU timing (DXR_AVATAR_GPUTIME=1) ────────────────────────────────
-    // Timestamp queries bracketing the per-view command buffer, so a change can
-    // be judged on GPU ms/view instead of Task Manager %. Off by default.
+    // Timestamp pairs bracketing each renderEye inside the frame's command
+    // buffer, so a change can be judged on GPU ms/view instead of Task Manager
+    // %. One query range per ring slot, read back (no wait) when the slot next
+    // opens — the measured path is now the shipping path. Off by default.
+    static constexpr uint32_t kTimedPerFrame = 16;
     VkQueryPool tsPool_     = VK_NULL_HANDLE;
     bool        gpuTimeOn_  = false;
     double      tsPeriodNs_ = 0.0;      // ns per timestamp tick
     size_t      targetBytes_ = 0;       // device memory held by the render targets
+    uint32_t    tsCount_[dxr::detail::kMaxFramesInFlight] = {};
+    uint32_t    tsExtent_[dxr::detail::kMaxFramesInFlight][kTimedPerFrame][2] = {};
 
     // Bucketed by viewport extent, because renderEye serves both the per-eye
     // tile and the ~1/3-scale silhouette pass — averaging them together would
@@ -433,19 +532,9 @@ private:
     VkPipelineLayout fadePipelineLayout_ = VK_NULL_HANDLE;
     VkPipeline fadePipeline_ = VK_NULL_HANDLE;
     VkDescriptorPool descriptorPool_ = VK_NULL_HANDLE;
+    // Set 0 = UNIFORM_BUFFER_DYNAMIC on ring_.uboBuffer(); the dynamic offset
+    // selects slot x slice, so one set serves every frame in flight.
     VkDescriptorSet descriptorSet_ = VK_NULL_HANDLE;
-    // Ring of per-view UniformBlocks + matching command buffers and fences, so
-    // renderEye no longer has to drain the queue after every view. kRingSlots
-    // must be >= the most renderEye calls in one frame: max view count (4 for a
-    // 2x2 quad mode) plus the 2 silhouette passes.
-    static constexpr uint32_t kRingSlots = 8;
-    ModelBuffer   uniformBuffer_;                 // host-visible UniformBlock[kRingSlots]
-    VkDeviceSize  uboStride_ = 0;                 // aligned per-slot stride
-    VkCommandBuffer ringCmd_[kRingSlots]   = {};  // pre-allocated, reused
-    VkFence         ringFence_[kRingSlots] = {};
-    bool            ringSubmitted_[kRingSlots] = {};
-    uint32_t        ringSlot_  = 0;               // next slot to use this frame
-    uint32_t        ringInUse_ = 0;               // slots submitted this frame
 
     // ── Material textures (set = 1: 5 combined image samplers) ───────────
     VkSampler sampler_ = VK_NULL_HANDLE;
@@ -481,15 +570,28 @@ private:
     VkDescriptorSetLayout jointSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorPool jointPool_ = VK_NULL_HANDLE;       // recreated per model
     VkDescriptorSet jointSet_ = VK_NULL_HANDLE;
-    ModelBuffer jointBuffer_;                            // host-visible mat4[] SSBO
+    // STORAGE_BUFFER_DYNAMIC: framesInFlight copies of the joint palette, one
+    // per ring slot. The CPU pose (jointCpu_) is written by updateAnimation and
+    // copied into the open frame's copy in the frame prologue — rewriting a
+    // single SSBO would race the frames still in flight.
+    ModelBuffer jointBuffer_;
+    void*       jointMapped_ = nullptr;                  // persistently mapped
+    VkDeviceSize jointStride_ = 0;                       // aligned per-slot stride
+    std::vector<float> jointCpu_;                        // 16 floats x jointCount_
     std::vector<ModelSkin> skins_;
-    uint32_t jointCount_ = 0;                            // matrices in jointBuffer_
+    uint32_t jointCount_ = 0;                            // matrices per palette
     float    skinAccum_ = 0.0f;                          // DXR_AVATAR_SKIN_HZ accumulator
 
     // ── Morph targets (Phase 3: CPU blend into a host-visible vertex buffer) ─
-    bool hasMorph_ = false;                  // → vertexBuffer_ is host-visible
+    // Morph models: vertexBuffer_ is host-visible and holds framesInFlight
+    // copies (one per ring slot, vbStride_ apart); blendMorphs writes
+    // morphBlended_ on the CPU and the frame prologue copies it into the slot.
+    bool hasMorph_ = false;
+    void* vertexMapped_ = nullptr;
+    VkDeviceSize vbStride_ = 0;
     std::vector<ModelMorph>  morphs_;
     std::vector<ModelVertex> morphBase_;     // CPU base verts, re-blended per frame
+    std::vector<ModelVertex> morphBlended_;  // CPU blend result, uploaded per slot
     float morphCentroid_[3] = {0, 0, 0};     // raw world centroid of morphed verts
     bool  morphCentroidValid_ = false;       // (rig-bind fallback when no skeleton)
 

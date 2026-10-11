@@ -2382,9 +2382,20 @@ static const uint8_t* RenderBubbleBitmap(uint32_t subW, uint32_t subH) {
 // Rasterize the bubble, acquire the window-space swapchain image, upload the
 // staging buffer into it, and fill `outLayer` (the panel sub-rect mapped onto
 // the full top-25% band). Returns true when the layer is ready to submit.
-static bool BuildBubbleLayer(VkDevice dev, VkQueue queue, VkCommandPool pool,
-                             uint32_t subW, uint32_t subH, int bandW, int bandH,
+static void FillBubbleLayer(uint32_t subW, uint32_t subH, int bandW, int bandH,
+                            XrCompositionLayerLocal2DDXR& outLayer);
+
+static bool BuildBubbleLayer(uint32_t subW, uint32_t subH, int bandW, int bandH,
                              XrCompositionLayerLocal2DDXR& outLayer) {
+    // The greeting is STATIC: re-upload only when the panel sub-rect changes
+    // (resize) — the Windows #837 fix. This used to upload + vkQueueWaitIdle
+    // EVERY frame; in between, the last released swapchain image keeps serving
+    // the layer.
+    static uint32_t s_upW = 0, s_upH = 0;
+    if (s_upW == subW && s_upH == subH) {
+        FillBubbleLayer(subW, subH, bandW, bandH, outLayer);
+        return true;
+    }
     const uint8_t* px = RenderBubbleBitmap(subW, subH);
     if (!px) return false;
 
@@ -2397,20 +2408,10 @@ static bool BuildBubbleLayer(VkDevice dev, VkQueue queue, VkCommandPool pool,
 
     memcpy(g_bubbleStagingMapped, px, (size_t)kBubbleTexW * kBubbleTexH * 4);
 
-    VkCommandBufferAllocateInfo cai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-    cai.commandPool = pool;
-    cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    cai.commandBufferCount = 1;
-    VkCommandBuffer cb = VK_NULL_HANDLE;
-    if (vkAllocateCommandBuffers(dev, &cai, &cb) != VK_SUCCESS) {
-        XrSwapchainImageReleaseInfo bri = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
-        xrReleaseSwapchainImage(g_bubbleSwapchain, &bri);
-        return false;
-    }
-    VkCommandBufferBeginInfo bgi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-    bgi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(cb, &bgi);
+    // One-off (resize only): the renderer's immediate command buffer —
+    // allocated once, waits its OWN fence, never the queue.
     VkImage img = g_bubbleImages[idx].image;
+    const VkResult ur = g_modelRenderer.submitImmediate([&](VkCommandBuffer cb) {
     VkImageMemoryBarrier bar = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
     bar.srcAccessMask = 0; bar.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     bar.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED; bar.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
@@ -2429,16 +2430,19 @@ static bool BuildBubbleLayer(VkDevice dev, VkQueue queue, VkCommandPool pool,
     bar.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; bar.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
     vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
                          0, 0, nullptr, 0, nullptr, 1, &bar);
-    vkEndCommandBuffer(cb);
-    VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
-    si.commandBufferCount = 1; si.pCommandBuffers = &cb;
-    vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE);
-    vkQueueWaitIdle(queue);
-    vkFreeCommandBuffers(dev, pool, 1, &cb);
+    });
 
     XrSwapchainImageReleaseInfo bri = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
     xrReleaseSwapchainImage(g_bubbleSwapchain, &bri);
+    if (ur != VK_SUCCESS) return false;
+    s_upW = subW;
+    s_upH = subH;
+    FillBubbleLayer(subW, subH, bandW, bandH, outLayer);
+    return true;
+}
 
+static void FillBubbleLayer(uint32_t subW, uint32_t subH, int bandW, int bandH,
+                            XrCompositionLayerLocal2DDXR& outLayer) {
     // Visible bubble = the panel sub-rect mapped onto the FULL top-25% band. The
     // Local2D layer's implicit M=0 mask over `rect` flattens that band to 2D so
     // the avatar stops weaving there; the panel fills it with the rounded pill.
@@ -2450,12 +2454,25 @@ static bool BuildBubbleLayer(VkDevice dev, VkQueue queue, VkCommandPool pool,
     outLayer.subImage.imageArrayIndex = 0;
     outLayer.rect.offset = {0, 0};
     outLayer.rect.extent = {bandW, bandH};
-    return true;
 }
 
 // ============================================================================
 // Tiger-zone activation + per-frame render (XR_DXR_display_zones)
 // ============================================================================
+
+// INV-4.10: the frame's projection swapchain image is released only AFTER the
+// renderer's single per-frame submit (endFrame), which must also carry the
+// click-through silhouette recorded after the views. So the render paths below
+// park the acquired swapchain here instead of releasing it; the frame loop
+// calls ReleasePendingFrameImage() right after g_modelRenderer.endFrame().
+static XrSwapchain g_pendingReleaseSwapchain = XR_NULL_HANDLE;
+
+static void ReleasePendingFrameImage() {
+    if (g_pendingReleaseSwapchain == XR_NULL_HANDLE) return;
+    XrSwapchainImageReleaseInfo ri = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+    xrReleaseSwapchainImage(g_pendingReleaseSwapchain, &ri);
+    g_pendingReleaseSwapchain = XR_NULL_HANDLE;
+}
 
 // One-shot activation: capabilities check + pre-sized zone swapchain. The zone
 // swapchain is sized to the main atlas envelope (worst-case display×scale SBS);
@@ -2884,8 +2901,8 @@ static bool RenderTigerZone(AppXrSession& xr, const XrFrameState& frameState,
         projViews[i].fov = zoneViews[i].fov;
     }
     DxrAliasInactiveViews(projViews.data(), zoneViews, located, n);
-    XrSwapchainImageReleaseInfo ri = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
-    xrReleaseSwapchainImage(g_zoneSwapchain, &ri);
+    // Released by the frame loop after g_modelRenderer.endFrame() (INV-4.10).
+    g_pendingReleaseSwapchain = g_zoneSwapchain;
     PublishPickMatrices(fv, zoneViews, n);
     return true;
 }
@@ -3059,13 +3076,11 @@ int main(int argc, char** argv) {
         float dt = std::chrono::duration<float>(now - lastTime).count();
         lastTime = now;
 
-        // Frame boundary for the renderer's per-view ring. MUST precede
-        // updateAnimation: that rewrites the joint-matrix SSBO, which the
-        // previous frame's views may still be reading — renderEye does not
-        // drain the queue after each view. It is also what folds the
-        // content-mask coverage readbacks in (see beginContentMaskFrame).
-        // This leg never called it, so every kRingSlots-th renderEye fell back
-        // to a full queue drain and the coverage pass could never publish.
+        // Frame boundary for the renderer's frame ring (INV-4.10): the views
+        // and the click-through pass below record into ONE command buffer,
+        // submitted once by endFrame() before the swapchain release.
+        // updateAnimation only writes the CPU pose; the renderer copies it into
+        // the frame's own ring slot when the frame opens.
         g_modelRenderer.beginFrame();
         g_modelRenderer.updateAnimation(dt);
         UpdateInteractive(dt, xr.displayHeightM);   // WASD/QE pan, focus ease
@@ -3276,8 +3291,8 @@ int main(int argc, char** argv) {
                             projViews[i].fov = views[i].fov;
                         }
                         DxrAliasInactiveViews(projViews.data(), views.data(), viewCount, eyeCount);
-                        XrSwapchainImageReleaseInfo relInfo = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
-                        xrReleaseSwapchainImage(xr.swapchain.swapchain, &relInfo);
+                        // Released after g_modelRenderer.endFrame() (INV-4.10).
+                        g_pendingReleaseSwapchain = xr.swapchain.swapchain;
                         PublishPickMatrices(fv, views.data(), eyeCount);
                     }
                 }
@@ -3409,6 +3424,12 @@ int main(int argc, char** argv) {
             }
         }
 
+        // ONE vkQueueSubmit for the views + the click-through pass, no wait —
+        // and only THEN release the projection swapchain image: the runtime
+        // composes on the same queue (INV-4.10).
+        g_modelRenderer.endFrame();
+        ReleasePendingFrameImage();
+
         XrFrameEndInfo endInfo = {XR_TYPE_FRAME_END_INFO};
         endInfo.displayTime = frameState.predictedDisplayTime;
         // Keep the existing blend mode as-is (the runtime keys the transparent
@@ -3471,8 +3492,7 @@ int main(int argc, char** argv) {
                 if (subW < 2) subW = 2; else if (subW > kBubbleTexW) subW = kBubbleTexW;
                 if (subH < 2) subH = 2; else if (subH > kBubbleTexH) subH = kBubbleTexH;
 
-                if (BuildBubbleLayer(vkDevice, graphicsQueue, bubbleCmdPool,
-                                     subW, subH, bandW, bandH, bubbleLayer)) {
+                if (BuildBubbleLayer(subW, subH, bandW, bandH, bubbleLayer)) {
                     layers[layerN++] = (XrCompositionLayerBaseHeader*)&bubbleLayer;
                 }
             }
@@ -3500,6 +3520,7 @@ int main(int argc, char** argv) {
             dxr::ChainContentMask(endInfo, contentMaskDXR, g_contentMaskCells,
                                   kContentMaskGridCells, kContentMaskGridCells);
         }
+        g_modelRenderer.endFrame();  // no-op unless a path opened a frame without closing it
         xrEndFrame(xr.session, &endInfo);
     }
 

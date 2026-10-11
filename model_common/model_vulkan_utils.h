@@ -49,12 +49,3 @@ ModelImage modelCreateImage2D(VkDevice device,
 
 // Destroy an image, its view, and free memory.
 void modelDestroyImage(VkDevice device, ModelImage& img);
-
-// Upload CPU data to a device-local buffer via a staging buffer.
-bool modelUploadBuffer(VkDevice device,
-                    VkPhysicalDevice physDevice,
-                    VkQueue queue,
-                    VkCommandPool cmdPool,
-                    ModelBuffer& dst,
-                    const void* data,
-                    VkDeviceSize size);
