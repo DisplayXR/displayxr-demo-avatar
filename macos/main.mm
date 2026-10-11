@@ -70,6 +70,7 @@
 extern "C" int stbi_write_png(char const* filename, int w, int h, int comp,
                               const void* data, int stride_in_bytes);
 #include "atlas_capture.h"
+#include "model_cursor_depth.h" // depth-aware cursor (XR_DXR_cursor_depth): runtime-drawn, model ray cast
 
 // ============================================================================
 // Logging
@@ -1025,6 +1026,10 @@ struct AppXrSession {
     bool hasAtlasCaptureExt = false;
     PFN_xrCaptureAtlasDXR pfnCaptureAtlasEXT = nullptr;
 
+    // XR_DXR_cursor_depth (runtime ADR-046): the runtime draws a depth cursor
+    // in front of content that pops out under the pointer. 0 = not enabled.
+    uint32_t cursorDepthSpecVersion = 0;
+
     // XR_DXR_mcp_tools (#22): app-defined agent tools on the runtime-hosted
     // per-process MCP server. The whole path is inert when the extension or
     // the MCP capability gate is absent — never load-bearing.
@@ -1187,6 +1192,9 @@ static bool InitializeOpenXR(AppXrSession& xr) {
         if (strcmp(ext.extensionName, XR_DXR_ATLAS_CAPTURE_EXTENSION_NAME) == 0) xr.hasAtlasCaptureExt = true;
         if (strcmp(ext.extensionName, XR_DXR_MCP_TOOLS_EXTENSION_NAME) == 0) xr.hasMcpToolsExt = true;
         if (strcmp(ext.extensionName, XR_DXR_LOCAL_3D_ZONE_EXTENSION_NAME) == 0) xr.hasLocal3DZone = true;
+        if (strcmp(ext.extensionName, XR_DXR_CURSOR_DEPTH_EXTENSION_NAME) == 0 &&
+            avatar::CursorDepthWanted())
+            xr.cursorDepthSpecVersion = ext.extensionVersion;
     }
 
     if (!hasVulkan) { LOG_ERROR("XR_KHR_vulkan_enable not available"); return false; }
@@ -1198,6 +1206,9 @@ static bool InitializeOpenXR(AppXrSession& xr) {
     if (xr.hasAtlasCaptureExt) enabled.push_back(XR_DXR_ATLAS_CAPTURE_EXTENSION_NAME);
     if (xr.hasMcpToolsExt) enabled.push_back(XR_DXR_MCP_TOOLS_EXTENSION_NAME);
     if (xr.hasLocal3DZone) enabled.push_back(XR_DXR_LOCAL_3D_ZONE_EXTENSION_NAME);
+    if (xr.cursorDepthSpecVersion > 0) enabled.push_back(XR_DXR_CURSOR_DEPTH_EXTENSION_NAME);
+    LOG_INFO("XR_DXR_cursor_depth: %s (spec v%u)", xr.cursorDepthSpecVersion ? "ENABLED" : "off",
+             xr.cursorDepthSpecVersion);
 
     XrInstanceCreateInfo ci = {XR_TYPE_INSTANCE_CREATE_INFO};
     strncpy(ci.applicationInfo.applicationName, "DisplayXRAvatarMacOS", sizeof(ci.applicationInfo.applicationName));
@@ -2825,6 +2836,18 @@ int main(int argc, char** argv) {
     LOG_INFO("          -/= Depth  Space=Reset  M=Auto-Orbit  V=Mode");
     LOG_INFO("          L/Open=Load  Tab=HUD  ESC=Quit  (.glb/.gltf also accept drag-and-drop)");
 
+    // Depth-aware cursor: the runtime draws it (default look) in front of the
+    // avatar where it pops out of the glass; the app supplies the depth. This
+    // leg renders its OWN Kooima views from the raw display-space eyes (no
+    // XR_DXR_view_rig), so the locate space is NOT the model world: the
+    // app-Kooima hit test casts through the app's views and hands the runtime
+    // the display-space point its views see at the same two canvas positions
+    // (common/model_cursor_depth.h). Inert when the extension is off / opted out.
+    dxr::CursorDepth cursor;
+    avatar::CursorDepthAdoption cursorAdopt;
+    cursorAdopt.setupAppKooima(cursor, g_modelRenderer, xr.cursorDepthSpecVersion);
+    if (!cursorAdopt.scripted()) cursor.setWindowCocoa((__bridge void*)g_metalView);
+
     auto lastTime = std::chrono::high_resolution_clock::now();
 
     while (g_running && !xr.exitRequested) {
@@ -2967,6 +2990,7 @@ int main(int argc, char** argv) {
                     XrView views[8] = {};
                     for (uint32_t v = 0; v < runtimeViewCount; v++) views[v].type = XR_TYPE_VIEW;
 
+                    cursor.chain(locateInfo, viewState);
                     XrResult locResult = xrLocateViews(xr.session, &locateInfo, &viewState,
                         runtimeViewCount, &runtimeViewCount, views);
                     if (XR_SUCCEEDED(locResult) &&
@@ -3019,6 +3043,21 @@ int main(int argc, char** argv) {
                         }
 
                         int eyeCount = monoMode ? 1 : (int)modeViewCount;
+                        // The RAW located views (display space) — before the
+                        // Kooima block below overwrites views[].pose for submit.
+                        cursor.afterLocate(views, (uint32_t)eyeCount);
+                        if (cursorAdopt.endFrame(cursor)) LOG_INFO("%s", cursorAdopt.summary());
+                        {
+                            static bool s_loggedCursorCanvas = false;
+                            if (!s_loggedCursorCanvas && xr.cursorDepthSpecVersion > 0 && eyeCount >= 2) {
+                                s_loggedCursorCanvas = true;
+                                // The hit test assumes the raw views frame the WINDOW
+                                // canvas (the canvas cursorUV is relative to).
+                                LOG_INFO("cursor depth: raw view canvas aspect %.4f, window %ux%u (aspect %.4f)",
+                                         dxr::cursorCanvasAspect(views[0]), g_windowW, g_windowH,
+                                         g_windowH ? (float)g_windowW / (float)g_windowH : 0.0f);
+                            }
+                        }
 
                         // Collect raw eye positions for every view this mode uses.
                         std::vector<XrVector3f> rawEyePos(modeViewCount);
@@ -3207,6 +3246,17 @@ int main(int argc, char** argv) {
                                 convert_projection_gl_to_zero_to_one(eyeViewsUnres[_v].projection_matrix);
                             }
                         }
+                        // Depth cursor: the outer views as renderEye gets them
+                        // (legacy Y-mirror convention; the avatar fills the
+                        // bottom canvasFrac of the window). Used by NEXT frame's
+                        // chain(), paired with this frame's raw views.
+                        if (hasKooima && eyeCount >= 2)
+                            cursorAdopt.setAppViews(eyeViews[0].view_matrix, eyeViews[0].projection_matrix,
+                                                    eyeViews[eyeCount - 1].view_matrix,
+                                                    eyeViews[eyeCount - 1].projection_matrix,
+                                                    /*legacyMirror=*/true, 1.0f - canvasFrac);
+                        else
+                            cursorAdopt.clearAppViews();
 
                         // Double-click focus: ray from CENTER physical eyes through the
                         // physical mouse location on the display surface, pick nearest surface,
@@ -3316,8 +3366,15 @@ int main(int argc, char** argv) {
                                     memcpy(viewMat[eye].data(), eyeViews[eye].view_matrix, sizeof(float) * 16);
                                     memcpy(projMat[eye].data(), eyeViews[eye].projection_matrix, sizeof(float) * 16);
                                     memcpy(projMatUnres[eye].data(), eyeViewsUnres[eye].projection_matrix, sizeof(float) * 16);
-                                    views[srcView].pose.position = eyeViews[eye].eye_world;
-                                    views[srcView].pose.orientation = cameraPose.orientation;
+                                    // The layer keeps the RAW located pose/fov (below):
+                                    // this leg does not use XR_DXR_view_rig, so the
+                                    // locate space is display space and the raw views
+                                    // are what frame the window canvas there. The
+                                    // app-side Kooima eye (eye_world) lives in the
+                                    // Y-mirrored render frame, a different space; the
+                                    // runtime projects its depth cursor through the
+                                    // layer's views, so they must be in the locate
+                                    // space (XR_DXR_cursor_depth v5).
                                 } else {
                                     mat4_view_from_xr_pose(viewMat[eye].data(), views[srcView].pose);
                                     mat4_from_xr_fov(projMat[eye].data(), views[srcView].fov, 0.01f, 100.0f);
@@ -3338,7 +3395,7 @@ int main(int argc, char** argv) {
                                 projectionViews[eye].subImage.imageRect.extent = {(int32_t)renderW, (int32_t)renderH};
                                 projectionViews[eye].subImage.imageArrayIndex = 0;
                                 projectionViews[eye].pose = views[srcView].pose;
-                                projectionViews[eye].fov = hasKooima ? eyeViews[eye].fov : views[srcView].fov;
+                                projectionViews[eye].fov = views[srcView].fov;
                             }
 
                             // Render model or placeholder

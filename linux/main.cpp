@@ -151,6 +151,7 @@
 // Header-only static inline — same include the win/mac peers + cube_handle use.
 #include "projection_depth.h"
 #include "auto_fit.h"            // dxr::AutoFitVHeight — shared load-time framing rule
+#include "model_cursor_depth.h"  // depth-aware cursor (XR_DXR_cursor_depth): runtime-drawn, model ray cast
 
 #include "stb_truetype.h"        // CPU text rasterizer for the speech bubble
                                  // (impl defined in stb_truetype_impl.cpp)
@@ -391,6 +392,19 @@ static float g_focusTarget[3] = {0.0f, 0.0f, 0.0f};
 // click-through region — is displayxr-common's displayxr::linux_window.
 // Destroyed LAST (the runtime's VkSurfaceKHR borrows its connection).
 static DxrLinuxWindow g_window;
+// Depth-aware cursor (XR_DXR_cursor_depth): the runtime draws it in front of the
+// avatar where it pops out of the glass; the app supplies the depth
+// (ModelRenderer::raycast through the rig's render-ready views).
+// displayxr::linux_window is X11 OR Wayland, so this leg feeds the pointer by
+// hand (FeedCursorPointer, from Motion / PointerLeave) and hides the OS cursor
+// with the window's own set_cursor() - the helper's manual path. The cursor
+// locate is the zone-scoped one (the tiger zone, bottom 75%), so the pointer is
+// fed as ZONE uv; on the full-tile fallback it is window uv. Declared after
+// g_window: destroyed BEFORE it.
+static dxr::CursorDepth g_cursor;
+static avatar::CursorDepthAdoption g_cursorAdopt;
+static int  g_cursorPtrX = 0, g_cursorPtrY = 0;   // last Motion, client px
+static bool g_cursorPtrIn = false;                // pointer over the window
 //! xrWeaveSnapWindowRectDXR behind the helper's drag (runtime#1588).
 static DxrWeaveSnap g_weaveSnap;
 
@@ -695,6 +709,7 @@ struct AppXrSession {
     unsigned int xWinW = 0, xWinH = 0; // create-time window size (fallback when the live one is unknown)
     bool usingAppWindow = false;       // the window binding was actually handed to xrCreateSession
     bool hasViewRig = false;           // XR_DXR_view_rig enabled — chain the display rig on locate
+    uint32_t cursorDepthSpecVersion = 0; //!< XR_DXR_cursor_depth, 0 = not enabled
 
     // XR_DXR_display_info (adaptive tiling / extension-app path). When enabled +
     // the query succeeds (displayWidthM > 0), the per-view render TILE is
@@ -1215,6 +1230,16 @@ static void HandleWindowEvent(AppXrSession& xr, const DxrWindowEvent& ev) {
         break;
     }
 
+    case DxrWindowEvent::Type::Motion:
+        g_cursorPtrX = ev.x;
+        g_cursorPtrY = ev.y;
+        g_cursorPtrIn = true;
+        break;
+
+    case DxrWindowEvent::Type::PointerLeave:
+        g_cursorPtrIn = false;   // off the canvas: no hint
+        break;
+
     case DxrWindowEvent::Type::FocusLost:
         // Losing KEYBOARD focus means losing the keys: a held W released over
         // another window never reaches us, and the avatar would pan forever.
@@ -1238,6 +1263,17 @@ static void HandleWindowEvent(AppXrSession& xr, const DxrWindowEvent& ev) {
 
     default: break;
     }
+}
+
+//! Depth cursor: hand dxr::CursorDepth this frame's pointer as uv of the canvas
+//! the cursor locate frames — client rows [topPx, winH) x the full width (the
+//! tiger zone; topPx = 0 on the full-tile fallback). Scripted
+//! (DISPLAYXR_CURSOR_DEPTH_UV) pointers are left alone.
+static void FeedCursorPointer(uint32_t winW, uint32_t winH, int32_t topPx) {
+    if (g_cursorAdopt.scripted()) return;
+    const int32_t h = (int32_t)winH - topPx;
+    if (!g_cursorPtrIn || winW == 0 || h <= 0) { g_cursor.clearPointerUV(); return; }
+    g_cursor.setPointerUV((float)g_cursorPtrX / (float)winW, (float)(g_cursorPtrY - topPx) / (float)h);
 }
 
 //! Drain the window once per frame (both backends).
@@ -1296,6 +1332,9 @@ static bool InitializeOpenXR(AppXrSession& xr, DxrWindowBackend requestedBackend
         if (strcmp(ext.extensionName, XR_DXR_DISPLAY_ZONES_EXTENSION_NAME) == 0) hasDisplayZones = true;
         if (strcmp(ext.extensionName, XR_DXR_ATLAS_CAPTURE_EXTENSION_NAME) == 0) hasAtlasCapture = true;
         if (strcmp(ext.extensionName, XR_DXR_WEAVE_EXTENSION_NAME) == 0) xr.hasWeave = true;
+        if (strcmp(ext.extensionName, XR_DXR_CURSOR_DEPTH_EXTENSION_NAME) == 0 &&
+            avatar::CursorDepthWanted())
+            xr.cursorDepthSpecVersion = ext.extensionVersion;
         if (strcmp(ext.extensionName, XR_DXR_DEPTH_BUDGET_EXTENSION_NAME) == 0) {
             xr.hasDepthBudget = true;
             // The RUNTIME's version, not this app's vendored SPEC_VERSION — the
@@ -1359,6 +1398,12 @@ static bool InitializeOpenXR(AppXrSession& xr, DxrWindowBackend requestedBackend
         LOG_INFO("XR_DXR_view_rig present but XR_DXR_display_info is not — "
                  "not enabling the rig (needs display_info for window-relative Kooima)");
     }
+    // The depth cursor's ray cast runs in the rig's render-ready world, so it
+    // is only meaningful with the rig on.
+    if (xr.cursorDepthSpecVersion > 0 && !xr.hasViewRig) xr.cursorDepthSpecVersion = 0;
+    if (xr.cursorDepthSpecVersion > 0) enabledExtensions.push_back(XR_DXR_CURSOR_DEPTH_EXTENSION_NAME);
+    LOG_INFO("XR_DXR_cursor_depth: %s (spec v%u)", xr.cursorDepthSpecVersion ? "ENABLED" : "off",
+             xr.cursorDepthSpecVersion);
     // Enable the Local2D layer so the runtime composites the flat 2D speech
     // bubble in the top 25% band (the runtime's software-composite path handles
     // Local2D on Linux with no platform guard). Guarded everywhere on
@@ -2748,6 +2793,11 @@ static bool RenderTigerZone(AppXrSession& xr, const XrFrameState& frameState,
     uint32_t viewCountOut = 0;
     XrView zoneViews[kMaxViews];
     for (uint32_t i = 0; i < kMaxViews; i++) zoneViews[i] = {XR_TYPE_VIEW};
+    // Depth cursor: chained LAST (it prepends), on the zone-scoped locate —
+    // the canvas is the zone. NB the runtime does not draw in a zones frame
+    // yet (willDraw stays false, the OS cursor stays): inert until it does.
+    FeedCursorPointer(winW, winH, topBand);
+    g_cursor.chain(locateInfo, viewState);
     if (XR_FAILED(xrLocateViews(xr.session, &locateInfo, &viewState, kMaxViews, &viewCountOut, zoneViews)) ||
         viewCountOut == 0) {
         static bool s_warned = false;
@@ -2776,6 +2826,8 @@ static bool RenderTigerZone(AppXrSession& xr, const XrFrameState& frameState,
                      zoneWanted, viewCountOut, tiles, n);
         }
     }
+    g_cursor.afterLocate(zoneViews, n);
+    if (g_cursorAdopt.endFrame(g_cursor)) LOG_INFO("%s", g_cursorAdopt.summary());
     if (n == 0) return false;  // nothing submittable — fall back to the full-tile path
 
     XrSwapchainImageAcquireInfo ai = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
@@ -2990,6 +3042,11 @@ int main(int argc, char** argv) {
         LOG_WARN("XR_DXR_local_3d_zone unavailable — no speech bubble");
     }
 
+    g_cursorAdopt.setup(g_cursor, g_modelRenderer, xr.cursorDepthSpecVersion);
+    g_cursor.onDepthCursorShownChanged([](bool shown) {
+        g_window.set_cursor(shown ? DxrCursor::Hidden : DxrCursor::Default);
+    });
+
     LOG_INFO("=== Entering main loop (Ctrl+C to exit) ===");
     auto lastTime = std::chrono::high_resolution_clock::now();
 
@@ -3093,6 +3150,14 @@ int main(int argc, char** argv) {
             xrLocateViews(xr.session, &locateInfo, &viewState, 0, &viewCount, nullptr);
             if (viewCount == 0) viewCount = 2;
             std::vector<XrView> views(viewCount, {XR_TYPE_VIEW});
+            // Depth cursor: only under the rig (its views are the model world);
+            // the canvas is the whole window here.
+            if (useDisplayRig) {
+                uint32_t cw = 0, ch = 0;
+                LiveClientSize(xr, &cw, &ch);
+                FeedCursorPointer(cw, ch, 0);
+                g_cursor.chain(locateInfo, viewState);
+            }
             XrResult loc = xrLocateViews(xr.session, &locateInfo, &viewState, viewCount, &viewCount, views.data());
 
             // Render whenever the locate succeeds — the view pose/FOV come from the
@@ -3133,6 +3198,9 @@ int main(int argc, char** argv) {
                         // projection layer with viewCount 0 is itself invalid, so
                         // never let the render loop degenerate.
                         if (eyeCount == 0) eyeCount = 1;
+                        g_cursor.afterLocate(useDisplayRig ? views.data() : nullptr,
+                                             useDisplayRig ? eyeCount : 0u);
+                        if (g_cursorAdopt.endFrame(g_cursor)) LOG_INFO("%s", g_cursorAdopt.summary());
                         // Per-eye RENDER TILE = window × recommendedViewScale
                         // (docs/specs/runtime/multiview-tiling.md + ADR-010/030):
                         // the swapchain is the worst-case display×scale envelope,
@@ -3455,6 +3523,7 @@ int main(int argc, char** argv) {
     CleanupOpenXR(xr);
     if (vkDevice) vkDestroyDevice(vkDevice, nullptr);
     if (vkInstance) vkDestroyInstance(vkInstance, nullptr);
+    g_cursor.enable(0);   // restores the OS cursor while the window still exists
     g_window.destroy();   // LAST: the runtime's VkSurfaceKHR borrowed this connection
     LOG_INFO("Clean exit");
     return 0;

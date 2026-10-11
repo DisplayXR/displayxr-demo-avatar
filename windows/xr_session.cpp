@@ -13,6 +13,7 @@
 // displayxr-common's dxr_view_config.h (via displayxr::rules) — the one
 // implementation; this repo no longer carries a local copy (runtime #1612).
 #include "dxr_view_config.h"   // DxrSelectViewConfigType (runtime #1486)
+#include "model_cursor_depth.h" // avatar::CursorDepthWanted (XR_DXR_cursor_depth)
 #include <cstring>
 
 // App-side availability flag (XrSessionManager carries no app-named fields).
@@ -25,6 +26,7 @@ bool g_hasLocal3DZone = false;
 // consumes render-ready XrView pose/fov instead of running app-side Kooima).
 bool g_hasViewRigExt = false;
 bool g_hasDisplayZonesExt = false;
+uint32_t g_cursorDepthSpecVersion = 0;
 
 // XR_DXR_depth_budget (#81): runtime-advisory rear depth budget for the
 // transparent-standalone ZDP clip. Optional — older runtimes (including the
@@ -111,7 +113,15 @@ bool InitializeOpenXR(XrSessionManager& xr) {
             g_hasDepthBudgetExt = true;
             g_depthBudgetExtVersion = ext.extensionVersion;
         }
+        if (strcmp(ext.extensionName, XR_DXR_CURSOR_DEPTH_EXTENSION_NAME) == 0 &&
+            avatar::CursorDepthWanted()) {
+            g_cursorDepthSpecVersion = ext.extensionVersion;
+        }
     }
+    // The depth cursor is fed from the zone-scoped rig locate (render-ready
+    // views in the model world); without the rig + zones there is nothing to
+    // chain it on.
+    if (!g_hasViewRigExt || !g_hasDisplayZonesExt) g_cursorDepthSpecVersion = 0;
 
     LOG_INFO("XR_KHR_vulkan_enable2: %s", hasVulkan ? "AVAILABLE" : "NOT FOUND");
     LOG_INFO("XR_DXR_win32_window_binding: %s", xr.hasWin32WindowBindingExt ? "AVAILABLE" : "NOT FOUND");
@@ -124,6 +134,8 @@ bool InitializeOpenXR(XrSessionManager& xr) {
     LOG_INFO("XR_DXR_mcp_tools: %s", g_hasMcpToolsExt ? "AVAILABLE" : "NOT FOUND");
     LOG_INFO("XR_DXR_depth_budget: %s (v%u)", g_hasDepthBudgetExt ? "AVAILABLE" : "NOT FOUND",
              g_depthBudgetExtVersion);
+    LOG_INFO("XR_DXR_cursor_depth: %s (spec v%u)", g_cursorDepthSpecVersion ? "ENABLED" : "off",
+             g_cursorDepthSpecVersion);
 
     if (!hasVulkan) {
         LOG_ERROR("XR_KHR_vulkan_enable2 extension not available");
@@ -163,6 +175,9 @@ bool InitializeOpenXR(XrSessionManager& xr) {
     }
     if (g_hasDepthBudgetExt) {
         enabledExtensions.push_back(XR_DXR_DEPTH_BUDGET_EXTENSION_NAME);
+    }
+    if (g_cursorDepthSpecVersion > 0) {
+        enabledExtensions.push_back(XR_DXR_CURSOR_DEPTH_EXTENSION_NAME);
     }
 
     XrInstanceCreateInfo createInfo = {XR_TYPE_INSTANCE_CREATE_INFO};
