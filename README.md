@@ -75,6 +75,17 @@ The same set is wired on Windows, macOS and Linux except where a platform has
 no equivalent — the Linux leg has no on-panel HUD or toast chips, no
 drag-and-drop model load (`Ctrl+O` covers it) and no `C` camera-rig round-trip.
 
+**Depth-aware cursor.** Where the tiger pops out of the glass under the
+pointer, the runtime draws the cursor just in front of it (runtime ≥ v2.36,
+`XR_DXR_cursor_depth`). Elsewhere — empty space, the speech bubble, anything on
+or behind the glass — the OS cursor is unchanged. Today it draws on macOS; the
+Windows and Linux legs feed the depth from their tiger-zone locate and switch
+on by themselves once the runtime draws the cursor in display-zones frames (and,
+on Windows, in its D3D compositors, runtime #1944). `DISPLAYXR_CURSOR_DEPTH=0`
+turns it off. The recipe is the model viewer's
+([displayxr-demo-modelviewer `docs/depth-cursor.md`](https://github.com/DisplayXR/displayxr-demo-modelviewer/blob/main/docs/depth-cursor.md));
+what differs here is in `common/model_cursor_depth.h`.
+
 On Linux one binary runs on X11 or native Wayland (`--platform=x11|wayland|auto`).
 The right-click window drag keeps the weave phase unchanged. On X11 the app
 owns the drag, and every step goes through the runtime's

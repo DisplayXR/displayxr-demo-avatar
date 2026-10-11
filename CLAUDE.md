@@ -80,6 +80,37 @@ at startup.
   centroid (`getAnimatedAnchor`), so A/D/Q/E are effectively no-ops; `W`/`S`
   drive Z through the display-plane clip.
 
+### Depth-aware cursor (`XR_DXR_cursor_depth`, runtime ADR-046 Amendment 2)
+The runtime draws the cursor in front of the tiger where it pops out under the
+pointer; the app supplies only the depth. Adopted from the model viewer's pilot
+(modelviewer PR #171, `docs/depth-cursor.md` there): `model_common/model_raycast.*`
+is a verbatim copy, `common/model_cursor_depth.h` is its helper plus ONE
+avatar-specific depth source. `DISPLAYXR_CURSOR_DEPTH=0` opts out;
+`DISPLAYXR_CURSOR_DEPTH_UV=u,v` scripts the pointer and adds the placement to
+the throttled `cursor depth: ray cast …` cost line.
+- **Windows / Linux** chain it on the **zone-scoped rig locate** (views = the
+  model world, `setPlainViewConvention`), pointer fed as **zone** uv (bottom
+  75 %). The runtime does **not draw in a display-zones frame yet** (it reports
+  `willDraw = false`, so the OS cursor stays) — both legs are inert until it
+  does, and Windows additionally until the D3D compositors draw (runtime #1944).
+  Linux's full-tile fallback (no zones; rig views, window uv) is wired too and
+  should draw today — not yet run.
+- **macOS** has no view rig: it renders its OWN Kooima views from the raw
+  display-space eyes, so the locate space is NOT the model world.
+  `setupAppKooima` casts the footprint through the app's outer views (legacy
+  Y-mirror folded in, bottom-75 % canvas) and hands the runtime the
+  display-space point its raw views see at the same two canvas positions
+  (closest approach of the two runtime rays) — on-screen disparity preserved
+  under any ipd/parallax/m2v. **The projection layer therefore submits the RAW
+  located pose/fov**, not the Kooima `eye_world` (a Y-mirrored render-frame
+  pose): the runtime projects its cursor through the layer's views, which must
+  be in the locate space. Before that change the arrow landed at the top of
+  the tile.
+- Verify headlessly on macOS: run with `DISPLAYXR_CURSOR_DEPTH_UV=0.5,0.55`
+  (head), then `touch "$TMPDIR/displayxr_atlas_trigger.avatar_handle_vk_macos"`
+  → `$TMPDIR/displayxr_atlas.avatar_handle_vk_macos.png`. Use the **per-exe**
+  trigger; the plain one is consumed by whichever DisplayXR app polls first.
+
 ## Runtime dependency
 
 Requires **DisplayXR runtime ≥ v1.9.1** (v1.9.1 has the per-app VK-native
@@ -122,6 +153,11 @@ model_common/                     — the renderer (vendor-neutral, analog of
   model_renderer.{h,cpp}          — metallic-roughness GGX raster pass into an
                                     internal colour image, blitted into the
                                     per-eye swapchain viewport; IBL generation
+  model_raycast.{h,cpp}           — CPU ray cast (BVH per rigid cluster,
+                                    follows node anim + rigid skinning): the
+                                    depth source of the depth-aware cursor.
+                                    A VERBATIM copy of modelviewer's (#171) —
+                                    keep in step; displayxr-common would dedupe
   model_vulkan_utils.{h,cpp}      — VkBuffer/VkImage helpers
   shaders/                        — pbr.{vert,frag}; skybox.frag; IBL gen:
                                     fullscreen.vert, brdf_lut/irradiance/

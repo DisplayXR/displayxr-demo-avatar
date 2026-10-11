@@ -100,6 +100,7 @@ add_library(avatar_vk_android SHARED
     stb_impl.cpp
     # ── SHARED renderer (model_common/), glTF + FBX subset ──
     ${MODEL_COMMON}/model_renderer.cpp
+    ${MODEL_COMMON}/model_raycast.cpp
     ${MODEL_COMMON}/model_loader.cpp
     ${MODEL_COMMON}/model_loader_gltf.cpp
     ${MODEL_COMMON}/model_loader_fbx.cpp       # .fbx backend (ufbx) — the bundled avatar

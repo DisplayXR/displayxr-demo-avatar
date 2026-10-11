@@ -20,6 +20,10 @@ extern bool g_hasLocal3DZone;
 // True when the runtime advertises XR_DXR_view_rig (set in InitializeOpenXR).
 // Required for the zone-chained XrDisplayRigDXR locate (runtime-side framing).
 extern bool g_hasViewRigExt;
+//! XR_DXR_cursor_depth spec version when ENABLED at xrCreateInstance, else 0
+//! (absent, opted out with DISPLAYXR_CURSOR_DEPTH=0, or no view rig / zones —
+//! the depth cursor rides the zone-scoped rig locate).
+extern uint32_t g_cursorDepthSpecVersion;
 
 // True when the runtime advertises XR_DXR_display_zones (set in InitializeOpenXR).
 // Together with g_hasViewRigExt this gates the zones frame path: one 3D zone

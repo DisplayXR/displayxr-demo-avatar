@@ -35,6 +35,7 @@
 #include "display3d_view.h"
 #include "projection_depth.h"
 #include "auto_fit.h"       // dxr::AutoFitVHeight / FitTransition — shared framing rule
+#include "model_cursor_depth.h" // depth-aware cursor (XR_DXR_cursor_depth): runtime-drawn, model ray cast
 #include "auto_fit_canvas.h" // dxr::AutoFitCanvas — the runtime-resolved zone canvas
 #include "clip_policy.h"     // dxr::ResolveClipPlanes / ChainRearDepthBudget (#81)
 #include "content_bounds.h"  // dxr::ProjectAabbToWindowBounds / ChainContentBounds (#81 v2; #82 zone rebase)
@@ -2505,6 +2506,18 @@ static void RenderThreadFunc(
 {
     LOG_INFO("[RenderThread] Started");
 
+    // Depth-aware cursor: the runtime draws it in front of the avatar where it
+    // pops out of the glass; the app supplies the depth (ModelRenderer::raycast
+    // through the zone-scoped rig views, which are the model world). Until the
+    // runtime draws on this path - D3D11/D3D12 compositors (runtime #1944) AND
+    // display-zones frames - willDraw stays false and the OS cursor stays:
+    // inert. The Win32 adapter only hides/shows the OS cursor; the pointer is
+    // fed per frame as ZONE uv (the canvas of the zone-scoped locate).
+    dxr::CursorDepth cursor;
+    avatar::CursorDepthAdoption cursorAdopt;
+    cursorAdopt.setup(cursor, g_modelRenderer, g_cursorDepthSpecVersion);
+    if (!cursorAdopt.scripted()) cursor.setWindowWin32(hwnd);
+
     PerformanceStats perfStats = {};
     perfStats.lastTime = std::chrono::high_resolution_clock::now();
 
@@ -3225,6 +3238,24 @@ static void RenderThreadFunc(
                                 dxr::ChainRearDepthBudget(zoneViewState, zoneBudget);
                             }
                             for (uint32_t i = 0; i < 8; i++) zoneViews[i] = {XR_TYPE_VIEW};
+                            // Depth cursor: pointer as ZONE uv (client px, y-down,
+                            // same space as tigerZone.rect), then chained LAST (it
+                            // prepends) on this locate. The hit test reads the
+                            // model, so it runs under the scene lock.
+                            if (!cursorAdopt.scripted()) {
+                                POINT cp;
+                                if (GetCursorPos(&cp) && ScreenToClient(hwnd, &cp) &&
+                                    tigerZone.rect.extent.width > 0 && tigerZone.rect.extent.height > 0)
+                                    cursor.setPointerUV(
+                                        (float)(cp.x - tigerZone.rect.offset.x) / (float)tigerZone.rect.extent.width,
+                                        (float)(cp.y - tigerZone.rect.offset.y) / (float)tigerZone.rect.extent.height);
+                                else
+                                    cursor.setPointerUV(-1.0f, -1.0f);   // off the canvas: no hint
+                            }
+                            {
+                                std::lock_guard<std::mutex> cursorSceneLock(g_sceneMutex);
+                                cursor.chain(zoneLocate, zoneViewState);
+                            }
                             XrResult zlr = xrLocateViews(xr->session, &zoneLocate, &zoneViewState,
                                                          8, &zoneViewCount, zoneViews);
                             if (XR_SUCCEEDED(zlr) && zoneViewCount > 0) {
@@ -3252,6 +3283,10 @@ static void RenderThreadFunc(
                                 zonesFrame = false;
                             }
                         }
+
+                        cursor.afterLocate(zonesFrame ? zoneViews : nullptr,
+                                           zonesFrame ? (uint32_t)eyeCount : 0u);
+                        if (cursorAdopt.endFrame(cursor)) LOG_INFO("%s", cursorAdopt.summary());
 
                         // Double-click focus: center-eye ray through mouse, pick splat,
                         // smoothly re-pose the virtual display to face back along the ray.

@@ -146,6 +146,8 @@ endforeach()
 add_library(model_renderer STATIC
     model_renderer.h
     model_renderer.cpp
+    model_raycast.h
+    model_raycast.cpp          # CPU ray cast (per-cluster BVH) for the depth-aware cursor
     model_loader.h
     model_loader_backends.h
     model_loader.cpp           # format dispatcher + path helpers
