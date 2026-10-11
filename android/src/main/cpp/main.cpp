@@ -67,6 +67,7 @@
 #include "hud_bar.h"
 #include "model_renderer.h"
 #include "model_vulkan_utils.h"  // scratch image/buffer for the click-through silhouette
+#include "sil_readback.h"        // frame-ring-pipelined silhouette readback (INV-4.10)
 
 #define LOG_TAG "model_viewer_vk_android"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
@@ -210,10 +211,10 @@ std::mutex g_bubble_rect_mtx;
 int g_bubble_rect[4] = {0, 0, 0, 0};
 bool g_bubble_rect_valid = false;
 
-ModelImage g_sil_image = {};
-ModelBuffer g_sil_readback = {};
-void *g_sil_mapped = nullptr;
-VkCommandPool g_sil_pool = VK_NULL_HANDLE;
+// Scratch image + per-frame-ring-slot readback bands (model_common/
+// sil_readback.h): the passes and copies ride the renderer's one frame command
+// buffer; a band is read when its slot next opens. user[0..3] = zone rect.
+SilReadback g_sil_rb;
 
 // True if a canvas-space point lands on the tiger silhouette (dilated). Called
 // from nativeOnTouch (UI thread). Fail-OPEN until the first coverage is ready so
@@ -628,48 +629,9 @@ build_splat_model(float angle)
 	    mat4_mul(push, mat4_mul(roty, mat4_mul(flip, mat4_mul(scale, recenter)))));
 }
 
-// Lazily (re)create the silhouette scratch image + host-visible readback buffer
-// + a transfer command pool. Sized to the downscaled coverage; resized on demand.
-bool
-ensure_sil_targets(uint32_t w, uint32_t h)
-{
-	if (g_sil_image.image != VK_NULL_HANDLE && g_sil_image.width == w &&
-	    g_sil_image.height == h)
-		return true;
-	if (g_sil_image.image != VK_NULL_HANDLE) modelDestroyImage(g_vk_device, g_sil_image);
-	if (g_sil_readback.buffer != VK_NULL_HANDLE) {
-		if (g_sil_mapped) {
-			vkUnmapMemory(g_vk_device, g_sil_readback.memory);
-			g_sil_mapped = nullptr;
-		}
-		modelDestroyBuffer(g_vk_device, g_sil_readback);
-	}
-	g_sil_image = modelCreateImage2D(g_vk_device, g_vk_phys_device, w, h,
-	    VK_FORMAT_R8G8B8A8_UNORM,
-	    // avatar#99: COLOR_ATTACHMENT too — renderEye's exit barrier names
-	    // COLOR_ATTACHMENT_OPTIMAL, and modelCreateImage2D always creates a view
-	    // (a TRANSFER-only image is not view-compatible). The entry layout is
-	    // already right here: the scratch is rendered at viewport (0,0), so
-	    // renderEye takes the UNDEFINED (discard) entry.
-	    VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
-	        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
-	if (g_sil_image.image == VK_NULL_HANDLE) return false;
-	g_sil_readback = modelCreateBuffer(g_vk_device, g_vk_phys_device, (VkDeviceSize)w * h * 4,
-	    VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-	    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-	if (g_sil_readback.buffer == VK_NULL_HANDLE) return false;
-	if (vkMapMemory(g_vk_device, g_sil_readback.memory, 0, (VkDeviceSize)w * h * 4, 0,
-	                &g_sil_mapped) != VK_SUCCESS)
-		return false;
-	if (g_sil_pool == VK_NULL_HANDLE) {
-		VkCommandPoolCreateInfo pci = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
-		pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-		pci.queueFamilyIndex = g_vk_queue_family;
-		if (vkCreateCommandPool(g_vk_device, &pci, nullptr, &g_sil_pool) != VK_SUCCESS)
-			return false;
-	}
-	return g_sil_mapped != nullptr;
-}
+void
+publish_silhouette(const std::vector<uint8_t> &uni, uint32_t w, uint32_t h, int zoneX, int zoneY,
+                   int zoneW, int zoneH);
 
 // Render the tiger (UNION over the rendered views — first+last, like the Windows
 // leg) into the scratch image, read alpha back, publish the coverage bitmap.
@@ -677,70 +639,80 @@ ensure_sil_targets(uint32_t w, uint32_t h)
 // (bottom-75%), so renderEye fills the WHOLE scratch (no stale top band). imgW/
 // imgH MUST match the atlas dims so the renderer's internal target isn't
 // reallocated (same caveat as the main eye render). (#568)
+//
+// INV-4.10: the passes and their copies are recorded into the renderer's ONE
+// frame command buffer (submitted by g_model.endFrame(), never waited). The
+// bytes land in this ring slot's band and are published when the slot comes
+// around again — framesInFlight frames later. This used to allocate a command
+// buffer, submit and vkQueueWaitIdle per view: a mid-frame drain that parked
+// the Adreno governor (displayxr-runtime #1917).
 void
 update_silhouette(uint32_t imgW, uint32_t imgH, int zoneX, int zoneY, int zoneW, int zoneH,
                   const Mat4 *evMs, const Mat4 *projMs, const float *clipFars, uint32_t numViews)
 {
 	if (zoneW <= 0 || zoneH <= 0 || numViews == 0) return;
+
+	// 1. Publish what this ring slot copied framesInFlight frames ago — the
+	//    renderer waited the slot's fence when the frame opened.
+	{
+		const uint8_t *band = nullptr;
+		SilReadback::Meta m;
+		if (g_sil_rb.take(g_model, &band, &m)) {
+			const size_t n = (size_t)m.w * m.h;
+			std::vector<uint8_t> uni(n, 0);
+			for (uint32_t p = 0; p < m.planes; ++p) {
+				const uint8_t *px = band + g_sil_rb.planeBytes * p;
+				for (size_t i = 0; i < n; ++i) {
+					const uint8_t a = px[i * 4 + 3];
+					if (a > uni[i]) uni[i] = a;
+				}
+			}
+			publish_silhouette(uni, m.w, m.h, m.user[0], m.user[1], m.user[2], m.user[3]);
+		}
+	}
+
+	// 2. Record this frame's passes + copies. ONE scratch image, rendered at
+	//    viewport (0,0) — renderEye takes the UNDEFINED (discard) entry, so the
+	//    copy leaving it in TRANSFER_SRC needs no hand-back; renderEye's leading
+	//    barrier orders the second pass after the first plane's copy.
 	uint32_t w = (uint32_t)zoneW / 4;
 	if (w < 64) w = 64; else if (w > 512) w = 512;
 	uint32_t h = (uint32_t)zoneH / 4;
 	if (h < 64) h = 64; else if (h > 512) h = 512;
-	if (!ensure_sil_targets(w, h)) return;
+	if (!g_sil_rb.ensure(g_model, g_vk_device, g_vk_phys_device, w, h, 1, /*preferHostCached*/ false))
+		return;
+	g_sil_rb.prepFresh(g_model);
 
 	const uint32_t idx[2] = {0, numViews - 1};  // outermost views bound the disparity spread
 	const uint32_t passes = (numViews > 1) ? 2u : 1u;
-	std::vector<uint8_t> uni((size_t)w * h, 0);
-
+	uint32_t slot = UINT32_MAX;
 	for (uint32_t p = 0; p < passes; ++p) {
 		const uint32_t v = idx[p];
 		// Draw the tiger into the whole scratch (zone-framed projM → 1:1 with the
 		// zone rect). Transparent bg → alpha is the silhouette.
-		g_model.renderEye(g_sil_image.image, VK_FORMAT_R8G8B8A8_UNORM, imgW, imgH,
+		g_model.renderEye(g_sil_rb.image(0), VK_FORMAT_R8G8B8A8_UNORM, imgW, imgH,
 		    0, 0, w, h, evMs[v].m, projMs[v].m, /*transparentBg*/ true, clipFars[v]);
-		// renderEye leaves the scratch in COLOR_ATTACHMENT_OPTIMAL → copy to host.
-		VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-		ai.commandPool = g_sil_pool;
-		ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-		ai.commandBufferCount = 1;
-		VkCommandBuffer cmd = VK_NULL_HANDLE;
-		if (vkAllocateCommandBuffers(g_vk_device, &ai, &cmd) != VK_SUCCESS) return;
-		VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-		bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-		vkBeginCommandBuffer(cmd, &bi);
-		VkImageMemoryBarrier to_src = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-		to_src.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-		to_src.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-		to_src.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-		to_src.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-		to_src.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-		to_src.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-		to_src.image = g_sil_image.image;
-		to_src.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-		vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-		    VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &to_src);
-		VkBufferImageCopy region = {};
-		region.bufferRowLength = w;
-		region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-		region.imageExtent = {w, h, 1};
-		vkCmdCopyImageToBuffer(cmd, g_sil_image.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-		    g_sil_readback.buffer, 1, &region);
-		vkEndCommandBuffer(cmd);
-		VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
-		si.commandBufferCount = 1;
-		si.pCommandBuffers = &cmd;
-		vkQueueSubmit(g_vk_queue, 1, &si, VK_NULL_HANDLE);
-		vkQueueWaitIdle(g_vk_queue);
-		vkFreeCommandBuffers(g_vk_device, g_sil_pool, 1, &cmd);
-
-		const uint8_t *px = (const uint8_t *)g_sil_mapped;
-		if (!px) return;
-		for (uint32_t i = 0; i < w * h; ++i) {
-			const uint8_t a = px[i * 4 + 3];
-			if (a > uni[i]) uni[i] = a;
-		}
+		const uint32_t s = g_sil_rb.record(g_model, 0, p, /*restoreCleared*/ false);
+		if (s == UINT32_MAX || (slot != UINT32_MAX && s != slot)) return;  // rolled: drop
+		slot = s;
 	}
+	SilReadback::Meta m;
+	m.w = w;
+	m.h = h;
+	m.planes = passes;
+	m.user[0] = zoneX;
+	m.user[1] = zoneY;
+	m.user[2] = zoneW;
+	m.user[3] = zoneH;
+	g_sil_rb.commit(slot, m);
+}
 
+// Publish a landed coverage readback: the gesture gate bitmap, the tight bbox
+// and the #66 touch-passthrough bands.
+void
+publish_silhouette(const std::vector<uint8_t> &uni, uint32_t w, uint32_t h, int zoneX, int zoneY,
+                   int zoneW, int zoneH)
+{
 	uint32_t covered = 0;
 	// Track the tiger's tight bbox in coverage-px while counting coverage (#13).
 	int minCx = (int)w, minCy = (int)h, maxCx = -1, maxCy = -1;
@@ -1503,6 +1475,20 @@ create_reference_space()
 bool
 gs_init()
 {
+	// A/B knob for the frame ring (INV-4.10): Android has no usable process
+	// environment, so DXR_VK_FRAMES_IN_FLIGHT cannot reach the renderer here.
+	// `adb shell setprop debug.dxr.avatar.frames_in_flight 1` reproduces the old
+	// submit→wait shape; unset/0 = the ring's default (3). Read at launch.
+	{
+		char prop[PROP_VALUE_MAX] = {0};
+		if (__system_property_get("debug.dxr.avatar.frames_in_flight", prop) > 0) {
+			const int n = atoi(prop);
+			if (n > 0) {
+				g_model.setFramesInFlight((uint32_t)n);
+				LOGI("frame ring: debug.dxr.avatar.frames_in_flight=%d", n);
+			}
+		}
+	}
 	if (!g_model.init(g_vk_instance, g_vk_phys_device, g_vk_device, g_vk_queue,
 	               g_vk_queue_family, g_views[0].width, g_views[0].height)) {
 		LOGE("ModelRenderer::init failed");
@@ -2191,6 +2177,13 @@ render_frame()
 				}
 			}
 			const Mat4 splat_model = build_splat_model(yaw);
+			// Frame boundary for the renderer's frame ring (INV-4.10). This leg
+			// never called it: the renderer's old per-view ring then climbed to
+			// its overflow fallback — a vkQueueWaitIdle every 8th view — and the
+			// joint palette was rewritten under views still in flight. With the
+			// ring the views + silhouette below record into ONE command buffer,
+			// submitted once by g_model.endFrame() before the swapchain release.
+			g_model.beginFrame();
 			// Advance glTF animation (bind pose if the model has none). ~60 fps dt.
 			g_model.updateAnimation(1.0f / 60.0f);
 
@@ -2319,6 +2312,20 @@ render_frame()
 					projection_views[i].subImage.imageRect.extent = {(int32_t)tile_w, (int32_t)tile_h};
 					projection_views[i].subImage.imageArrayIndex = 0;
 				}
+				// Refresh the gesture/click-through silhouette (throttled ~10 Hz —
+				// the tiger moves slowly and only touch-DOWN samples it; each tick is
+				// 1-2 extra downscaled model draws + a copy, recorded into this
+				// frame's command buffer and read back framesInFlight frames later).
+				// Zone frames only. Before endFrame so it rides the frame's submit.
+				if (zones_frame && (g_frame_count % 6) == 0) {
+					update_silhouette(g_views[0].width, g_views[0].height,
+					    tiger_zone.rect.offset.x, tiger_zone.rect.offset.y,
+					    tiger_zone.rect.extent.width, tiger_zone.rect.extent.height,
+					    sil_evM, sil_projM, sil_clip, view_count);
+				}
+				// ONE vkQueueSubmit for every tile + the silhouette, no wait —
+				// and BEFORE the release: the runtime composes on the same queue.
+				g_model.endFrame();
 				XrSwapchainImageReleaseInfo rel = {};
 				rel.type = XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO;
 				res = xrReleaseSwapchainImage(g_views[0].swapchain, &rel);
@@ -2336,15 +2343,6 @@ render_frame()
 				const uint32_t located_cap = located < kViewCount ? located : kViewCount;
 				DxrAliasInactiveViews(projection_views, views, located_cap, view_count);
 				submitted_view_count = located_cap;
-			}
-			// Refresh the gesture/click-through silhouette (throttled ~10 Hz —
-			// the tiger moves slowly and only touch-DOWN samples it; each tick is
-			// 1-2 extra downscaled model draws + a readback). Zone frames only.
-			if (rendered && zones_frame && (g_frame_count % 6) == 0) {
-				update_silhouette(g_views[0].width, g_views[0].height,
-				    tiger_zone.rect.offset.x, tiger_zone.rect.offset.y,
-				    tiger_zone.rect.extent.width, tiger_zone.rect.extent.height,
-				    sil_evM, sil_projM, sil_clip, view_count);
 			}
 		} else {
 			log_xr_result("xrLocateViews", res);
@@ -2474,6 +2472,7 @@ render_frame()
 	const bool submit_layers = rendered && submitted_view_count > 0;
 	end_info.layerCount = submit_layers ? base_count : 0;
 	end_info.layers = submit_layers ? layers : nullptr;
+	g_model.endFrame();  // no-op unless a path above opened a frame and skipped its endFrame
 	res = xrEndFrame(g_session, &end_info);
 	if (res != XR_SUCCESS) {
 		log_xr_result("xrEndFrame", res);
@@ -2503,16 +2502,7 @@ destroy_all()
 		g_model_ready = false;
 	}
 	hud_bar_destroy(g_bubble);
-	if (g_sil_mapped) {
-		vkUnmapMemory(g_vk_device, g_sil_readback.memory);
-		g_sil_mapped = nullptr;
-	}
-	if (g_sil_readback.buffer != VK_NULL_HANDLE) modelDestroyBuffer(g_vk_device, g_sil_readback);
-	if (g_sil_image.image != VK_NULL_HANDLE) modelDestroyImage(g_vk_device, g_sil_image);
-	if (g_sil_pool != VK_NULL_HANDLE) {
-		vkDestroyCommandPool(g_vk_device, g_sil_pool, nullptr);
-		g_sil_pool = VK_NULL_HANDLE;
-	}
+	g_sil_rb.destroy(g_vk_device);
 	if (g_session != XR_NULL_HANDLE) {
 		xrDestroySession(g_session);
 		g_session = XR_NULL_HANDLE;

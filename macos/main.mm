@@ -64,6 +64,7 @@
 #include "auto_fit.h"    // dxr::AutoFitVHeight — shared load-time framing rule
 #include "model_renderer.h"
 #include "model_vulkan_utils.h"   // scratch image/buffer for the click-through silhouette
+#include "sil_readback.h"         // frame-ring-pipelined silhouette readback (INV-4.10)
 
 // stb_image_write (linked from displayxr-common) — used only by the optional
 // DXR_DUMP_SILHOUETTE debug dump below.
@@ -1991,17 +1992,10 @@ static void CleanupOpenXR(AppXrSession& xr) {
 // Placeholder rendering (clear to dark gray when no scene loaded)
 // ============================================================================
 
-static void RenderPlaceholder(VkDevice dev, VkQueue queue, VkCommandPool pool,
-                               VkImage image, uint32_t w, uint32_t h,
-                               float yaw, float pitch) {
-    VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-    ai.commandPool = pool; ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; ai.commandBufferCount = 1;
-    VkCommandBuffer cmd;
-    vkAllocateCommandBuffers(dev, &ai, &cmd);
-    VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(cmd, &bi);
-
+// Recorded into the renderer's frame command buffer (INV-4.10) — it used to
+// allocate its own, submit and vkQueueWaitIdle every frame.
+static void RenderPlaceholder(VkCommandBuffer cmd, VkImage image, float yaw, float pitch) {
+    if (cmd == VK_NULL_HANDLE) return;
     VkImageMemoryBarrier barrier = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
     barrier.srcAccessMask = 0; barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED; barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
@@ -2023,13 +2017,6 @@ static void RenderPlaceholder(VkDevice dev, VkQueue queue, VkCommandPool pool,
     barrier.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
-
-    vkEndCommandBuffer(cmd);
-    VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
-    si.commandBufferCount = 1; si.pCommandBuffers = &cmd;
-    vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE);
-    vkQueueWaitIdle(queue);
-    vkFreeCommandBuffers(dev, pool, 1, &cmd);
 }
 
 // Clear the ENTIRE acquired swapchain image before a partial-tile render
@@ -2040,16 +2027,10 @@ static void RenderPlaceholder(VkDevice dev, VkQueue queue, VkCommandPool pool,
 // Clears to (0,0,0,0) in transparent-bg mode (else opaque black) and leaves the
 // image in COLOR_ATTACHMENT_OPTIMAL, the layout renderEye's non-first-view blit
 // expects (so the cleared band survives the per-eye blits that follow).
-static void ClearSwapchainImage(VkDevice dev, VkQueue queue, VkCommandPool pool,
-                                VkImage image, bool transparentBg) {
-    VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-    ai.commandPool = pool; ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; ai.commandBufferCount = 1;
-    VkCommandBuffer cmd;
-    vkAllocateCommandBuffers(dev, &ai, &cmd);
-    VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(cmd, &bi);
-
+// Recorded into the renderer's frame command buffer ahead of the views
+// (INV-4.10); renderEye's leading barrier orders the views after it.
+static void ClearSwapchainImage(VkCommandBuffer cmd, VkImage image, bool transparentBg) {
+    if (cmd == VK_NULL_HANDLE) return;
     VkImageMemoryBarrier barrier = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
     barrier.srcAccessMask = 0; barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED; barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
@@ -2069,13 +2050,6 @@ static void ClearSwapchainImage(VkDevice dev, VkQueue queue, VkCommandPool pool,
     barrier.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
-
-    vkEndCommandBuffer(cmd);
-    VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
-    si.commandBufferCount = 1; si.pCommandBuffers = &cmd;
-    vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE);
-    vkQueueWaitIdle(queue);
-    vkFreeCommandBuffers(dev, pool, 1, &cmd);
 }
 
 // ============================================================================
@@ -2256,66 +2230,14 @@ static void TryAutoLoadBundledScene(const std::string& overridePath = std::strin
 static std::vector<uint8_t> g_silBits;   // covW*covH, 1 = avatar present
 static int  g_silCovW = 0, g_silCovH = 0;
 static bool g_silReady = false;
-static ModelImage  g_silImage = {};
-static ModelBuffer g_silReadback = {};
-static void*       g_silMapped = nullptr;
-// Set when the image is (re)created: UNDEFINED, not yet through RecordSilhouettePrep.
-static bool        g_silImageFresh = false;
-
-// avatar#99 (same fix as the Windows leg): renderEye picks its entry layout from
-// firstViewInImage = (viewportX == 0 && viewportY == 0), and the silhouette
-// renders into the bottom canvas band (viewportY != 0), so it always claims
-// COLOR_ATTACHMENT_OPTIMAL — while the image is UNDEFINED on first use and
-// TRANSFER_SRC_OPTIMAL after every readback copy. Keep the claim true: between
-// renderEye calls the scratch image sits cleared in COLOR_ATTACHMENT_OPTIMAL.
-static void RecordSilhouettePrep(VkCommandBuffer cmd, VkImage img, VkImageLayout oldLayout,
-                                 VkPipelineStageFlags srcStage, VkAccessFlags srcAccess) {
-    VkImageMemoryBarrier b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-    b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    b.image = img;
-    b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    b.srcAccessMask = srcAccess;
-    b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    b.oldLayout = oldLayout;
-    b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    vkCmdPipelineBarrier(cmd, srcStage, VK_PIPELINE_STAGE_TRANSFER_BIT,
-        0, 0, nullptr, 0, nullptr, 1, &b);
-    const VkClearColorValue zero = {{0.0f, 0.0f, 0.0f, 0.0f}};
-    vkCmdClearColorImage(cmd, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &zero, 1,
-        &b.subresourceRange);
-    b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    b.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-    b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    b.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
-        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
-}
-
-static bool EnsureSilhouetteTargets(VkDevice dev, VkPhysicalDevice phys, uint32_t w, uint32_t h) {
-    if (g_silImage.image != VK_NULL_HANDLE && g_silImage.width == w && g_silImage.height == h)
-        return true;
-    if (g_silImage.image != VK_NULL_HANDLE) modelDestroyImage(dev, g_silImage);
-    if (g_silReadback.buffer != VK_NULL_HANDLE) {
-        if (g_silMapped) vkUnmapMemory(dev, g_silReadback.memory);
-        modelDestroyBuffer(dev, g_silReadback);
-        g_silMapped = nullptr;
-    }
-    // avatar#99: COLOR_ATTACHMENT is required too — renderEye's barriers name
-    // COLOR_ATTACHMENT_OPTIMAL, and modelCreateImage2D always creates a view,
-    // which a TRANSFER-only image cannot have ("failed to create image view").
-    g_silImage = modelCreateImage2D(dev, phys, w, h, VK_FORMAT_R8G8B8A8_UNORM,
-        VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
-        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
-    if (g_silImage.image == VK_NULL_HANDLE) return false;
-    g_silImageFresh = true;
-    g_silReadback = modelCreateBuffer(dev, phys, (VkDeviceSize)w * h * 4,
-        VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    if (g_silReadback.buffer == VK_NULL_HANDLE) return false;
-    vkMapMemory(dev, g_silReadback.memory, 0, (VkDeviceSize)w * h * 4, 0, &g_silMapped);
-    return g_silMapped != nullptr;
-}
+// Scratch image + per-frame-ring-slot readback bands (model_common/
+// sil_readback.h). avatar#99 (same fix as the Windows leg): renderEye picks its
+// entry layout from firstViewInImage = (viewportX == 0 && viewportY == 0), and
+// the silhouette renders into the bottom canvas band (viewportY != 0), so it
+// always claims COLOR_ATTACHMENT_OPTIMAL. Keep the claim true: between
+// renderEye calls the scratch image sits cleared in COLOR_ATTACHMENT_OPTIMAL
+// (SilReadback::prepFresh / record(restoreCleared)).
+static SilReadback g_silRb;
 
 // runtime#1470 mutation test. With DXR_AVATAR_MASKPASS_TEST=1, setting
 // DXR_AVATAR_MASKPASS_MUTATE_VH=<offset> overrides the REAL pass's far offset
@@ -2359,41 +2281,57 @@ static const MaskMutationCfg &MaskMutation() {
 // equal the dims the main eye render used so the renderer's internal targets
 // don't churn. The hit mask is the UNION of the first + last views (the weave
 // shows every view with disparity that grows with window size).
-static void UpdateSilhouette(VkDevice dev, VkPhysicalDevice phys, VkQueue queue, VkCommandPool pool,
+//
+// INV-4.10: both passes and their copies are recorded into the renderer's ONE
+// frame command buffer — this used to allocate a command buffer, submit and
+// vkQueueWaitIdle per view. The bytes land in this ring slot's band and are
+// published when the slot opens again (framesInFlight frames later).
+static void UpdateSilhouette(VkDevice dev, VkPhysicalDevice phys,
                             uint32_t imgW, uint32_t imgH, uint32_t winW, uint32_t winH,
                             const float (*viewMats)[16], const float (*projMats)[16],
                             const float (*projMatsUnres)[16],
                             const float* clipFars, uint32_t numViews, float canvasFrac) {
     if (winW == 0 || winH == 0 || numViews == 0) return;
     if (!g_modelRenderer.hasModel()) return;
+
+    // 1. Publish the band this ring slot wrote framesInFlight frames ago.
+    {
+        const uint8_t* band = nullptr;
+        SilReadback::Meta pm;
+        if (g_silRb.take(g_modelRenderer, &band, &pm)) {
+            const size_t n = (size_t)pm.w * pm.h;
+            std::vector<uint8_t> unionAlpha(n, 0);
+            for (uint32_t p = 0; p < pm.planes; ++p) {
+                const uint8_t* px = band + g_silRb.planeBytes * p;
+                for (size_t i = 0; i < n; ++i) {
+                    const uint8_t a = px[i * 4 + 3];
+                    if (a > unionAlpha[i]) unionAlpha[i] = a;
+                }
+            }
+            g_silBits.resize(n);
+            for (size_t i = 0; i < n; ++i) g_silBits[i] = (unionAlpha[i] > 40) ? 1 : 0;
+            g_silCovW = (int)pm.w; g_silCovH = (int)pm.h;
+            g_silReady = true;
+
+            // Debug: DXR_DUMP_SILHOUETTE → /tmp/avatar_silhouette.png (~once/sec,
+            // white = avatar, black = pass-through) so the hit mask can be eyeballed.
+            static const bool s_dumpSil = (getenv("DXR_DUMP_SILHOUETTE") != nullptr);
+            static int s_dbg = 0;
+            if (s_dumpSil && (s_dbg++ % 60) == 0)
+                stbi_write_png("/tmp/avatar_silhouette.png", (int)pm.w, (int)pm.h, 1,
+                               unionAlpha.data(), (int)pm.w);
+        }
+    }
+
+    // 2. Record this frame's passes + copies into the frame command buffer.
     uint32_t w = winW / 3; if (w < 64) w = 64; if (w > 640) w = 640;
     uint32_t h = winH / 3; if (h < 64) h = 64; if (h > 360) h = 360;
-    if (!EnsureSilhouetteTargets(dev, phys, w, h)) return;
-    if (g_silImageFresh) {
-        VkCommandBufferAllocateInfo pai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-        pai.commandPool = pool; pai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-        pai.commandBufferCount = 1;
-        VkCommandBuffer pcmd = VK_NULL_HANDLE;
-        if (vkAllocateCommandBuffers(dev, &pai, &pcmd) != VK_SUCCESS) return;
-        VkCommandBufferBeginInfo pbi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-        pbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-        vkBeginCommandBuffer(pcmd, &pbi);
-        RecordSilhouettePrep(pcmd, g_silImage.image, VK_IMAGE_LAYOUT_UNDEFINED,
-            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0);
-        vkEndCommandBuffer(pcmd);
-        VkSubmitInfo psi = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
-        psi.commandBufferCount = 1; psi.pCommandBuffers = &pcmd;
-        const bool ok = (vkQueueSubmit(queue, 1, &psi, VK_NULL_HANDLE) == VK_SUCCESS);
-        if (ok) vkQueueWaitIdle(queue);
-        vkFreeCommandBuffers(dev, pool, 1, &pcmd);
-        if (!ok) return;
-        g_silImageFresh = false;
-    }
+    if (!g_silRb.ensure(g_modelRenderer, dev, phys, w, h, 1, /*preferHostCached=*/true)) return;
+    g_silRb.prepFresh(g_modelRenderer);
 
     const uint32_t silIdx[2] = {0, numViews - 1};
     const uint32_t silPasses = (numViews > 1) ? 2u : 1u;
-    std::vector<uint8_t> unionAlpha((size_t)w * h, 0);
-
+    uint32_t slot = UINT32_MAX;
     for (uint32_t p = 0; p < silPasses; ++p) {
         const uint32_t v = silIdx[p];
         // Render into the bottom canvasFrac of the silhouette image so the hit
@@ -2409,63 +2347,19 @@ static void UpdateSilhouette(VkDevice dev, VkPhysicalDevice phys, VkQueue queue,
         mp.unrestricted = projMatsUnres ? projMatsUnres[v] : nullptr;
         mp.testRestricted = MaskMutation().active ? projMats[v] : nullptr;
         mp.testUnrestrictedReal = MaskMutation().active ? mp.unrestricted : nullptr;
-        g_modelRenderer.renderEye(g_silImage.image, VK_FORMAT_R8G8B8A8_UNORM,
+        g_modelRenderer.renderEye(g_silRb.image(0), VK_FORMAT_R8G8B8A8_UNORM,
             imgW, imgH, 0, silAvY, w, silAvH, viewMats[v], projMats[v], /*transparentBg=*/true,
             clipFars[v], /*edgeFadePx=*/0.0f, &mp);
-        // renderEye leaves the scratch image in COLOR_ATTACHMENT_OPTIMAL → copy to host.
-        VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-        ai.commandPool = pool; ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; ai.commandBufferCount = 1;
-        VkCommandBuffer cmd = VK_NULL_HANDLE;
-        vkAllocateCommandBuffers(dev, &ai, &cmd);
-        VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-        bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-        vkBeginCommandBuffer(cmd, &bi);
-        VkImageMemoryBarrier toSrc = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-        toSrc.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-        toSrc.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-        toSrc.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-        toSrc.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-        toSrc.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        toSrc.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        toSrc.image = g_silImage.image;
-        toSrc.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-            VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toSrc);
-        VkBufferImageCopy region = {};
-        region.bufferRowLength = w;
-        region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-        region.imageExtent = {w, h, 1};
-        vkCmdCopyImageToBuffer(cmd, g_silImage.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-            g_silReadback.buffer, 1, &region);
-        // avatar#99: back to cleared COLOR_ATTACHMENT_OPTIMAL for the next renderEye.
-        RecordSilhouettePrep(cmd, g_silImage.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
-        vkEndCommandBuffer(cmd);
-        VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
-        si.commandBufferCount = 1; si.pCommandBuffers = &cmd;
-        vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE);
-        vkQueueWaitIdle(queue);
-        vkFreeCommandBuffers(dev, pool, 1, &cmd);
-
-        const uint8_t* px = (const uint8_t*)g_silMapped;
-        if (!px) return;
-        for (uint32_t i = 0; i < w * h; ++i) {
-            const uint8_t a = px[i * 4 + 3];
-            if (a > unionAlpha[i]) unionAlpha[i] = a;
-        }
+        // renderEye leaves the scratch in COLOR_ATTACHMENT_OPTIMAL → plane p of
+        // this slot's band; avatar#99: back to cleared COLOR_ATTACHMENT_OPTIMAL
+        // for the next renderEye (the second pass reuses the same image).
+        const uint32_t s = g_silRb.record(g_modelRenderer, 0, p, /*restoreCleared=*/true);
+        if (s == UINT32_MAX || (slot != UINT32_MAX && s != slot)) return;  // rolled: drop
+        slot = s;
     }
-
-    g_silBits.resize((size_t)w * h);
-    for (uint32_t i = 0; i < w * h; ++i) g_silBits[i] = (unionAlpha[i] > 40) ? 1 : 0;
-    g_silCovW = (int)w; g_silCovH = (int)h;
-    g_silReady = true;
-
-    // Debug: DXR_DUMP_SILHOUETTE → /tmp/avatar_silhouette.png (~once/sec, white
-    // = avatar, black = pass-through) so the hit mask can be eyeballed.
-    static const bool s_dumpSil = (getenv("DXR_DUMP_SILHOUETTE") != nullptr);
-    static int s_dbg = 0;
-    if (s_dumpSil && (s_dbg++ % 60) == 0)
-        stbi_write_png("/tmp/avatar_silhouette.png", (int)w, (int)h, 1, unionAlpha.data(), (int)w);
+    SilReadback::Meta m;
+    m.w = w; m.h = h; m.planes = silPasses;
+    g_silRb.commit(slot, m);
 }
 
 // True if the cursor is over an interactive region (avatar silhouette, the top
@@ -2778,13 +2672,6 @@ int main(int argc, char** argv) {
           LOG_WARN("model renderer init failed");
     }
 
-    // Command pool for placeholder rendering
-    VkCommandPool cmdPool = VK_NULL_HANDLE;
-    { VkCommandPoolCreateInfo ci = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
-      ci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-      ci.queueFamilyIndex = queueFamilyIndex;
-      vkCreateCommandPool(vkDevice, &ci, nullptr, &cmdPool); }
-
     // Speech-bubble window-space swapchain (Phase 3) — only if the runtime
     // advertises XR_DXR_local_3d_zone (the Metal compositor does).
     if (xr.hasLocal3DZone)
@@ -2909,7 +2796,14 @@ int main(int argc, char** argv) {
             if (g_input.playPauseRequested) { g_input.playPauseRequested = false; g_modelRenderer.togglePaused(); }
             UpdateAnimButton();   // refresh label (clip name ↔ "Paused")
         }
+        // Frame boundary for the renderer's frame ring (INV-4.10). This leg
+        // never called it, so the renderer's old per-view ring climbed to its
+        // overflow fallback (a vkQueueWaitIdle every 8th view). Now the clear,
+        // every view and the silhouette record into ONE command buffer,
+        // submitted once by endFrame() before the swapchain release.
+        g_modelRenderer.beginFrame();
         // Advance node/TRS animation once per frame (no-op for static models).
+        // CPU pose only — the renderer copies it into the frame's ring slot.
         g_modelRenderer.updateAnimation(deltaTime);
 
         // Handle rendering mode change (V=cycle, 0-3=direct, Mode button, or the
@@ -3409,7 +3303,7 @@ int main(int argc, char** argv) {
                                 // undrawn top band is defined (transparent) instead
                                 // of uninitialized magenta the speech-bubble zone
                                 // would reveal.
-                                ClearSwapchainImage(vkDevice, graphicsQueue, cmdPool,
+                                ClearSwapchainImage(g_modelRenderer.frameCommandBuffer(),
                                                     targetImage, tbg);
                                 for (int eye = 0; eye < eyeCount; eye++) {
                                     // Transparent mode → cull content behind the ZDP
@@ -3437,9 +3331,8 @@ int main(int argc, char** argv) {
                                         tbg, clipFars[eye], /*edgeFadePx=*/0.0f, &mp);
                                 }
                             } else {
-                                RenderPlaceholder(vkDevice, graphicsQueue, cmdPool,
-                                    targetImage, xr.swapchain.width, xr.swapchain.height,
-                                    g_input.yaw, g_input.pitch);
+                                RenderPlaceholder(g_modelRenderer.frameCommandBuffer(),
+                                    targetImage, g_input.yaw, g_input.pitch);
                             }
 
                             // 'I' key: snapshot the multi-view atlas the runtime
@@ -3486,8 +3379,6 @@ int main(int argc, char** argv) {
                                 }
                             }
 
-                            ReleaseSwapchainImage(xr);
-
                             // ADR-041 (runtime #1612): the layer carries EVERY
                             // located view, not only the eyeCount rendered ones.
                             // Under PRIMARY_MULTIVIEW_DXR xrEndFrame rejects a
@@ -3508,18 +3399,25 @@ int main(int argc, char** argv) {
                             // per-view matrices we just drew (so the hit mask
                             // tracks the animation, W/S dolly, billboard yaw and
                             // the display-plane clip). Throttled to every other
-                            // frame — the pass adds GPU waits and ~30 Hz is plenty
-                            // for the hit region. imgW/imgH = the dims the eye
+                            // frame — ~30 Hz is plenty for the hit region. imgW/imgH = the dims the eye
                             // render used, so the renderer's internal targets
                             // don't churn.
                             static uint32_t s_silFrame = 0;
                             if (g_modelRenderer.hasModel() && (s_silFrame++ & 1u) == 0u)
-                                UpdateSilhouette(vkDevice, physDevice, graphicsQueue, cmdPool,
+                                UpdateSilhouette(vkDevice, physDevice,
                                     xr.swapchain.width, xr.swapchain.height, g_windowW, g_windowH,
                                     (const float(*)[16])viewMat.data(),
                                     (const float(*)[16])projMat.data(),
                                     (const float(*)[16])projMatUnres.data(),
                                     clipFars.data(), (uint32_t)eyeCount, canvasFrac);
+
+                            // ONE vkQueueSubmit for the clear, every view and the
+                            // silhouette — no wait — and BEFORE the release: the
+                            // runtime composes on the same queue. (The release
+                            // moved below UpdateSilhouette so the pass rides the
+                            // same submit.)
+                            g_modelRenderer.endFrame();
+                            ReleaseSwapchainImage(xr);
                         } else {
                             rendered = false;
                         }
@@ -3549,21 +3447,25 @@ int main(int argc, char** argv) {
                         if (subW < 2) subW = 2; else if (subW > kBubbleTexW) subW = kBubbleTexW;
                         if (subH < 2) subH = 2; else if (subH > kBubbleTexH) subH = kBubbleTexH;
 
-                        const uint8_t* px = RenderBubbleBitmap(subW, subH);
+                        // The greeting is STATIC: re-render + re-upload only when
+                        // the panel sub-rect changes (resize) — the Windows #837
+                        // fix. This uploaded and vkQueueWaitIdle'd EVERY frame;
+                        // the last released swapchain image keeps serving the
+                        // layer in between.
+                        static uint32_t s_bubbleUpW = 0, s_bubbleUpH = 0;
+                        const bool bubbleUpToDate = (s_bubbleUpW == subW && s_bubbleUpH == subH);
+                        const uint8_t* px = bubbleUpToDate ? nullptr : RenderBubbleBitmap(subW, subH);
                         uint32_t idx = 0;
                         XrSwapchainImageAcquireInfo bai = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
                         XrSwapchainImageWaitInfo bwi = {XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO}; bwi.timeout = 1000000000;
+                        bool bubbleImageOk = bubbleUpToDate;
                         if (px && XR_SUCCEEDED(xrAcquireSwapchainImage(g_bubbleSwapchain, &bai, &idx)) &&
                             XR_SUCCEEDED(xrWaitSwapchainImage(g_bubbleSwapchain, &bwi))) {
                             memcpy(g_bubbleStagingMapped, px, (size_t)kBubbleTexW * kBubbleTexH * 4);
-                            VkCommandBufferAllocateInfo cai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-                            cai.commandPool = cmdPool; cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; cai.commandBufferCount = 1;
-                            VkCommandBuffer cb = VK_NULL_HANDLE;
-                            vkAllocateCommandBuffers(vkDevice, &cai, &cb);
-                            VkCommandBufferBeginInfo bgi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-                            bgi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-                            vkBeginCommandBuffer(cb, &bgi);
+                            // One-off (resize only): the renderer's immediate
+                            // command buffer — allocated once, waits its OWN fence.
                             VkImage img = g_bubbleImages[idx].image;
+                            g_modelRenderer.submitImmediate([&](VkCommandBuffer cb) {
                             VkImageMemoryBarrier bar = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
                             bar.srcAccessMask = 0; bar.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
                             bar.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED; bar.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
@@ -3581,13 +3483,14 @@ int main(int argc, char** argv) {
                             bar.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; bar.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
                             vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
                                 0, 0, nullptr, 0, nullptr, 1, &bar);
-                            vkEndCommandBuffer(cb);
-                            VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO}; si.commandBufferCount = 1; si.pCommandBuffers = &cb;
-                            vkQueueSubmit(graphicsQueue, 1, &si, VK_NULL_HANDLE);
-                            vkQueueWaitIdle(graphicsQueue);
-                            vkFreeCommandBuffers(vkDevice, cmdPool, 1, &cb);
+                            });
                             XrSwapchainImageReleaseInfo bri = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
                             xrReleaseSwapchainImage(g_bubbleSwapchain, &bri);
+                            s_bubbleUpW = subW;
+                            s_bubbleUpH = subH;
+                            bubbleImageOk = true;
+                        }
+                        if (bubbleImageOk) {
 
                             // Visible bubble = the panel sub-rect mapped onto the FULL band.
                             bubbleLayer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
@@ -3629,12 +3532,14 @@ int main(int argc, char** argv) {
                     // off the cocoa binding flag, not the blend mode).
                     ei.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
                     ei.layerCount = layerN; ei.layers = layers;
+                    g_modelRenderer.endFrame();  // no-op unless a path opened a frame without closing it
                     xrEndFrame(xr.session, &ei);
                 } else {
                     XrFrameEndInfo ei = {XR_TYPE_FRAME_END_INFO};
                     ei.displayTime = frameState.predictedDisplayTime;
                     ei.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
                     ei.layerCount = 0; ei.layers = nullptr;
+                    g_modelRenderer.endFrame();  // no-op unless a path opened a frame without closing it
                     xrEndFrame(xr.session, &ei);
                 }
             }
@@ -3733,7 +3638,8 @@ int main(int argc, char** argv) {
 
     LOG_INFO("=== Shutting down ===");
     g_xrForMcp = nullptr;  // session is going away; stop touching MCP tools
-    g_modelRenderer.cleanup();
+    g_modelRenderer.cleanup();   // waits the device, frees the frame ring
+    g_silRb.destroy(vkDevice);
     // Speech-bubble window-space swapchain + staging.
     if (g_bubbleStaging.buffer != VK_NULL_HANDLE) {
         if (g_bubbleStagingMapped) vkUnmapMemory(vkDevice, g_bubbleStaging.memory);
@@ -3744,7 +3650,6 @@ int main(int argc, char** argv) {
         xrDestroySwapchain(g_bubbleSwapchain);
         g_bubbleSwapchain = XR_NULL_HANDLE;
     }
-    if (cmdPool != VK_NULL_HANDLE) vkDestroyCommandPool(vkDevice, cmdPool, nullptr);
     CleanupOpenXR(xr);
     // MoltenVK may throw std::system_error ("mutex lock failed") during device/instance
     // destruction due to internal threading cleanup.  Catch and ignore since we're exiting.

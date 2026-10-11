@@ -28,8 +28,9 @@ at startup.
   decoration (title bar) so the OS can move/resize, then back to borderless.
 - **Per-pixel click-through** — `UpdateSilhouette` renders the FIRST and LAST
   views into two scratch images **every frame** (same frame → the union is
-  self-consistent), reads back alpha through a `HOST_CACHED` pipelined readback
-  → thresholded + 1-texel-dilated coverage bitmap; `UpdateClickRegion` shapes
+  self-consistent), reads back alpha through a `HOST_CACHED` readback pipelined
+  by the renderer's frame ring (`model_common/sil_readback.h`, read
+  framesInFlight frames later — never a wait) → thresholded + 1-texel-dilated coverage bitmap; `UpdateClickRegion` shapes
   the window with `SetWindowRgn` so input outside the silhouette falls through
   cross-process. **The region is a VISUAL CLIP, not just a hit mask** — outside
   it the window is not drawn — so the raster scales with the window
@@ -44,7 +45,7 @@ at startup.
   `ModelRenderer::beginContentMaskFrame()` / `contentMaskCoverage()` — a
   coverage-only re-draw (same `pbr.vert`, same skinning, empty
   `shaders/coverage.frag`) into a 256×144 R8 target, armed around the silhouette
-  pass's two views and read back one frame later in `beginFrame()`. The v2
+  pass's two views and read back when the frame ring reopens that slot. The v2
   `XrContentBoundsDXR` bounds were always clip-independent (a projected
   model-space AABB) and stay chained as the runtime's fallback.
   **TWO clips, not one (runtime#1470).** Removing `pbr.frag`'s far discard was
@@ -240,6 +241,19 @@ Lint any leg with
 `DxrSelectViewConfigType` as the opt-in (INV-3.1).
 
 ### Renderer conventions (important)
+- **Frame ring — one submit per frame (runtime INV-4.10).** `ModelRenderer`
+  is built on displayxr-common's `dxr::VkFrameRing` (`vk_frame_ring.h`, via
+  `displayxr::rules`, ≥ v2.28.0): 3 frames in flight (`DXR_VK_FRAMES_IN_FLIGHT`
+  1..8; Android: `setprop debug.dxr.avatar.frames_in_flight N`), every
+  `renderEye` of a frame — views AND silhouette — recorded into ONE command
+  buffer. Every leg calls `beginFrame()` → `updateAnimation` → `renderEye`… →
+  `endFrame()` → `xrReleaseSwapchainImage` (endFrame BEFORE the release; the
+  runtime composes on the same queue). Never add a `vkQueueWaitIdle`, a
+  per-frame `vkAllocateCommandBuffers`, or a second per-frame submit: record
+  into `frameCommandBuffer()`, read back via `sil_readback.h`, destroy via
+  `deferDestroy()`, one-offs via `submitImmediate()`. Per-view UBOs, the
+  joint palette and morphed verts are per ring slot. On Adreno a submit→wait
+  loop parks the GPU clock at ~1/3 (modelviewer#170: 13 → 30 fps).
 - **Internal target sized to the swapchain** (not per-eye); recreated only on
   swapchain-size change. `renderEye` sets viewport/scissor to the per-eye tile
   and blits `[0,0..vp]` into the swapchain at `(vpX,vpY)`. Mirrors gs_renderer.

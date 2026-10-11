@@ -182,6 +182,21 @@ void buildCubeModel(ModelData& md) {
 
 }  // namespace
 
+static void perfLogf(const char* fmt, ...);
+
+// Run `fn` with nothing in flight (target resize). A frame the caller has open
+// is submitted first and a fresh one opened afterwards, so the caller keeps
+// recording; the extra submit + wait happen only on a resize, never per frame.
+template <typename F>
+void ModelRenderer::quiesced(F&& fn) {
+    const bool reopen = ring_.frameOpen();
+    if (reopen) endFrame();    // submit what the open frame recorded so far
+    ring_.waitAll();
+    fn();
+    if (reopen) openFrame();   // the caller keeps recording into a fresh slot
+}
+
+
 // ═════════════════════════════════════════════════════════════════════════
 bool ModelRenderer::init(VkInstance instance,
                          VkPhysicalDevice physicalDevice,
@@ -198,12 +213,21 @@ bool ModelRenderer::init(VkInstance instance,
     width_ = renderWidth;
     height_ = renderHeight;
 
-    VkCommandPoolCreateInfo poolInfo = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
-    poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-    poolInfo.queueFamilyIndex = queueFamilyIndex;
-    if (vkCreateCommandPool(device, &poolInfo, nullptr, &cmdPool_) != VK_SUCCESS) {
-        std::fprintf(stderr, "ModelRenderer: failed to create command pool\n");
-        return false;
+    // The frame ring (INV-4.10): N command buffers + fences + the per-view
+    // UBO, allocated ONCE. Created first — the IBL bake and every upload below
+    // go through its immediate-submit buffer, and createPipeline() points set 0
+    // at its UBO.
+    {
+        dxr::VkFrameRing::Config rc;
+        rc.perViewUboBytes = sizeof(UniformBlock);
+        rc.maxViewsPerFrame = kUboSlicesPerFrame;
+        rc.framesInFlight = framesInFlightRequest_;
+        if (!ring_.init(device, physicalDevice, queue, queueFamilyIndex, rc)) {
+            std::fprintf(stderr, "ModelRenderer: failed to create the frame ring\n");
+            return false;
+        }
+        std::printf("ModelRenderer: frame ring — %u frames in flight, one submit per frame\n",
+                    ring_.framesInFlight());
     }
 
     if (!createRenderTargets()) return false;
@@ -219,6 +243,30 @@ bool ModelRenderer::init(VkInstance instance,
         if (maskTestForce_)
             std::printf("ModelRenderer: MASKPASS TEST on — the unclipped content-mask "
                         "coverage pass runs every view and reports (runtime#1470)\n");
+    }
+
+    // GPU timing: one query range per ring slot, created up front so the frame
+    // prologue can reset the slot's range inside its own command buffer.
+    {
+        const char* e = std::getenv("DXR_AVATAR_GPUTIME");
+        if (e && std::atoi(e) != 0) {
+            VkPhysicalDeviceProperties props;
+            vkGetPhysicalDeviceProperties(physDevice_, &props);
+            if (props.limits.timestampComputeAndGraphics) {
+                VkQueryPoolCreateInfo qpci = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+                qpci.queryType  = VK_QUERY_TYPE_TIMESTAMP;
+                qpci.queryCount = ring_.framesInFlight() * kTimedPerFrame * 2;
+                if (vkCreateQueryPool(device_, &qpci, nullptr, &tsPool_) == VK_SUCCESS) {
+                    tsPeriodNs_ = (double)props.limits.timestampPeriod;
+                    gpuTimeOn_  = true;
+                    perfLogf("ModelRenderer: GPU timing ON (period %.3f ns/tick, device '%s')\n",
+                             tsPeriodNs_, props.deviceName);
+                }
+            } else {
+                std::fprintf(stderr, "ModelRenderer: device has no graphics timestamps; "
+                                     "DXR_AVATAR_GPUTIME ignored\n");
+            }
+        }
     }
 
     initialized_ = true;
@@ -437,7 +485,16 @@ bool ModelRenderer::createRenderTargets() {
 bool ModelRenderer::ensureTargets(uint32_t w, uint32_t h) {
     if (w == 0) w = 1;
     if (h == 0) h = 1;
-    if (device_ != VK_NULL_HANDLE) vkDeviceWaitIdle(device_);
+    // The targets (and softenSet_, rewritten below) are referenced by every
+    // frame in flight AND by what the open frame has recorded so far. A resize
+    // is rare (window grow, or a sustained halving), so pay for it there:
+    // submit the open frame, wait the ring, rebuild, reopen.
+    bool ok = false;
+    quiesced([&] { ok = rebuildTargets(w, h); });
+    return ok;
+}
+
+bool ModelRenderer::rebuildTargets(uint32_t w, uint32_t h) {
     if (softenFramebuffer_    != VK_NULL_HANDLE) { vkDestroyFramebuffer(device_, softenFramebuffer_, nullptr); softenFramebuffer_ = VK_NULL_HANDLE; }
     if (softenColorImage_.image != VK_NULL_HANDLE) { modelDestroyImage(device_, softenColorImage_); softenColorImage_ = {}; }
     if (framebuffer_    != VK_NULL_HANDLE) { vkDestroyFramebuffer(device_, framebuffer_, nullptr); framebuffer_ = VK_NULL_HANDLE; }
@@ -606,7 +663,7 @@ bool ModelRenderer::createPipeline() {
     // 1-matrix dummy for static models) so the binding is valid every draw.
     VkDescriptorSetLayoutBinding jb = {};
     jb.binding = 0;
-    jb.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    jb.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC;   // per-slot palette
     jb.descriptorCount = 1;
     jb.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
     VkDescriptorSetLayoutCreateInfo jlci = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
@@ -914,30 +971,14 @@ bool ModelRenderer::createPipeline() {
     dsai.pSetLayouts = &dsLayout_;
     if (vkAllocateDescriptorSets(device_, &dsai, &descriptorSet_) != VK_SUCCESS) return false;
 
-    // One UniformBlock PER SLOT, not one shared block. updateUniforms is called
-    // once per view, so a single block plus a per-view queue stall was the only
-    // thing stopping view 2 from overwriting view 1's matrices mid-flight —
-    // removing that stall without ringing this would silently collapse stereo.
-    // Slots are handed out per renderEye call and reused a frame later, gated by
-    // the matching fence in beginFrame().
-    {
-        VkPhysicalDeviceProperties props;
-        vkGetPhysicalDeviceProperties(physDevice_, &props);
-        const VkDeviceSize align = props.limits.minUniformBufferOffsetAlignment;
-        uboStride_ = sizeof(UniformBlock);
-        if (align > 0) uboStride_ = ((uboStride_ + align - 1) / align) * align;
-    }
-    // kRingSlots render slots + kMaskSlots slots owned by the content-mask
-    // coverage pass. The mask pass needs its OWN viewProj (an unrestricted far
-    // plane, runtime#1470) and therefore cannot share the view's slot.
-    uniformBuffer_ = modelCreateBuffer(device_, physDevice_,
-        uboStride_ * (kRingSlots + kMaskSlots),
-        VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
-        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    if (uniformBuffer_.buffer == VK_NULL_HANDLE) return false;
-
-    // range = ONE block; the dynamic offset selects the slot at bind time.
-    VkDescriptorBufferInfo dbi = {uniformBuffer_.buffer, 0, sizeof(UniformBlock)};
+    // One UniformBlock PER renderEye PER RING SLOT, owned by the frame ring:
+    // ring_.viewUbo(slice) hands out a slot-private slice (the content-mask
+    // pass takes slices of its own — it needs its OWN viewProj, an
+    // unrestricted far plane, runtime#1470). A single shared block would let
+    // view 2 overwrite view 1's matrices, and a frame N+1 overwrite frame N's
+    // while it is still in flight. range = ONE block; the dynamic offset
+    // selects slot x slice at bind time.
+    VkDescriptorBufferInfo dbi = {ring_.uboBuffer(), 0, ring_.uboSliceBytes()};
     VkWriteDescriptorSet w = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
     w.dstSet = descriptorSet_;
     w.dstBinding = 0;
@@ -993,13 +1034,8 @@ ModelImage ModelRenderer::uploadTexture(const ModelTexture& tex) {
     std::memcpy(mapped, tex.rgba.data(), tex.rgba.size());
     vkUnmapMemory(device_, staging.memory);
 
-    VkCommandBufferAllocateInfo cbai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-    cbai.commandPool = cmdPool_; cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; cbai.commandBufferCount = 1;
-    VkCommandBuffer cmd; vkAllocateCommandBuffers(device_, &cbai, &cmd);
-    VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(cmd, &bi);
-
+    // One-off (model load): the ring's immediate buffer, allocated once.
+    ring_.submitImmediate([&](VkCommandBuffer cmd) {
     auto barrier = [&](uint32_t mip, uint32_t count, VkImageLayout oldL, VkImageLayout newL,
                        VkAccessFlags srcA, VkAccessFlags dstA, VkPipelineStageFlags srcS, VkPipelineStageFlags dstS) {
         VkImageMemoryBarrier b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
@@ -1044,13 +1080,7 @@ ModelImage ModelRenderer::uploadTexture(const ModelTexture& tex) {
     // last mip → SHADER_READ
     barrier(mips - 1, 1, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
             VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
-
-    vkEndCommandBuffer(cmd);
-    VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
-    si.commandBufferCount = 1; si.pCommandBuffers = &cmd;
-    vkQueueSubmit(queue_, 1, &si, VK_NULL_HANDLE);
-    vkQueueWaitIdle(queue_);
-    vkFreeCommandBuffers(device_, cmdPool_, 1, &cmd);
+    });
     modelDestroyBuffer(device_, staging);
     return img;
 }
@@ -1121,12 +1151,8 @@ bool ModelRenderer::genCubeMap(CubeMap& cube, uint32_t size, uint32_t mips,
             fbci.width = ms; fbci.height = ms; fbci.layers = 1;
             VkFramebuffer fb; vkCreateFramebuffer(device_, &fbci, nullptr, &fb);
 
-            VkCommandBufferAllocateInfo cai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-            cai.commandPool = cmdPool_; cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; cai.commandBufferCount = 1;
-            VkCommandBuffer cmd; vkAllocateCommandBuffers(device_, &cai, &cmd);
-            VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-            bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-            vkBeginCommandBuffer(cmd, &bi);
+            // Init-time bake: the ring's immediate buffer (allocated once).
+            ring_.submitImmediate([&](VkCommandBuffer cmd) {
             VkRenderPassBeginInfo rpbi = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
             rpbi.renderPass = fp.rp; rpbi.framebuffer = fb;
             rpbi.renderArea.extent = {ms, ms};
@@ -1139,10 +1165,7 @@ bool ModelRenderer::genCubeMap(CubeMap& cube, uint32_t size, uint32_t mips,
             vkCmdPushConstants(cmd, fp.layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(Push), &pcv);
             vkCmdDraw(cmd, 3, 1, 0, 0);
             vkCmdEndRenderPass(cmd);
-            vkEndCommandBuffer(cmd);
-            VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO}; si.commandBufferCount = 1; si.pCommandBuffers = &cmd;
-            vkQueueSubmit(queue_, 1, &si, VK_NULL_HANDLE); vkQueueWaitIdle(queue_);
-            vkFreeCommandBuffers(device_, cmdPool_, 1, &cmd);
+            });
             vkDestroyFramebuffer(device_, fb, nullptr);
             vkDestroyImageView(device_, faceView, nullptr);
         }
@@ -1173,12 +1196,7 @@ bool ModelRenderer::createIbl() {
         fbci.renderPass = fp.rp; fbci.attachmentCount = 1; fbci.pAttachments = &brdfLut_.view;
         fbci.width = 256; fbci.height = 256; fbci.layers = 1;
         VkFramebuffer fb; vkCreateFramebuffer(device_, &fbci, nullptr, &fb);
-        VkCommandBufferAllocateInfo cai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-        cai.commandPool = cmdPool_; cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; cai.commandBufferCount = 1;
-        VkCommandBuffer cmd; vkAllocateCommandBuffers(device_, &cai, &cmd);
-        VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-        bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-        vkBeginCommandBuffer(cmd, &bi);
+        ring_.submitImmediate([&](VkCommandBuffer cmd) {   // init-time bake
         VkRenderPassBeginInfo rpbi = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
         rpbi.renderPass = fp.rp; rpbi.framebuffer = fb; rpbi.renderArea.extent = {256, 256};
         vkCmdBeginRenderPass(cmd, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
@@ -1186,10 +1204,8 @@ bool ModelRenderer::createIbl() {
         vkCmdSetViewport(cmd, 0, 1, &vpr); vkCmdSetScissor(cmd, 0, 1, &scs);
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, fp.pipe);
         vkCmdDraw(cmd, 3, 1, 0, 0);
-        vkCmdEndRenderPass(cmd); vkEndCommandBuffer(cmd);
-        VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO}; si.commandBufferCount = 1; si.pCommandBuffers = &cmd;
-        vkQueueSubmit(queue_, 1, &si, VK_NULL_HANDLE); vkQueueWaitIdle(queue_);
-        vkFreeCommandBuffers(device_, cmdPool_, 1, &cmd);
+        vkCmdEndRenderPass(cmd);
+        });
         vkDestroyFramebuffer(device_, fb, nullptr);
         destroyFsPipe(device_, fp);
     }
@@ -1250,11 +1266,14 @@ VkDescriptorSet ModelRenderer::makeMaterialSet(VkImageView baseColor, VkImageVie
 bool ModelRenderer::finalizeModel(ModelData& md) {
     cleanupModel();
 
-    // Morph models need a CPU-writable vertex buffer (re-blended each frame);
-    // everything else keeps the device-local staged upload.
+    // Morph models need a CPU-writable vertex buffer (re-blended each frame),
+    // one copy per ring slot so a frame in flight never reads verts the CPU is
+    // rewriting; everything else keeps the single device-local staged upload.
     hasMorph_ = !md.morphs.empty();
     const VkDeviceSize vbSize = md.vertices.size() * sizeof(ModelVertex);
-    vertexBuffer_ = modelCreateBuffer(device_, physDevice_, vbSize,
+    vbStride_ = vbSize;
+    const uint32_t vbCopies = hasMorph_ ? ring_.framesInFlight() : 1u;
+    vertexBuffer_ = modelCreateBuffer(device_, physDevice_, vbSize * vbCopies,
         VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
         hasMorph_ ? (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
                   : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
@@ -1264,18 +1283,18 @@ bool ModelRenderer::finalizeModel(ModelData& md) {
         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     if (vertexBuffer_.buffer == VK_NULL_HANDLE || indexBuffer_.buffer == VK_NULL_HANDLE) return false;
     if (hasMorph_) {
-        // Keep the base verts for re-blending; seed the buffer with them.
+        // Keep the base verts for re-blending; seed every slot's copy with them.
         morphBase_ = md.vertices;
-        void* mapped = nullptr;
-        vkMapMemory(device_, vertexBuffer_.memory, 0, vbSize, 0, &mapped);
-        std::memcpy(mapped, md.vertices.data(), (size_t)vbSize);
-        vkUnmapMemory(device_, vertexBuffer_.memory);
+        morphBlended_ = md.vertices;
+        vertexMapped_ = nullptr;
+        if (vkMapMemory(device_, vertexBuffer_.memory, 0, VK_WHOLE_SIZE, 0, &vertexMapped_) != VK_SUCCESS)
+            return false;
+        for (uint32_t c = 0; c < vbCopies; ++c)
+            std::memcpy((char*)vertexMapped_ + c * vbSize, md.vertices.data(), (size_t)vbSize);
     } else {
-        modelUploadBuffer(device_, physDevice_, queue_, cmdPool_, vertexBuffer_,
-                          md.vertices.data(), vertexBuffer_.size);
+        if (!uploadBuffer(vertexBuffer_, md.vertices.data(), vbSize)) return false;
     }
-    modelUploadBuffer(device_, physDevice_, queue_, cmdPool_, indexBuffer_,
-                      md.indices.data(), indexBuffer_.size);
+    if (!uploadBuffer(indexBuffer_, md.indices.data(), indexBuffer_.size)) return false;
 
     // Upload textures (parallel to md.textures; empty entries stay null).
     modelTextures_.resize(md.textures.size());
@@ -1302,23 +1321,37 @@ bool ModelRenderer::finalizeModel(ModelData& md) {
     // Sized to all skins' joints concatenated; ≥1 matrix so static models still
     // bind a valid set 3. Host-visible: updateAnimation memcpy's it each frame.
     // Initialized to identity — the static fast-path then leaves it untouched.
+    // One palette per ring slot (STORAGE_BUFFER_DYNAMIC, jointStride_ apart):
+    // the CPU pose lives in jointCpu_ and the frame prologue copies it into the
+    // open slot's palette, so a frame in flight keeps the pose it was recorded
+    // with.
     skins_ = std::move(md.skins);
     jointCount_ = md.totalJoints > 0 ? md.totalJoints : 1;
+    const VkDeviceSize jointBytes = (VkDeviceSize)jointCount_ * 16 * sizeof(float);
+    {
+        VkPhysicalDeviceProperties props;
+        vkGetPhysicalDeviceProperties(physDevice_, &props);
+        const VkDeviceSize a = props.limits.minStorageBufferOffsetAlignment;
+        jointStride_ = (a > 1) ? ((jointBytes + a - 1) / a) * a : jointBytes;
+    }
     jointBuffer_ = modelCreateBuffer(device_, physDevice_,
-        (VkDeviceSize)jointCount_ * 16 * sizeof(float),
+        jointStride_ * ring_.framesInFlight(),
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
     if (jointBuffer_.buffer == VK_NULL_HANDLE) return false;
+    jointMapped_ = nullptr;
+    if (vkMapMemory(device_, jointBuffer_.memory, 0, VK_WHOLE_SIZE, 0, &jointMapped_) != VK_SUCCESS)
+        return false;
     {
-        void* mapped = nullptr;
-        vkMapMemory(device_, jointBuffer_.memory, 0, jointBuffer_.size, 0, &mapped);
+        jointCpu_.assign((size_t)jointCount_ * 16, 0.0f);
         const glm::mat4 ident(1.0f);
         for (uint32_t i = 0; i < jointCount_; ++i)
-            std::memcpy((char*)mapped + i * 16 * sizeof(float), glm::value_ptr(ident), 16 * sizeof(float));
-        vkUnmapMemory(device_, jointBuffer_.memory);
+            std::memcpy(&jointCpu_[(size_t)i * 16], glm::value_ptr(ident), 16 * sizeof(float));
+        for (uint32_t c = 0; c < ring_.framesInFlight(); ++c)
+            std::memcpy((char*)jointMapped_ + c * jointStride_, jointCpu_.data(), (size_t)jointBytes);
     }
     {
-        VkDescriptorPoolSize jps = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1};
+        VkDescriptorPoolSize jps = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, 1};
         VkDescriptorPoolCreateInfo jdpci = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
         jdpci.maxSets = 1;
         jdpci.poolSizeCount = 1;
@@ -1329,12 +1362,12 @@ bool ModelRenderer::finalizeModel(ModelData& md) {
         jdsai.descriptorSetCount = 1;
         jdsai.pSetLayouts = &jointSetLayout_;
         if (vkAllocateDescriptorSets(device_, &jdsai, &jointSet_) != VK_SUCCESS) return false;
-        VkDescriptorBufferInfo jdbi = {jointBuffer_.buffer, 0, jointBuffer_.size};
+        VkDescriptorBufferInfo jdbi = {jointBuffer_.buffer, 0, jointBytes};   // one palette
         VkWriteDescriptorSet jw = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
         jw.dstSet = jointSet_;
         jw.dstBinding = 0;
         jw.descriptorCount = 1;
-        jw.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        jw.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC;
         jw.pBufferInfo = &jdbi;
         vkUpdateDescriptorSets(device_, 1, &jw, 0, nullptr);
     }
@@ -1399,7 +1432,11 @@ bool ModelRenderer::finalizeModel(ModelData& md) {
 bool ModelRenderer::loadModel(const char* gltfPath) {
     if (!initialized_ || !gltfPath) return false;
     ModelData md;
-    if (!model_loader_load(gltfPath, md)) return false;
+    if (!model_loader_load(gltfPath, md)) return false;   // parse outside the lock
+    // The swap may run on a thread other than the render loop (Windows message
+    // thread / MCP). The old model is retired, not destroyed (cleanupModel),
+    // and the uploads use the ring's immediate buffer — both under modelMtx_.
+    std::lock_guard<std::mutex> lk(modelMtx_);
     if (!finalizeModel(md)) return false;
     loadedModelPath_ = gltfPath;
     return true;
@@ -1409,6 +1446,7 @@ bool ModelRenderer::loadDebugModel() {
     if (!initialized_) return false;
     ModelData md;
     buildCubeModel(md);
+    std::lock_guard<std::mutex> lk(modelMtx_);
     if (!finalizeModel(md)) return false;
     loadedModelPath_ = "<debug-cube>";
     return true;
@@ -1446,7 +1484,7 @@ float ModelRenderer::findBestYaw(const float[3], const float[3], uint32_t) const
 }
 
 void ModelRenderer::updateUniforms(const float viewMatrix[16], const float projMatrix[16],
-                                   float clipFar, uint32_t uboSlot) {
+                                   float clipFar, void* dst) {
     // Legacy convention (default): flip world Y at the view stage (right-
     // multiply by diag(1,-1,1,1) → negate view column 1) so the model is
     // upright with the demo's Y-mirrored display-pose contract.
@@ -1496,45 +1534,164 @@ void ModelRenderer::updateUniforms(const float viewMatrix[16], const float projM
     ub.lightDir[0] = lx / ln; ub.lightDir[1] = ly / ln; ub.lightDir[2] = lz / ln;
     ub.lightDir[3] = (clipFar > 0.0f) ? clipFar : 0.0f;  // foreground clip (view-space)
 
-    // Write the caller's slot; the dynamic descriptor offset in renderEye
-    // points the shader at it.
-    const VkDeviceSize off = (VkDeviceSize)uboSlot * uboStride_;
-    void* mapped = nullptr;
-    vkMapMemory(device_, uniformBuffer_.memory, off, sizeof(UniformBlock), 0, &mapped);
-    std::memcpy(mapped, &ub, sizeof(UniformBlock));
-    vkUnmapMemory(device_, uniformBuffer_.memory);
+    // Write the caller's slot-private slice (persistently mapped, coherent);
+    // the dynamic descriptor offset in renderEye points the shader at it.
+    std::memcpy(dst, &ub, sizeof(UniformBlock));
 }
 
-// Frame boundary. Called once per frame BEFORE any renderEye. Waits for the
-// previous frame's submissions so this frame can safely reuse ring slots and so
-// the caller can safely rewrite the joint-matrix SSBO (which is per-frame, not
-// per-slot, and is therefore what bounds us to one frame in flight rather than
-// two or three — ringing it is the next step if more overlap is wanted).
+// ── Frame ring ──────────────────────────────────────────────────────────────
+//
+// Frame boundary. Cheap: submits a frame a caller left open (so a missed
+// endFrame() cannot leak into the next frame) and disarms the content-mask
+// pass. The ring frame itself opens lazily on the first renderEye() /
+// frameCommandBuffer(), so an iteration that renders nothing submits nothing.
 void ModelRenderer::beginFrame() {
     if (!initialized_) return;
-    if (ringInUse_ > 0) {
-        VkFence waitFences[kRingSlots];
-        uint32_t n = 0;
-        for (uint32_t i = 0; i < ringInUse_ && i < kRingSlots; i++)
-            if (ringSubmitted_[i] && ringFence_[i] != VK_NULL_HANDLE) waitFences[n++] = ringFence_[i];
-        if (n > 0) {
-            vkWaitForFences(device_, n, waitFences, VK_TRUE, UINT64_MAX);
-            // runtime#1470: the content-mask copies rode on those same
-            // submissions, so the wait above (and ONLY it — the reset below
-            // makes the fences unwaitable) is what makes their bytes readable.
-            // Fold them in HERE, before the reset.
-            consumeMaskReadbacks(/*waitFences=*/false);
-            vkResetFences(device_, n, waitFences);
-        }
-        for (uint32_t i = 0; i < kRingSlots; i++) ringSubmitted_[i] = false;
-    }
-    ringSlot_ = 0;
-    ringInUse_ = 0;
+    if (ring_.frameOpen()) endFrame();
     // Disarm: the caller re-arms around exactly the views whose silhouette
     // should feed the mask (the avatar's is the two-view silhouette pass), so a
     // frame that never arms never pays for the extra draw.
     maskArmed_ = false;
     maskSlotCount_ = 0;
+}
+
+VkResult ModelRenderer::endFrame() {
+    if (!ring_.frameOpen()) return VK_SUCCESS;
+    // EXACTLY ONE vkQueueSubmit for the whole frame, the slot's fence, no wait.
+    const VkResult r = ring_.endFrame();
+    if (r != VK_SUCCESS) {
+        static bool s_logged = false;
+        if (!s_logged) {
+            s_logged = true;
+            std::fprintf(stderr, "ModelRenderer: frame submit failed (%d)\n", (int)r);
+        }
+    }
+    return r;
+}
+
+VkCommandBuffer ModelRenderer::frameCommandBuffer() {
+    if (!initialized_) return VK_NULL_HANDLE;
+    if (ring_.frameOpen()) return ring_.current();
+    return openFrame() ? ring_.current() : VK_NULL_HANDLE;
+}
+
+bool ModelRenderer::openFrame() {
+    // Waits ONLY the fence of the frame that used this slot N frames ago.
+    VkCommandBuffer cmd = ring_.beginFrame();
+    if (cmd == VK_NULL_HANDLE) return false;
+    framePrologue(cmd);
+    return true;
+}
+
+void ModelRenderer::framePrologue(VkCommandBuffer cmd) {
+    const uint32_t slot = ring_.slotIndex();
+    uboCursor_ = 0;
+
+    // That slot's fence was just waited: whatever it copied out is readable.
+    consumeMaskReadbacks(slot);
+    if (gpuTimeOn_) {
+        collectGpuTimes(slot);
+        vkCmdResetQueryPool(cmd, tsPool_, slot * kTimedPerFrame * 2, kTimedPerFrame * 2);
+    }
+
+    std::lock_guard<std::mutex> lk(modelMtx_);
+    // Retired model objects: destroyed when this slot is next waited, by which
+    // point every frame that could have referenced them has retired (see
+    // retired_ in the header).
+    for (auto& fn : retired_) ring_.deferDestroy(std::move(fn));
+    retired_.clear();
+
+    // Upload the CPU pose into THIS slot's copies. updateAnimation only ever
+    // touches the CPU side, so a frame in flight keeps the pose it recorded.
+    if (jointMapped_ != nullptr && !jointCpu_.empty()) {
+        std::memcpy((char*)jointMapped_ + slot * jointStride_, jointCpu_.data(),
+                    jointCpu_.size() * sizeof(float));
+    }
+    if (hasMorph_ && vertexMapped_ != nullptr && !morphBlended_.empty()) {
+        std::memcpy((char*)vertexMapped_ + slot * vbStride_, morphBlended_.data(),
+                    morphBlended_.size() * sizeof(ModelVertex));
+    }
+}
+
+void* ModelRenderer::allocUboSlice(uint32_t* outDynOffset) {
+    void* p = ring_.viewUbo(uboCursor_, outDynOffset);
+    if (p == nullptr) {
+        if (!uboOverflowLogged_) {
+            uboOverflowLogged_ = true;
+            std::fprintf(stderr, "ModelRenderer: more than %u draws in one frame — "
+                                 "skipping the rest (raise kUboSlicesPerFrame)\n",
+                         kUboSlicesPerFrame);
+        }
+        return nullptr;
+    }
+    ++uboCursor_;
+    return p;
+}
+
+void ModelRenderer::deferDestroy(std::function<void()> fn) { ring_.deferDestroy(std::move(fn)); }
+
+void ModelRenderer::waitIdle() { ring_.waitAll(); }
+
+VkResult ModelRenderer::submitImmediate(const std::function<void(VkCommandBuffer)>& record) {
+    std::lock_guard<std::mutex> lk(modelMtx_);   // shares the immediate buffer with loads
+    return ring_.submitImmediate(record);
+}
+
+uint32_t ModelRenderer::recordColorReadback(VkImage image, uint32_t w, uint32_t h, VkBuffer dst,
+                                            VkDeviceSize slotStride, VkDeviceSize extraOffset) {
+    VkCommandBuffer cmd = frameCommandBuffer();
+    if (cmd == VK_NULL_HANDLE || image == VK_NULL_HANDLE || dst == VK_NULL_HANDLE) return UINT32_MAX;
+    const uint32_t slot = ring_.slotIndex();
+    VkImageMemoryBarrier toSrc = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    toSrc.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    toSrc.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    toSrc.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    toSrc.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    toSrc.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toSrc.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toSrc.image = image;
+    toSrc.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toSrc);
+    VkBufferImageCopy region = {};
+    region.bufferOffset = slotStride * slot + extraOffset;
+    region.bufferRowLength = w;
+    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.imageExtent = {w, h, 1};
+    vkCmdCopyImageToBuffer(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst, 1, &region);
+    // The slot fence is an execution dependency; this makes the copy's writes
+    // available to the HOST read that follows it N frames later.
+    VkBufferMemoryBarrier bmb = {VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+    bmb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    bmb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    bmb.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    bmb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    bmb.buffer = dst;
+    bmb.offset = region.bufferOffset;
+    bmb.size = (VkDeviceSize)w * h * 4;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 0,
+                         nullptr, 1, &bmb, 0, nullptr);
+    return slot;
+}
+
+bool ModelRenderer::uploadBuffer(ModelBuffer& dst, const void* data, VkDeviceSize size) {
+    if (size == 0) return true;
+    ModelBuffer staging = modelCreateBuffer(device_, physDevice_, size,
+        VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (staging.buffer == VK_NULL_HANDLE) return false;
+    void* mapped = nullptr;
+    vkMapMemory(device_, staging.memory, 0, size, 0, &mapped);
+    std::memcpy(mapped, data, (size_t)size);
+    vkUnmapMemory(device_, staging.memory);
+    // One-off (model load): the ring's immediate buffer, allocated once.
+    const VkResult r = ring_.submitImmediate([&](VkCommandBuffer cmd) {
+        VkBufferCopy region = {};
+        region.size = size;
+        vkCmdCopyBuffer(cmd, staging.buffer, dst.buffer, 1, &region);
+    });
+    modelDestroyBuffer(device_, staging);
+    return r == VK_SUCCESS;
 }
 
 namespace {
@@ -1722,9 +1879,9 @@ void ModelRenderer::updateAnimation(float dtSeconds) {
     //    ModelSkin). Static skinned models keep the identity SSBO from
     //    finalizeModel, which is exactly the bind pose, so this only runs when a
     //    clip is animating the skeleton.
-    if (!skins_.empty()) {
-        void* mapped = nullptr;
-        vkMapMemory(device_, jointBuffer_.memory, 0, jointBuffer_.size, 0, &mapped);
+    if (!skins_.empty() && !jointCpu_.empty()) {
+        // CPU palette only — the frame prologue copies it into the open slot.
+        float* mapped = jointCpu_.data();
         uint32_t base = 0;
         glm::dvec3 centroid(0.0);   // accumulate joint world positions for the rig bind
         uint32_t jointTotal = 0;
@@ -1735,8 +1892,9 @@ void ModelRenderer::updateAnimation(float dtSeconds) {
                 const glm::mat4 nw = (node >= 0 && node < (int)nodes_.size())
                     ? glm::make_mat4(&nodeWorld_[node * 16]) : glm::mat4(1.0f);
                 const glm::mat4 jm = nw * glm::make_mat4(&s.inverseBind[j * 16]);
-                std::memcpy((char*)mapped + (base + j) * 16 * sizeof(float),
-                            glm::value_ptr(jm), 16 * sizeof(float));
+                if ((size_t)(base + j + 1) * 16 <= jointCpu_.size())
+                    std::memcpy(mapped + (size_t)(base + j) * 16, glm::value_ptr(jm),
+                                16 * sizeof(float));
                 if ((size_t)(base + j) * 16 + 16 <= jointMatsCpu_.size())
                     std::memcpy(&jointMatsCpu_[(size_t)(base + j) * 16], glm::value_ptr(jm), 16 * sizeof(float));
                 centroid += glm::dvec3(nw[3]);   // joint world translation
@@ -1744,7 +1902,6 @@ void ModelRenderer::updateAnimation(float dtSeconds) {
             }
             base += (uint32_t)s.joints.size();
         }
-        vkUnmapMemory(device_, jointBuffer_.memory);
 
         if (jointTotal > 0) {
             anchorRaw = glm::vec3(centroid / (double)jointTotal);
@@ -1830,10 +1987,9 @@ bool ModelRenderer::getPlaybackInfo(std::string& name, int& index, int& count,
 }
 
 void ModelRenderer::blendMorphs(bool trackAnchor) {
-    if (!hasMorph_ || vertexBuffer_.buffer == VK_NULL_HANDLE) return;
-    void* mapped = nullptr;
-    vkMapMemory(device_, vertexBuffer_.memory, 0, vertexBuffer_.size, 0, &mapped);
-    ModelVertex* dst = static_cast<ModelVertex*>(mapped);
+    if (!hasMorph_ || morphBlended_.size() != morphBase_.size()) return;
+    // CPU result only — the frame prologue copies it into the open slot's copy.
+    ModelVertex* dst = morphBlended_.data();
     glm::dvec3 sum(0.0);   // morphed-vertex world centroid for the rig bind
     uint64_t   cnt = 0;
     for (const ModelPrimitive& p : primitives_) {
@@ -1870,8 +2026,6 @@ void ModelRenderer::blendMorphs(bool trackAnchor) {
             }
         }
     }
-    vkUnmapMemory(device_, vertexBuffer_.memory);
-
     if (trackAnchor) {
         morphCentroidValid_ = cnt > 0;
         if (cnt > 0) {
@@ -2152,7 +2306,9 @@ bool ModelRenderer::ensureMaskPass() {
         }
     }
 
-    maskReadback_ = modelCreateBuffer(device_, physDevice_, slotBytes * kMaskSlots,
+    // framesInFlight bands of kMaskSlots regions — one band per ring slot.
+    maskReadback_ = modelCreateBuffer(device_, physDevice_,
+                                      slotBytes * kMaskSlots * ring_.framesInFlight(),
                                       VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                                       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                                           VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
@@ -2249,7 +2405,8 @@ bool ModelRenderer::ensureMaskPass() {
     return true;
 }
 
-void ModelRenderer::recordMaskPass(VkCommandBuffer cmd, uint32_t slot, uint32_t uboDynOffset) {
+void ModelRenderer::recordMaskPass(VkCommandBuffer cmd, uint32_t slot, uint32_t frameSlot,
+                                   uint32_t uboDynOffset) {
     VkClearValue clear;
     clear.color = {{0.0f, 0.0f, 0.0f, 0.0f}};
     VkRenderPassBeginInfo rpbi = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
@@ -2291,11 +2448,14 @@ void ModelRenderer::recordMaskPass(VkCommandBuffer cmd, uint32_t slot, uint32_t 
     }
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_, 2, 1,
                             &iblSet_, 0, nullptr);
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_, 3, 1,
-                            &jointSet_, 0, nullptr);
+    {
+        const uint32_t jointOff = (uint32_t)(jointStride_ * frameSlot);   // this slot's palette
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_, 3, 1,
+                                &jointSet_, 1, &jointOff);
+    }
 
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, maskPipeline_);
-    VkDeviceSize voff = 0;
+    VkDeviceSize voff = hasMorph_ ? vbStride_ * frameSlot : 0;
     vkCmdBindVertexBuffers(cmd, 0, 1, &vertexBuffer_.buffer, &voff);
     vkCmdBindIndexBuffer(cmd, indexBuffer_.buffer, 0, VK_INDEX_TYPE_UINT32);
 
@@ -2321,10 +2481,10 @@ void ModelRenderer::recordMaskPass(VkCommandBuffer cmd, uint32_t slot, uint32_t 
 
     vkCmdEndRenderPass(cmd);
     // finalLayout is TRANSFER_SRC_OPTIMAL — copy straight out into this slot's
-    // region of the shared readback buffer.
+    // region of the ring slot's band of the shared readback buffer.
     const VkDeviceSize slotBytes = VkDeviceSize(kContentMaskCovW) * kContentMaskCovH;
     VkBufferImageCopy rg = {};
-    rg.bufferOffset = slotBytes * slot;
+    rg.bufferOffset = slotBytes * ((VkDeviceSize)frameSlot * kMaskSlots + slot);
     rg.bufferRowLength = kContentMaskCovW;
     rg.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     rg.imageExtent = {kContentMaskCovW, kContentMaskCovH, 1};
@@ -2347,10 +2507,11 @@ void ModelRenderer::recordMaskPass(VkCommandBuffer cmd, uint32_t slot, uint32_t 
                          nullptr, 1, &bmb, 0, nullptr);
 }
 
-void ModelRenderer::consumeMaskReadbacks(bool waitFences) {
+void ModelRenderer::consumeMaskReadbacks(uint32_t frameSlot) {
     if (maskMapped_ == nullptr || maskCoverage_.empty()) return;
+    if (frameSlot >= dxr::detail::kMaxFramesInFlight) return;
     bool any = false;
-    for (uint32_t s = 0; s < kMaskSlots; s++) if (maskPending_[s]) { any = true; break; }
+    for (uint32_t s = 0; s < kMaskSlots; s++) if (maskPending_[frameSlot][s]) { any = true; break; }
     if (!any) return;
 
     const size_t n = maskCoverage_.size();
@@ -2358,13 +2519,13 @@ void ModelRenderer::consumeMaskReadbacks(bool waitFences) {
     for (uint32_t i = 0; i < kMaskProbeCount; i++) { maskProbeCovered_[i] = 0; maskProbeSeen_[i] = false; }
     bool anyRealProbe = false;
     for (uint32_t s = 0; s < kMaskSlots; s++) {
-        if (!maskPending_[s]) continue;
-        maskPending_[s] = false;
-        if (waitFences && maskFence_[s] != VK_NULL_HANDLE)
-            vkWaitForFences(device_, 1, &maskFence_[s], VK_TRUE, UINT64_MAX);
-        maskFence_[s] = VK_NULL_HANDLE;
-        const uint8_t* px = static_cast<const uint8_t*>(maskMapped_) + n * s;
-        const uint32_t probe = maskSlotProbe_[s] < kMaskProbeCount ? maskSlotProbe_[s] : 0u;
+        if (!maskPending_[frameSlot][s]) continue;
+        maskPending_[frameSlot][s] = false;
+        // The ring already waited this slot's fence (frame prologue).
+        const uint8_t* px = static_cast<const uint8_t*>(maskMapped_) +
+                            n * ((size_t)frameSlot * kMaskSlots + s);
+        const uint8_t sp = maskSlotProbe_[frameSlot][s];
+        const uint32_t probe = sp < kMaskProbeCount ? sp : 0u;
         maskProbeSeen_[probe] = true;
         // The attachment only ever holds the clear (0) or coverage.frag's 1.0
         // (255), so any nonzero is coverage. OR, not overwrite: the accumulator
@@ -2461,9 +2622,10 @@ void ModelRenderer::destroyMaskPass() {
             maskFramebuffer_[i] = VK_NULL_HANDLE;
         }
         if (maskImage_[i].image != VK_NULL_HANDLE) modelDestroyImage(device_, maskImage_[i]);
-        maskFence_[i] = VK_NULL_HANDLE;
-        maskPending_[i] = false;
-        maskSlotProbe_[i] = 0;
+        for (uint32_t f = 0; f < dxr::detail::kMaxFramesInFlight; f++) {
+            maskPending_[f][i] = false;
+            maskSlotProbe_[f][i] = 0;
+        }
     }
     for (uint32_t i = 0; i < kMaskProbeCount; i++) { maskProbeCovered_[i] = 0; maskProbeSeen_[i] = false; }
     if (maskRenderPass_ != VK_NULL_HANDLE) { vkDestroyRenderPass(device_, maskRenderPass_, nullptr); maskRenderPass_ = VK_NULL_HANDLE; }
@@ -2554,70 +2716,34 @@ void ModelRenderer::renderEye(VkImage swapchainImage,
                         swapchainFormat == VK_FORMAT_B8G8R8A8_SRGB ||
                         swapchainFormat == VK_FORMAT_A8B8G8R8_SRGB_PACK32);
 
-    // Pre-allocated ring slot instead of an allocate/free pair per view. If a
-    // frame somehow needs more than kRingSlots views, fall back to waiting so we
-    // can safely reuse slot 0 rather than corrupting in-flight work.
-    if (ringSlot_ >= kRingSlots) {
-        vkQueueWaitIdle(queue_);
-        for (uint32_t i = 0; i < kRingSlots; i++) {
-            if (ringSubmitted_[i] && ringFence_[i] != VK_NULL_HANDLE)
-                vkResetFences(device_, 1, &ringFence_[i]);
-            ringSubmitted_[i] = false;
-        }
-        ringSlot_ = 0;
-        ringInUse_ = 0;
-    }
-    const uint32_t slot = ringSlot_;
-    if (ringCmd_[slot] == VK_NULL_HANDLE) {
-        VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-        ai.commandPool = cmdPool_;
-        ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-        ai.commandBufferCount = 1;
-        if (vkAllocateCommandBuffers(device_, &ai, &ringCmd_[slot]) != VK_SUCCESS) return;
-        VkFenceCreateInfo fci = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-        if (vkCreateFence(device_, &fci, nullptr, &ringFence_[slot]) != VK_SUCCESS) return;
-    }
-    VkCommandBuffer cmd = ringCmd_[slot];
-    vkResetCommandBuffer(cmd, 0);
+    // Record into the frame's ONE command buffer (opens the frame on the first
+    // call: the ring waits only the fence of the frame N slots ago). Nothing is
+    // submitted here — endFrame() submits the whole frame once.
+    VkCommandBuffer cmd = frameCommandBuffer();
+    if (cmd == VK_NULL_HANDLE) return;
+    const uint32_t frameSlot = ring_.slotIndex();
+    uint32_t dynOffset = 0;
+    void* ubo = allocUboSlice(&dynOffset);
+    if (ubo == nullptr) return;
+    updateUniforms(viewMatrix, projMatrix, clipFarViewSpace, ubo);
 
-    // AFTER the slot is settled: updateUniforms writes into slot `ringSlot_`, so
-    // the fallback above must not be able to move the slot out from under it.
-    updateUniforms(viewMatrix, projMatrix, clipFarViewSpace, slot);
+    // Every renderEye shares the internal colour/depth/MSAA/soften targets
+    // (and the mask images) with the previous view AND with the frames still
+    // in flight. The per-view CPU wait used to order them; a full memory
+    // barrier does it on the GPU instead (its first scope covers everything
+    // earlier on this queue, previous frames' submits included).
+    dxr::VkFrameRing::tileBarrier(cmd);
 
-    VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(cmd, &bi);
-
-    // GPU timing: lazily create the 2-query pool, then bracket the whole command
-    // buffer. Timestamps are the only honest way to compare renderer changes —
-    // Task Manager's GPU % mixes in the compositor, the weave and every other
-    // client on the adapter.
-    static bool s_tsInitTried = false;
-    if (!s_tsInitTried) {
-        s_tsInitTried = true;
-        const char* e = std::getenv("DXR_AVATAR_GPUTIME");
-        if (e && std::atoi(e) != 0) {
-            VkPhysicalDeviceProperties props;
-            vkGetPhysicalDeviceProperties(physDevice_, &props);
-            if (props.limits.timestampComputeAndGraphics) {
-                VkQueryPoolCreateInfo qpci = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
-                qpci.queryType  = VK_QUERY_TYPE_TIMESTAMP;
-                qpci.queryCount = 2;
-                if (vkCreateQueryPool(device_, &qpci, nullptr, &tsPool_) == VK_SUCCESS) {
-                    tsPeriodNs_ = (double)props.limits.timestampPeriod;
-                    gpuTimeOn_  = true;
-                    perfLogf("ModelRenderer: GPU timing ON (period %.3f ns/tick, device '%s')\n",
-                             tsPeriodNs_, props.deviceName);
-                }
-            } else {
-                std::fprintf(stderr, "ModelRenderer: device has no graphics timestamps; "
-                                     "DXR_AVATAR_GPUTIME ignored\n");
-            }
-        }
-    }
-    if (gpuTimeOn_) {
-        vkCmdResetQueryPool(cmd, tsPool_, 0, 2);
-        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, tsPool_, 0);
+    // GPU timing: bracket this view inside the frame's command buffer; the
+    // pair is read back (no wait) when this slot next opens.
+    uint32_t tsIdx = UINT32_MAX;
+    if (gpuTimeOn_ && frameSlot < dxr::detail::kMaxFramesInFlight &&
+        tsCount_[frameSlot] < kTimedPerFrame) {
+        tsIdx = tsCount_[frameSlot]++;
+        tsExtent_[frameSlot][tsIdx][0] = viewportWidth;
+        tsExtent_[frameSlot][tsIdx][1] = viewportHeight;
+        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, tsPool_,
+                            (frameSlot * kTimedPerFrame + tsIdx) * 2);
     }
 
     // MSAA path has 3 attachments: [0]=MSAA color (CLEAR), [1]=depth (CLEAR),
@@ -2666,15 +2792,16 @@ void ModelRenderer::renderEye(VkImage swapchainImage,
 
     // Set 0 (camera UBO) + set 2 (IBL): constant for the frame, shared by the
     // skybox and model pipelines (same layout).
-    // Dynamic offset selects THIS view's UniformBlock slot.
-    {
-        const uint32_t dynOffset = (uint32_t)((VkDeviceSize)slot * uboStride_);
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_,
-                                0, 1, &descriptorSet_, 1, &dynOffset);
-    }
+    // Dynamic offset selects THIS view's slot-private UniformBlock slice.
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_,
+                            0, 1, &descriptorSet_, 1, &dynOffset);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_, 2, 1, &iblSet_, 0, nullptr);
-    // Set 3 (joint-matrix SSBO): one buffer for the whole model, bound once.
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_, 3, 1, &jointSet_, 0, nullptr);
+    // Set 3 (joint-matrix SSBO): THIS ring slot's palette (dynamic offset).
+    {
+        const uint32_t jointOff = (uint32_t)(jointStride_ * frameSlot);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_, 3, 1,
+                                &jointSet_, 1, &jointOff);
+    }
 
     // Opaque mode: paint the analytic sky behind the model. Skipped in
     // transparent mode so the desktop shows through (depth untouched).
@@ -2684,7 +2811,7 @@ void ModelRenderer::renderEye(VkImage swapchainImage,
     }
 
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_);
-    VkDeviceSize voff = 0;
+    VkDeviceSize voff = hasMorph_ ? vbStride_ * frameSlot : 0;   // morph: slot's copy
     vkCmdBindVertexBuffers(cmd, 0, 1, &vertexBuffer_.buffer, &voff);
     vkCmdBindIndexBuffer(cmd, indexBuffer_.buffer, 0, VK_INDEX_TYPE_UINT32);
 
@@ -2811,8 +2938,8 @@ void ModelRenderer::renderEye(VkImage swapchainImage,
 
     // runtime#1470: the UNCLIPPED silhouette for XR_DXR_depth_budget's content
     // mask. Its own target and its own trivial pipeline, so it touches nothing
-    // the blit below depends on, and it rides on this view's ring submission so
-    // the readback is released by the same fence beginFrame() already waits on.
+    // the blit below depends on, and it rides in the frame's command buffer so
+    // the readback is released by the slot fence the ring waits N frames on.
     // Armed by beginContentMaskFrame(); slots are never reused within an armed
     // batch, so a batch longer than kMaskSlots simply stops recording rather
     // than clobbering an in-flight copy.
@@ -2841,11 +2968,14 @@ void ModelRenderer::renderEye(VkImage swapchainImage,
         for (uint32_t probe = 0; probe < kMaskProbeCount; probe++) {
             if (probeProj[probe] == nullptr) continue;
             if (maskSlotCount_ >= kMaskSlots) break;
+            uint32_t maskDyn = 0;
+            void* maskUbo = allocUboSlice(&maskDyn);
+            if (maskUbo == nullptr) break;
             const uint32_t ms = maskSlotCount_++;
-            const uint32_t uboSlot = kRingSlots + ms;
-            updateUniforms(viewMatrix, probeProj[probe], /*clipFar=*/0.0f, uboSlot);
-            recordMaskPass(cmd, ms, (uint32_t)((VkDeviceSize)uboSlot * uboStride_));
-            maskSlotProbe_[ms] = (uint8_t)probe;
+            updateUniforms(viewMatrix, probeProj[probe], /*clipFar=*/0.0f, maskUbo);
+            recordMaskPass(cmd, ms, frameSlot, maskDyn);
+            maskSlotProbe_[frameSlot][ms] = (uint8_t)probe;
+            maskPending_[frameSlot][ms] = true;
         }
     }
 
@@ -2903,108 +3033,118 @@ void ModelRenderer::renderEye(VkImage swapchainImage,
                          VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
                          0, 0, nullptr, 0, nullptr, 1, &toColor);
 
-    if (gpuTimeOn_) vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, tsPool_, 1);
-
-    vkEndCommandBuffer(cmd);
-    VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
-    si.commandBufferCount = 1;
-    si.pCommandBuffers = &cmd;
-    // No queue drain: this slot's fence is waited on in beginFrame() before the
-    // slot (and its UniformBlock) is reused next frame.
-    vkQueueSubmit(queue_, 1, &si, ringFence_[slot]);
-    ringSubmitted_[slot] = true;
-    ringSlot_++;
-    ringInUse_ = ringSlot_;
-
-    // runtime#1470: hand the mask slot the fence that releases it. The shipping
-    // path stops here — beginFrame() waits the whole ring next frame and folds
-    // the pending slots in, so the coverage is one frame pipelined, exactly
-    // like the click-through readback it replaces as the mask source. The
-    // MASKPASS_TEST leg (only when the app is not arming the pass itself, i.e.
-    // on macOS/Linux where nothing chains a mask) instead waits inline and
-    // reports per view, which is a deliberate serialisation — same bargain the
-    // DXR_AVATAR_GPUTIME path makes.
-    if (maskSlotCount_ > maskSlotFirst) {
-        for (uint32_t ms = maskSlotFirst; ms < maskSlotCount_; ms++) {
-            maskFence_[ms] = ringFence_[slot];
-            maskPending_[ms] = true;
-        }
-        if (maskTestForce_ && !maskArmed_) {
-            consumeMaskReadbacks(/*waitFences=*/true);
-            maskSlotCount_ = 0;
-        }
+    if (tsIdx != UINT32_MAX) {
+        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, tsPool_,
+                            (frameSlot * kTimedPerFrame + tsIdx) * 2 + 1);
     }
-
-    // GPU timing needs the results to be ready, so it keeps its own targeted
-    // wait on just this submission rather than reinstating the queue drain. Only
-    // active under DXR_AVATAR_GPUTIME, so the measured path is slightly more
-    // serialised than the shipping one — fine for comparing configs, but do not
-    // read absolute frame rates off a GPUTIME run.
-    if (gpuTimeOn_) {
-        vkWaitForFences(device_, 1, &ringFence_[slot], VK_TRUE, UINT64_MAX);
-        uint64_t ts[2] = {0, 0};
-        if (vkGetQueryPoolResults(device_, tsPool_, 0, 2, sizeof(ts), ts,
-                                  sizeof(uint64_t),
-                                  VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT)
-            == VK_SUCCESS && ts[1] > ts[0]) {
-            const double ms = (double)(ts[1] - ts[0]) * tsPeriodNs_ / 1.0e6;
-            // A bucket is claimed once w != 0; n resets to 0 after each report.
-            GpuTimeBucket* b = nullptr;
-            GpuTimeBucket* freeSlot = nullptr;
-            for (auto& c : gpuBuckets_) {
-                if (c.w == viewportWidth && c.h == viewportHeight) { b = &c; break; }
-                if (c.w == 0 && !freeSlot) freeSlot = &c;
-            }
-            if (!b) b = freeSlot;
-            if (b) {
-                b->w = viewportWidth; b->h = viewportHeight;
-                b->ms += ms; b->n++;
-                if (b->n >= 240) {
-                    // views/s converts the ms/view figure into a per-frame GPU
-                    // cost, which is what a GPU-% reading has to be compared
-                    // against. Keyed per bucket size via the extent in the name.
-                    const auto now = std::chrono::steady_clock::now();
-                    static std::chrono::steady_clock::time_point s_prev[4];
-                    const size_t bi = (size_t)(b - &gpuBuckets_[0]);
-                    double vps = 0.0;
-                    if (bi < 4 && s_prev[bi].time_since_epoch().count() != 0) {
-                        const double sec = std::chrono::duration<double>(now - s_prev[bi]).count();
-                        if (sec > 0.0) vps = (double)b->n / sec;
-                    }
-                    if (bi < 4) s_prev[bi] = now;
-                    perfLogf("ModelRenderer: GPU %6.3f ms/view  %ux%u  %ux MSAA  "
-                             "targets %.1f MB  (n=%u, %.1f views/s => %.2f ms/s GPU)\n",
-                             b->ms / b->n, b->w, b->h, (unsigned)msaaSamples_,
-                             targetBytes_ / 1048576.0, b->n, vps,
-                             (b->ms / b->n) * vps);
-                    b->ms = 0.0; b->n = 0;
-                }
-            }
-        }
-    }
-    // cmd + fence belong to the ring — freed in cleanup(), not here.
+    // No submit and no wait: endFrame() submits the frame once. The content-
+    // mask copies recorded above are folded in when this ring slot next opens
+    // (framePrologue → consumeMaskReadbacks), framesInFlight frames from now.
 }
 
+// DXR_AVATAR_GPUTIME: fold the timestamp pairs ring slot `slot` recorded N
+// frames ago. Called from the prologue right after the ring waited that slot's
+// fence, so the results are available without VK_QUERY_RESULT_WAIT_BIT.
+void ModelRenderer::collectGpuTimes(uint32_t slot) {
+    if (slot >= dxr::detail::kMaxFramesInFlight) return;
+    const uint32_t count = tsCount_[slot];
+    tsCount_[slot] = 0;
+    for (uint32_t i = 0; i < count; ++i) {
+        uint64_t ts[2] = {0, 0};
+        if (vkGetQueryPoolResults(device_, tsPool_, (slot * kTimedPerFrame + i) * 2, 2,
+                                  sizeof(ts), ts, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT)
+                != VK_SUCCESS || ts[1] <= ts[0]) {
+            continue;
+        }
+        const uint32_t viewportWidth = tsExtent_[slot][i][0];
+        const uint32_t viewportHeight = tsExtent_[slot][i][1];
+        const double ms = (double)(ts[1] - ts[0]) * tsPeriodNs_ / 1.0e6;
+        // A bucket is claimed once w != 0; n resets to 0 after each report.
+        GpuTimeBucket* b = nullptr;
+        GpuTimeBucket* freeSlot = nullptr;
+        for (auto& c : gpuBuckets_) {
+            if (c.w == viewportWidth && c.h == viewportHeight) { b = &c; break; }
+            if (c.w == 0 && !freeSlot) freeSlot = &c;
+        }
+        if (!b) b = freeSlot;
+        if (!b) continue;
+        b->w = viewportWidth; b->h = viewportHeight;
+        b->ms += ms; b->n++;
+        if (b->n >= 240) {
+            // views/s converts the ms/view figure into a per-frame GPU cost,
+            // which is what a GPU-% reading has to be compared against. Keyed
+            // per bucket size via the extent in the name.
+            const auto now = std::chrono::steady_clock::now();
+            static std::chrono::steady_clock::time_point s_prev[4];
+            const size_t bi = (size_t)(b - &gpuBuckets_[0]);
+            double vps = 0.0;
+            if (bi < 4 && s_prev[bi].time_since_epoch().count() != 0) {
+                const double sec = std::chrono::duration<double>(now - s_prev[bi]).count();
+                if (sec > 0.0) vps = (double)b->n / sec;
+            }
+            if (bi < 4) s_prev[bi] = now;
+            perfLogf("ModelRenderer: GPU %6.3f ms/view  %ux%u  %ux MSAA  "
+                     "targets %.1f MB  (n=%u, %.1f views/s => %.2f ms/s GPU, %u in flight)\n",
+                     b->ms / b->n, b->w, b->h, (unsigned)msaaSamples_,
+                     targetBytes_ / 1048576.0, b->n, vps,
+                     (b->ms / b->n) * vps, ring_.framesInFlight());
+            b->ms = 0.0; b->n = 0;
+        }
+    }
+}
+
+// Retire (not destroy) the loaded model's GPU objects: frames still in flight —
+// and, when the swap runs on another thread, the render loop's open frame — may
+// reference them. They are queued on retired_ and handed to the ring at the
+// next frame open; cleanup() (teardown) runs them after a full device wait.
+// Caller holds modelMtx_ (or is single-threaded teardown).
 void ModelRenderer::cleanupModel() {
+    // CPU-only ray-cast state: nothing in flight references it.
     raycaster_.clear();
     jointMatsCpu_.clear();
-    if (vertexBuffer_.buffer != VK_NULL_HANDLE) modelDestroyBuffer(device_, vertexBuffer_);
-    if (indexBuffer_.buffer != VK_NULL_HANDLE) modelDestroyBuffer(device_, indexBuffer_);
-    for (auto& t : modelTextures_)
-        if (t.image != VK_NULL_HANDLE) modelDestroyImage(device_, t);
+    {
+        VkDevice dev = device_;
+        ModelBuffer vb = vertexBuffer_, ib = indexBuffer_, jb = jointBuffer_;
+        std::vector<ModelImage> tex = std::move(modelTextures_);
+        VkDescriptorPool mp = matPool_, jp = jointPool_;
+        const bool vbMapped = vertexMapped_ != nullptr, jbMapped = jointMapped_ != nullptr;
+        if (vb.buffer != VK_NULL_HANDLE || ib.buffer != VK_NULL_HANDLE || jb.buffer != VK_NULL_HANDLE ||
+            !tex.empty() || mp != VK_NULL_HANDLE || jp != VK_NULL_HANDLE) {
+            retired_.push_back([=]() mutable {
+                if (vb.buffer != VK_NULL_HANDLE) {
+                    if (vbMapped) vkUnmapMemory(dev, vb.memory);
+                    modelDestroyBuffer(dev, vb);
+                }
+                if (ib.buffer != VK_NULL_HANDLE) modelDestroyBuffer(dev, ib);
+                for (auto& t : tex)
+                    if (t.image != VK_NULL_HANDLE) modelDestroyImage(dev, t);
+                // Freeing a pool frees every set allocated from it.
+                if (mp != VK_NULL_HANDLE) vkDestroyDescriptorPool(dev, mp, nullptr);
+                if (jb.buffer != VK_NULL_HANDLE) {
+                    if (jbMapped) vkUnmapMemory(dev, jb.memory);
+                    modelDestroyBuffer(dev, jb);
+                }
+                if (jp != VK_NULL_HANDLE) vkDestroyDescriptorPool(dev, jp, nullptr);
+            });
+        }
+    }
+    vertexBuffer_ = {};
+    indexBuffer_ = {};
+    jointBuffer_ = {};
+    vertexMapped_ = nullptr;
+    jointMapped_ = nullptr;
     modelTextures_.clear();
-    // Freeing the pool frees all material sets allocated from it.
-    if (matPool_ != VK_NULL_HANDLE) { vkDestroyDescriptorPool(device_, matPool_, nullptr); matPool_ = VK_NULL_HANDLE; }
+    matPool_ = VK_NULL_HANDLE;
     materialSets_.clear();
     defaultMatSet_ = VK_NULL_HANDLE;
-    // Joint-matrix SSBO + its pool (frees jointSet_).
-    if (jointBuffer_.buffer != VK_NULL_HANDLE) modelDestroyBuffer(device_, jointBuffer_);
-    if (jointPool_ != VK_NULL_HANDLE) { vkDestroyDescriptorPool(device_, jointPool_, nullptr); jointPool_ = VK_NULL_HANDLE; }
+    jointPool_ = VK_NULL_HANDLE;
     jointSet_ = VK_NULL_HANDLE;
+    jointCpu_.clear();
     skins_.clear();
     jointCount_ = 0;
     morphs_.clear();
     morphBase_.clear();
+    morphBlended_.clear();
     hasMorph_ = false;
     morphCentroidValid_ = false;
     materials_.clear();
@@ -3026,10 +3166,16 @@ void ModelRenderer::cleanupModel() {
 }
 
 void ModelRenderer::cleanup() {
-    if (!initialized_ && cmdPool_ == VK_NULL_HANDLE) return;
-    if (device_ != VK_NULL_HANDLE) vkDeviceWaitIdle(device_);
+    if (!initialized_ && !ring_.initialized()) return;
+    if (ring_.frameOpen()) endFrame();
+    if (device_ != VK_NULL_HANDLE) vkDeviceWaitIdle(device_);   // teardown only
 
-    cleanupModel();
+    {
+        std::lock_guard<std::mutex> lk(modelMtx_);
+        cleanupModel();
+        for (auto& fn : retired_) fn();   // nothing in flight any more
+        retired_.clear();
+    }
 
     if (sampler_ != VK_NULL_HANDLE) { vkDestroySampler(device_, sampler_, nullptr); sampler_ = VK_NULL_HANDLE; }
     if (whiteTex_.image != VK_NULL_HANDLE) modelDestroyImage(device_, whiteTex_);
@@ -3048,21 +3194,11 @@ void ModelRenderer::cleanup() {
         if (c->memory != VK_NULL_HANDLE) vkFreeMemory(device_, c->memory, nullptr);
         *c = {};
     }
-    if (uniformBuffer_.buffer != VK_NULL_HANDLE) modelDestroyBuffer(device_, uniformBuffer_);
     // Before pipelineLayout_ (which it borrows) is destroyed below.
     destroyMaskPass();
     if (tsPool_ != VK_NULL_HANDLE) { vkDestroyQueryPool(device_, tsPool_, nullptr); tsPool_ = VK_NULL_HANDLE; gpuTimeOn_ = false; }
-    for (uint32_t i = 0; i < kRingSlots; i++) {
-        if (ringCmd_[i] != VK_NULL_HANDLE && cmdPool_ != VK_NULL_HANDLE) {
-            vkFreeCommandBuffers(device_, cmdPool_, 1, &ringCmd_[i]);
-            ringCmd_[i] = VK_NULL_HANDLE;
-        }
-        if (ringFence_[i] != VK_NULL_HANDLE) {
-            vkDestroyFence(device_, ringFence_[i], nullptr);
-            ringFence_[i] = VK_NULL_HANDLE;
-        }
-        ringSubmitted_[i] = false;
-    }
+    // Runs the deferred destroys, frees the command buffers, fences and UBO.
+    ring_.destroy();
     if (descriptorPool_ != VK_NULL_HANDLE) { vkDestroyDescriptorPool(device_, descriptorPool_, nullptr); descriptorPool_ = VK_NULL_HANDLE; }
     if (pipeline_ != VK_NULL_HANDLE) { vkDestroyPipeline(device_, pipeline_, nullptr); pipeline_ = VK_NULL_HANDLE; }
     if (skyboxPipeline_ != VK_NULL_HANDLE) { vkDestroyPipeline(device_, skyboxPipeline_, nullptr); skyboxPipeline_ = VK_NULL_HANDLE; }
@@ -3086,7 +3222,6 @@ void ModelRenderer::cleanup() {
     if (colorImageMS_.image != VK_NULL_HANDLE) { modelDestroyImage(device_, colorImageMS_); colorImageMS_ = {}; }
     if (colorImage_.image   != VK_NULL_HANDLE) modelDestroyImage(device_, colorImage_);
     if (depthImage_.image   != VK_NULL_HANDLE) modelDestroyImage(device_, depthImage_);
-    if (cmdPool_ != VK_NULL_HANDLE) { vkDestroyCommandPool(device_, cmdPool_, nullptr); cmdPool_ = VK_NULL_HANDLE; }
 
     initialized_ = false;
 }

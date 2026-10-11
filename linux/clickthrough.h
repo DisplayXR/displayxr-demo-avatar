@@ -108,6 +108,6 @@ struct ClickthroughParams {
 //! it. Call once per frame, after the eye render.
 void ClickthroughUpdate(const ClickthroughParams &p);
 
-//! Free the scratch images / readback buffer / command pool / fence. Device
+//! Free the scratch images / readback bands (render loop stopped). Device
 //! must be idle.
 void ClickthroughDestroy(VkDevice dev);
