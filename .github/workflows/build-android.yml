@@ -199,6 +199,17 @@ jobs:
           fi
           echo "  ok: versionCode=$vcode versionName=$vname (above the shipped 1, matches $describe)"
 
+      # The client AAR (runtime >= v2.34.0, displayxr-runtime#1922) carries
+      # VK_LAYER_DXR_queue_lock; the runtime only enables mid-frame fills + the
+      # non-blocking hand-off (60 Hz face refresh, #1905) when the APK ships it.
+      - name: Verify APK carries the client AAR's queue-lock layer
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: |
+          set -euo pipefail
+          APK=$(find android/build/outputs/apk/release -name '*.apk' | head -1)
+          unzip -l "$APK" | grep -q 'lib/arm64-v8a/libVkLayer_DXR_queue_lock.so' || { echo "::error::client AAR layer missing from APK"; exit 1; }
+          echo "  ok: lib/arm64-v8a/libVkLayer_DXR_queue_lock.so present in $APK"
+
       - name: Stage the APK with a release name
         if: needs.DetectChanges.outputs.docs_only != 'true'
         run: |

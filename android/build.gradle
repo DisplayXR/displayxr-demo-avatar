@@ -289,7 +289,7 @@ android {
 //      runtime release below.
 // Deliberately NO download at configuration time: a Gradle configure phase that
 // reaches the network fails in offline builds and in CI without a token.
-ext.dxrClientRuntimeTag = 'v2.16.28'
+ext.dxrClientRuntimeTag = 'v2.34.0'
 
 def resolveDxrClientAar = {
     def explicit = project.findProperty('dxrClientAar') ?: System.getenv('DXR_CLIENT_AAR')
