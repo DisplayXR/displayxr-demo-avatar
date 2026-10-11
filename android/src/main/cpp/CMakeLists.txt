@@ -45,15 +45,16 @@ FetchContent_Declare(stb
     GIT_TAG        master)
 FetchContent_MakeAvailable(stb)
 
-# ── displayxr-common (header-only rules: dxr_view_config.h) ──────────────
-# DxrSelectViewConfigType + DxrAliasInactiveViews (ADR-041) — the ONE shared
-# implementation the desktop legs reach through sr_common_base. Sources only:
-# its CMake builds a STATIC lib with desktop platform deps, so it is not run
-# here; the header-only common/ dir is appended to the include path below.
-# Keep equal to the pin in common/CMakeLists.txt.
+# ── displayxr-common (header-only rules: dxr_view_config.h, vk_frame_ring.h) ─
+# DxrSelectViewConfigType + DxrAliasInactiveViews (ADR-041) and dxr::VkFrameRing
+# (v2.28.0+: N frames in flight, one submit per frame — the Adreno DVFS fix the
+# shared renderer is built on) — the SAME headers the desktop legs reach through
+# displayxr::rules. Sources only: its CMake builds a STATIC lib with desktop
+# platform deps, so it is not run here; the header-only common/ dir is appended
+# to the include path below. Keep EQUAL to the pin in common/CMakeLists.txt.
 FetchContent_Declare(displayxr_common_rules
     GIT_REPOSITORY https://github.com/DisplayXR/displayxr-common.git
-    GIT_TAG        v2.15.0
+    GIT_TAG        v2.29.0
     GIT_SHALLOW    TRUE)
 FetchContent_GetProperties(displayxr_common_rules)
 if(NOT displayxr_common_rules_POPULATED)
@@ -119,7 +120,7 @@ target_include_directories(avatar_vk_android PRIVATE
     ${REPO_ROOT}/openxr_includes                 # DisplayXR XR_DXR_* headers
     ${REPO_ROOT}/common                         # dxr_submit_views.h (the other legs
                                                 #  get common/ via sr_common_base)
-    ${displayxr_common_rules_SOURCE_DIR}/common) # dxr_view_config.h (displayxr-common;
+    ${displayxr_common_rules_SOURCE_DIR}/common) # dxr_view_config.h + vk_frame_ring.h (displayxr-common;
                                                 #  LAST, so no local header is shadowed)
 
 set_target_properties(avatar_vk_android PROPERTIES
