@@ -54,7 +54,9 @@ FetchContent_MakeAvailable(stb)
 # to the include path below. Keep EQUAL to the pin in common/CMakeLists.txt.
 FetchContent_Declare(displayxr_common_rules
     GIT_REPOSITORY https://github.com/DisplayXR/displayxr-common.git
-    GIT_TAG        v2.29.0
+    # v2.30.1: the Wayland geometry payload is read by structure, in any key order
+    # (displayxr-common#76; a sorted-key KWin publisher crashed the old parser).
+    GIT_TAG        v2.30.1
     GIT_SHALLOW    TRUE)
 FetchContent_GetProperties(displayxr_common_rules)
 if(NOT displayxr_common_rules_POPULATED)
