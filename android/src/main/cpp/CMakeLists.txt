@@ -56,7 +56,10 @@ FetchContent_Declare(displayxr_common_rules
     GIT_REPOSITORY https://github.com/DisplayXR/displayxr-common.git
     # v2.30.1: the Wayland geometry payload is read by structure, in any key order
     # (displayxr-common#76; a sorted-key KWin publisher crashed the old parser).
-    GIT_TAG        v2.30.1
+    # v2.31.0: dxr::CursorDepth::useMeasuredDisparity() (displayxr-common#77).
+    # v2.31.2: a right-button content drag runs on KWin (displayxr-common#78, only
+    # gtk_shell1 says mutter) + the buffer_device helper in u_wayland_geom.h (#81).
+    GIT_TAG        v2.31.2
     GIT_SHALLOW    TRUE)
 FetchContent_GetProperties(displayxr_common_rules)
 if(NOT displayxr_common_rules_POPULATED)
