@@ -14,6 +14,8 @@
 #   /usr/lib/displayxr-demos/<app>/assets/...         bundled sample assets
 #   /usr/bin/<pkg>                                    launcher wrapper (on PATH)
 #   /usr/share/applications/<pkg>.desktop            menu entry
+#   /usr/share/displayxr/apps/<id>.displayxr.json   DisplayXR Shell registration (Ctrl+L)
+#   /usr/lib/displayxr-demos/<app>/displayxr/<icons> its 2D / 3D launcher icons
 #
 # The demo is an OpenXR app → Depends: displayxr-runtime. With the runtime .deb
 # installed, the loader resolves the runtime via /etc/xdg/openxr/1/active_runtime.json
@@ -123,6 +125,56 @@ Exec=$PKG
 Terminal=false
 Categories=$DESKTOP_CATEGORIES
 EOF
+
+# --- DisplayXR Shell registration (the Ctrl+L launcher) ----------------------
+# On Linux the shell discovers installed apps ONLY from "registered" manifests,
+# *.displayxr.json in ~/.local/share/DisplayXR/apps, /usr/local/share/displayxr/apps
+# or /usr/share/displayxr/apps (displayxr-shell-pvt src/shell_app_scan.c). A
+# registered manifest must carry "exe_path" (absolute, an existing file), and a
+# relative icon would resolve against /usr/share/displayxr/apps — so the icons
+# are installed under $APPDIR/displayxr/ and referenced by ABSOLUTE path. A
+# missing icon makes the shell reject the whole app, so every referenced icon is
+# copied here and checked below. exe_path is the /usr/bin launcher, not the raw
+# binary: the launcher is what sets up the bundled libs + vk_native compositor.
+# Generated from the repo's own manifest so the two cannot drift.
+SHELL_MANIFEST_SRC="$ROOT/windows/displayxr/avatar_handle_vk_win.displayxr.json"
+SHELL_REG_DIR="$STAGE/usr/share/displayxr/apps"
+mkdir -p "$APPDIR/displayxr" "$SHELL_REG_DIR"
+python3 - "$SHELL_MANIFEST_SRC" "$STAGE" "/usr/lib/displayxr-demos/$APP/displayxr" \
+    "/usr/bin/$PKG" "/usr/share/displayxr/apps" <<'PY'
+import json, os, shutil, sys
+src, stage, icon_dir, exe, reg_dir = sys.argv[1:]
+def die(msg):
+    sys.exit("error: shell registration: " + msg)
+with open(src) as f:
+    m = json.load(f)
+if m.get("schema_version") != 1: die(f"{src}: schema_version must be 1")
+for k in ("id", "name"):
+    if not m.get(k): die(f"{src}: missing '{k}'")
+if m.get("type") not in ("3d", "2d"): die(f"{src}: type must be '3d' or '2d'")
+if "icon_3d" in m and "icon" not in m: die(f"{src}: icon_3d requires icon")
+out = {}
+for k, v in m.items():
+    if k == "exe_path":
+        continue
+    if k in ("icon", "icon_3d"):
+        isrc = os.path.join(os.path.dirname(src), v)
+        if not os.path.isfile(isrc): die(f"{k} '{v}' not found next to {src}")
+        v = icon_dir + "/" + os.path.basename(v)
+        shutil.copyfile(isrc, stage + v)
+        os.chmod(stage + v, 0o644)
+    out[k] = v
+    if k == "type":
+        out["exe_path"] = exe
+if not (os.path.isfile(stage + exe) and os.access(stage + exe, os.X_OK)):
+    die(f"exe_path {exe} is not an executable file in the package")
+dst = f"{reg_dir}/{m['id']}.displayxr.json"
+with open(stage + dst, "w") as f:
+    json.dump(out, f, indent=2)
+    f.write("\n")
+os.chmod(stage + dst, 0o644)
+print(f"==> shell registration: {dst} -> {exe}")
+PY
 
 # --- Depends: ONE .deb for Ubuntu 22.04, 24.04 and 26.04 --------------------
 # Two independent things decide whether a .deb installs AND runs on a release,
