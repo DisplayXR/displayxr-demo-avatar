@@ -690,7 +690,13 @@ static void OpenLoadDialog() {
                 ? (NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
                    NSWindowStyleMaskResizable | NSWindowStyleMaskMiniaturizable)
                 : NSWindowStyleMaskBorderless;
+            // Keep the CONTENT rect (position + size) across the swap:
+            // setStyleMask alone keeps the FRAME, so the avatar's canvas would
+            // grow/shrink by the title bar.
+            const NSRect content = [g_window contentRectForFrameRect:[g_window frame]];
             [g_window setStyleMask:st];
+            const NSRect want = [g_window frameRectForContentRect:content];
+            if (!NSEqualRects(want, g_window.frame)) [g_window setFrame:want display:NO animate:NO];
             // setStyleMask can reset opacity — re-assert the transparent backing.
             [g_window setOpaque:NO];
             [g_window setBackgroundColor:[NSColor clearColor]];
@@ -699,8 +705,14 @@ static void OpenLoadDialog() {
             // When decorated, let the window be dragged by the title bar AND the
             // body (the MetalView fills the frame, so title-bar-only drag is easy
             // to miss); borderless keeps background-drag off so it doesn't fight
-            // the click-through / avatar interaction.
-            [g_window setMovable:YES];
+            // the click-through / avatar interaction. Never touch `movable`: when
+            // the runtime owns placement (ADR-050 comp_metal_placement, every
+            // comp_metal session incl. VK -> comp_vk_client -> comp_metal) it sets
+            // movable = NO and performs title-bar and right-button drags itself,
+            // phase-snapped and atomic with the present. Flipping it back to YES
+            // let AppKit move the window behind the runtime (stale woven frame,
+            // no snap). Background drag only applies while movable, i.e. without
+            // runtime placement.
             [g_window setMovableByWindowBackground:g_decorated];
             [g_window makeFirstResponder:g_metalView];
             [g_window makeKeyAndOrderFront:nil];
