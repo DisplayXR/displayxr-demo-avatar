@@ -1696,6 +1696,18 @@ bool ModelRenderer::uploadBuffer(ModelBuffer& dst, const void* data, VkDeviceSiz
 
 namespace {
 
+// Keyframe interval k with in[k] <= t < in[k+1], by binary search (the time
+// array is sorted per glTF). The result is clamped to [0, n-2] so an unsorted
+// or degenerate time array can never index past the last interval; n < 2 has
+// no interval and returns 0 (the samplers below return early for n < 2).
+size_t keyInterval(const std::vector<float>& in, float t) {
+    const size_t n = in.size();
+    if (n < 2) return 0;
+    const size_t hi = (size_t)(std::upper_bound(in.begin(), in.end(), t) - in.begin());
+    if (hi == 0) return 0;
+    return std::min(hi - 1, n - 2);
+}
+
 // Sample a translation/scale sampler (comps = 3) at time t → out[comps].
 // Handles STEP / LINEAR / CUBICSPLINE; clamps outside the keyframe range.
 void sampleVec(const AnimSampler& s, int comps, float t, float* out) {
@@ -1709,8 +1721,7 @@ void sampleVec(const AnimSampler& s, int comps, float t, float* out) {
     if (t <= in.front() || n == 1) { const float* v = val(0);   for (int c=0;c<comps;++c) out[c]=v[c]; return; }
     if (t >= in.back())            { const float* v = val(n-1); for (int c=0;c<comps;++c) out[c]=v[c]; return; }
 
-    size_t k = 0;
-    while (k + 1 < n && in[k + 1] <= t) ++k;   // in[k] <= t < in[k+1]
+    const size_t k = keyInterval(in, t);   // in[k] <= t < in[k+1]
     const float dt = in[k + 1] - in[k];
     const float u = dt > 0.0f ? (t - in[k]) / dt : 0.0f;
 
@@ -1748,8 +1759,7 @@ glm::quat sampleQuat(const AnimSampler& s, float t) {
     if (t <= in.front() || n == 1) return glm::normalize(quatFrom(s.output, 0 * stride + valOff));
     if (t >= in.back())            return glm::normalize(quatFrom(s.output, (n-1) * stride + valOff));
 
-    size_t k = 0;
-    while (k + 1 < n && in[k + 1] <= t) ++k;
+    const size_t k = keyInterval(in, t);
     const float dt = in[k + 1] - in[k];
     const float u = dt > 0.0f ? (t - in[k]) / dt : 0.0f;
 
@@ -1846,9 +1856,11 @@ void ModelRenderer::updateAnimation(float dtSeconds) {
     }
 
     // 2) Re-walk the hierarchy (parent before child via DFS) → world matrices.
+    std::vector<int>& stack = walkStack_;   // reused: no per-frame allocation
     for (int root : rootNodes_) {
         // Iterative DFS; each node's parent world is already written when popped.
-        std::vector<int> stack(1, root);
+        stack.clear();
+        stack.push_back(root);
         while (!stack.empty()) {
             int idx = stack.back(); stack.pop_back();
             if (idx < 0 || idx >= (int)nodes_.size()) continue;
@@ -1924,8 +1936,10 @@ void ModelRenderer::updateAnimation(float dtSeconds) {
     // 5) Re-blend morph targets into the (host-visible) vertex buffer. Runs
     //    after the node walk so the Weights channels above are applied; morphed
     //    verts are then skinned by the GPU (morph→skin, the glTF-correct order).
-    //    trackAnchor → it also computes the morphed-vertex world centroid.
-    blendMorphs(true);
+    //    trackAnchor → it also computes the morphed-vertex world centroid, which
+    //    is only the anchor when the skeleton gave none, so skip that per-vertex
+    //    transform when the joint centroid above is already valid.
+    blendMorphs(!anchorValid);
     if (!anchorValid && morphCentroidValid_) {
         anchorRaw = glm::vec3(morphCentroid_[0], morphCentroid_[1], morphCentroid_[2]);
         anchorValid = true;
@@ -2114,8 +2128,10 @@ void ModelRenderer::recomputeAnimatedBounds(const std::vector<ModelVertex>& vert
             }
         }
         // Walk hierarchy → world matrices (parent before child).
+        std::vector<int>& stack = walkStack_;
         for (int root : rootNodes_) {
-            std::vector<int> stack(1, root);
+            stack.clear();
+            stack.push_back(root);
             while (!stack.empty()) {
                 int idx = stack.back(); stack.pop_back();
                 if (idx < 0 || idx >= (int)nd.size()) continue;

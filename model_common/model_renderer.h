@@ -607,6 +607,7 @@ private:
     std::vector<Animation>  animations_;
     std::vector<int>        rootNodes_;
     std::vector<float>      nodeWorld_;   // scratch: 16 floats/node, per-frame walk
+    std::vector<int>        walkStack_;   // scratch: DFS stack for the hierarchy walk
     int   activeAnim_ = -1;              // -1 = none/static (fast-path guard)
     float animTime_   = 0.0f;            // playhead within the active clip (seconds)
     bool  paused_     = false;           // freeze the playhead (Phase 4 play/pause)
