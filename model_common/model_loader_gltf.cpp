@@ -282,6 +282,63 @@ const char* primitiveProblem(const tinygltf::Model& m, const tinygltf::Primitive
     return nullptr;
 }
 
+// Why channel `c` of animation `a` cannot be played, or nullptr when it can.
+// `nodeMorphWeights[n]` = how many morph weights node n carries (its mesh's
+// morph-target count; 0 = none), one entry per m.nodes. On nullptr: the
+// sampler index, the target node and both sampler accessors are in range;
+// input is SCALAR FLOAT with at least one key; output is FLOAT of the type the
+// path needs (translation/scale VEC3, rotation VEC4, weights SCALAR) and holds
+// at least input.count * (3 for CUBICSPLINE, else 1) * values-per-key elements
+// (values-per-key = the target's morph-weight count for weights, else 1).
+const char* animationChannelProblem(const tinygltf::Model& m, const tinygltf::Animation& a,
+                                    const tinygltf::AnimationChannel& c,
+                                    const std::vector<size_t>& nodeMorphWeights) {
+    constexpr int kF = TINYGLTF_COMPONENT_TYPE_FLOAT;
+
+    if (c.sampler < 0 || c.sampler >= (int)a.samplers.size())
+        return "sampler index is out of range";
+    if (c.target_node < 0 || c.target_node >= (int)m.nodes.size() ||
+        c.target_node >= (int)nodeMorphWeights.size())
+        return "target node is out of range";
+
+    int outType = 0;
+    size_t valuesPerKey = 1;
+    if (c.target_path == "translation" || c.target_path == "scale") {
+        outType = TINYGLTF_TYPE_VEC3;
+    } else if (c.target_path == "rotation") {
+        outType = TINYGLTF_TYPE_VEC4;
+    } else if (c.target_path == "weights") {
+        outType = TINYGLTF_TYPE_SCALAR;
+        valuesPerKey = nodeMorphWeights[(size_t)c.target_node];
+        if (valuesPerKey == 0) return "weights target node has no mesh with morph targets";
+    } else {
+        return "target path is not supported";
+    }
+
+    const tinygltf::AnimationSampler& s = a.samplers[(size_t)c.sampler];
+    const tinygltf::Accessor* in = checkedAccessor(m, s.input, TINYGLTF_TYPE_SCALAR, {kF});
+    if (!in) return "input accessor is out of range, malformed or not SCALAR FLOAT";
+    if (in->count == 0) return "input accessor has no keyframes";
+
+    // Range-check the output for every component type glTF allows here, so a
+    // legal-but-undecoded normalized integer output gets its own reason.
+    const tinygltf::Accessor* out = checkedAccessor(
+        m, s.output, outType,
+        {kF, TINYGLTF_COMPONENT_TYPE_BYTE, TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE,
+         TINYGLTF_COMPONENT_TYPE_SHORT, TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT});
+    if (!out) return "output accessor is out of range, malformed or of the wrong type for its path";
+    if (out->componentType != kF)
+        return "output accessor uses normalized integer components, which are not decoded";
+
+    // Elements needed: one value (or, CUBICSPLINE, in-tangent/value/out-tangent)
+    // per key, times the morph-weight count for weights. Compared by division
+    // so a large count cannot overflow the product.
+    const size_t perKey = (s.interpolation == "CUBICSPLINE" ? 3u : 1u) * valuesPerKey;
+    if (in->count > out->count / perKey)
+        return "output accessor holds fewer values than its input keyframes need";
+    return nullptr;
+}
+
 // Turns the file's node graph into a tree before anything walks it: every
 // child index in range, at most one parent per node, no edge closing a cycle,
 // no chain deeper than kMaxNodeDepth. `kids` = the surviving child lists
@@ -691,32 +748,55 @@ bool model_load_gltf(const char* gltfPath, ModelData& out) {
         if (p == "weights")     { out = AnimPath::Weights;     return true; }
         return false;
     };
-    for (const auto& src : model.animations) {
+    // Every channel is checked (animationChannelProblem) before its sampler is
+    // read: a channel that fails is dropped and the rest of the clip still
+    // plays. Only samplers a surviving channel uses are read; the others stay
+    // empty so channel -> sampler indices keep the file's numbering.
+    std::vector<size_t> nodeMorphWeights(out.nodes.size());
+    for (size_t i = 0; i < out.nodes.size(); ++i) nodeMorphWeights[i] = out.nodes[i].weights.size();
+    size_t droppedChannels = 0;
+    std::string firstDrop;  // reason for the first dropped channel, for the one log line
+    for (size_t ai = 0; ai < model.animations.size(); ++ai) {
+        const tinygltf::Animation& src = model.animations[ai];
         Animation anim;
         anim.name = src.name;
-        anim.samplers.reserve(src.samplers.size());
-        for (const auto& s : src.samplers) {
-            AnimSampler smp;
-            readAccessorFloats(model, s.input, smp.input);
-            readAccessorFloats(model, s.output, smp.output);
-            smp.interp = s.interpolation == "STEP"        ? AnimInterp::Step
-                       : s.interpolation == "CUBICSPLINE" ? AnimInterp::CubicSpline
-                                                          : AnimInterp::Linear;
-            if (!smp.input.empty())
-                anim.duration = std::max(anim.duration, smp.input.back());
-            anim.samplers.push_back(std::move(smp));
-        }
-        for (const auto& c : src.channels) {
+        anim.samplers.resize(src.samplers.size());
+        std::vector<char> samplerRead(src.samplers.size(), 0);
+        for (size_t ci = 0; ci < src.channels.size(); ++ci) {
+            const tinygltf::AnimationChannel& c = src.channels[ci];
             AnimChannel ch;
+            // Paths outside the core four (an extension's) are not ours to play.
+            if (!mapPath(c.target_path, ch.path)) continue;
+            if (const char* why = animationChannelProblem(model, src, c, nodeMorphWeights)) {
+                if (droppedChannels++ == 0) {
+                    char buf[256];
+                    std::snprintf(buf, sizeof(buf), "animation %zu channel %zu: %s", ai, ci, why);
+                    firstDrop = buf;
+                }
+                continue;
+            }
             ch.targetNode = c.target_node;
             ch.sampler = c.sampler;
-            if (ch.targetNode < 0 || ch.targetNode >= (int)out.nodes.size()) continue;
-            if (ch.sampler < 0 || ch.sampler >= (int)anim.samplers.size()) continue;
-            if (!mapPath(c.target_path, ch.path)) continue;
+            const size_t si = (size_t)c.sampler;
+            if (!samplerRead[si]) {
+                samplerRead[si] = 1;
+                const tinygltf::AnimationSampler& s = src.samplers[si];
+                AnimSampler& smp = anim.samplers[si];
+                readAccessorFloats(model, s.input, smp.input);
+                readAccessorFloats(model, s.output, smp.output);
+                smp.interp = s.interpolation == "STEP"        ? AnimInterp::Step
+                           : s.interpolation == "CUBICSPLINE" ? AnimInterp::CubicSpline
+                                                              : AnimInterp::Linear;
+                if (!smp.input.empty())
+                    anim.duration = std::max(anim.duration, smp.input.back());
+            }
             anim.channels.push_back(ch);
         }
         if (!anim.channels.empty()) out.animations.push_back(std::move(anim));
     }
+    if (droppedChannels)
+        std::fprintf(stderr, "[model_loader] %zu animation channel(s) dropped (first: %s)\n",
+                     droppedChannels, firstDrop.c_str());
 
     if (issues.badMesh || issues.badSkin || issues.badMaterial || issues.badJoint ||
         issues.badInverseBind)
