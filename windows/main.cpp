@@ -1321,25 +1321,6 @@ static std::mutex g_bubbleMtx;
 static RECT       g_bubbleRect = {0, 0, 0, 0};
 static bool       g_bubbleVisible = false;
 
-// True if the client-space point is over the avatar silhouette (with a small
-// dilation so hovering near edges is forgiving). Thread-safe; called on the UI
-// thread from WM_NCHITTEST.
-static bool SilhouetteHit(int clientX, int clientY) {
-    std::lock_guard<std::mutex> lock(g_silCoverage.mtx);
-    if (!g_silCoverage.ready || g_silCoverage.winW <= 0 || g_silCoverage.winH <= 0) return false;
-    if (clientX < 0 || clientY < 0 || clientX >= g_silCoverage.winW || clientY >= g_silCoverage.winH) return false;
-    const int sx = clientX * g_silCoverage.covW / g_silCoverage.winW;
-    const int sy = clientY * g_silCoverage.covH / g_silCoverage.winH;
-    const int R = 2;  // dilation radius in coverage pixels
-    for (int dy = -R; dy <= R; ++dy)
-        for (int dx = -R; dx <= R; ++dx) {
-            const int x = sx + dx, y = sy + dy;
-            if (x < 0 || y < 0 || x >= g_silCoverage.covW || y >= g_silCoverage.covH) continue;
-            if (g_silCoverage.bits[(size_t)y * g_silCoverage.covW + x]) return true;
-        }
-    return false;
-}
-
 // Cross-process click-through via SetWindowRgn (the technique the working Unity
 // plugin uses). WM_NCHITTEST/HTTRANSPARENT only forwards to same-thread windows,
 // and a dynamically-toggled WS_EX_TRANSPARENT both fails to route cross-process
@@ -1351,10 +1332,39 @@ static bool SilhouetteHit(int clientX, int clientY) {
 // window catches input normally. We rebuild the region each tick from the
 // published silhouette coverage. When decorated, the region is cleared so the
 // whole framed window stays interactive for move/resize.
+//
+// SetWindowRgn is a DWM re-shape, not a cheap setter, and a still or paused
+// avatar hands it the identical rect list every tick, so the rect list is
+// hashed and the call skipped while it matches what the OS already has (the
+// same rule as displayxr-common's vk_clickthrough_region.h). The decorated-mode
+// NULL region is applied once per transition. Window-thread owned (WM_TIMER).
 static const UINT_PTR kClickThroughTimerId = 0xC17;
+static bool     g_regionShaped    = false;  // the OS holds the silhouette region g_regionSig names
+static uint64_t g_regionSig       = 0;
+static bool     g_regionClearedForDecor = false;  // SetWindowRgn(NULL) already applied this decorated spell
+
+// FNV-1a over the rect list, seeded with its length.
+static uint64_t HashRegionRects(const std::vector<RECT>& rects) {
+    uint64_t h = 0xcbf29ce484222325ull ^ (uint64_t)rects.size();
+    const uint8_t* p = reinterpret_cast<const uint8_t*>(rects.data());
+    const size_t n = rects.size() * sizeof(RECT);
+    for (size_t i = 0; i < n; ++i) {
+        h ^= p[i];
+        h *= 0x100000001b3ull;
+    }
+    return h;
+}
 
 static void UpdateClickRegion(HWND hwnd) {
-    if (g_decorated) { SetWindowRgn(hwnd, NULL, TRUE); return; }
+    if (g_decorated) {
+        if (!g_regionClearedForDecor) {
+            SetWindowRgn(hwnd, NULL, TRUE);
+            g_regionClearedForDecor = true;
+        }
+        g_regionShaped = false;  // the next borderless tick must re-apply
+        return;
+    }
+    g_regionClearedForDecor = false;
 
     std::vector<RECT> rects;
     int winW = 0, winH = 0;
@@ -1415,6 +1425,15 @@ static void UpdateClickRegion(HWND hwnd) {
             rects.push_back(g_bubbleRect);
         }
     }
+
+    // Nothing moved → the OS already has exactly this region. The rects are in
+    // client pixels scaled by the window size, so a resize or any coverage
+    // change alters the hash and is re-applied; a mode change clears
+    // g_regionShaped above.
+    const uint64_t sig = HashRegionRects(rects);
+    if (g_regionShaped && sig == g_regionSig) return;
+    g_regionShaped = true;
+    g_regionSig = sig;
 
     if (rects.empty()) {
         // Nothing drawn → empty region = the whole window is click-through.

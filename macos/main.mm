@@ -2226,7 +2226,7 @@ static void TryAutoLoadBundledScene(const std::string& overridePath = std::strin
 // on-screen chrome) the window catches the click; off it the click falls
 // through to the desktop behind. All on the main thread (render + poll), so no
 // mutex is needed — unlike the Windows render-thread split. Mirrors
-// windows/main.cpp UpdateSilhouette / SilhouetteHit.
+// windows/main.cpp UpdateSilhouette / UpdateClickRegion.
 static std::vector<uint8_t> g_silBits;   // covW*covH, 1 = avatar present
 static int  g_silCovW = 0, g_silCovH = 0;
 static bool g_silReady = false;
