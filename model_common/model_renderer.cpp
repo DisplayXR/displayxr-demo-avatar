@@ -1708,16 +1708,28 @@ size_t keyInterval(const std::vector<float>& in, float t) {
     return std::min(hi - 1, n - 2);
 }
 
+// True when `s` holds a value (CUBICSPLINE: in-tangent, value, out-tangent)
+// of `comps` floats for every one of its keys. The loader drops channels whose
+// sampler fails this, but other backends fill AnimSampler too, so the
+// per-frame readers check it again rather than index past `output`.
+bool samplerReadable(const AnimSampler& s, int comps) {
+    if (s.input.empty() || comps <= 0) return false;
+    const size_t perKey = (size_t)comps * (s.interp == AnimInterp::CubicSpline ? 3u : 1u);
+    return s.output.size() / perKey >= s.input.size();
+}
+
 // Sample a translation/scale sampler (comps = 3) at time t → out[comps].
 // Handles STEP / LINEAR / CUBICSPLINE; clamps outside the keyframe range.
+// A sampler with no keys or too few output values leaves `out` untouched, so
+// the node keeps its rest value.
 void sampleVec(const AnimSampler& s, int comps, float t, float* out) {
+    if (!samplerReadable(s, comps)) return;
     const std::vector<float>& in = s.input;
     const size_t n = in.size();
     const int stride = (s.interp == AnimInterp::CubicSpline) ? 3 * comps : comps;
     const int valOff = (s.interp == AnimInterp::CubicSpline) ? comps : 0;
     auto val = [&](size_t k) -> const float* { return &s.output[k * stride + valOff]; };
 
-    if (n == 0) { for (int c = 0; c < comps; ++c) out[c] = 0.0f; return; }
     if (t <= in.front() || n == 1) { const float* v = val(0);   for (int c=0;c<comps;++c) out[c]=v[c]; return; }
     if (t >= in.back())            { const float* v = val(n-1); for (int c=0;c<comps;++c) out[c]=v[c]; return; }
 
@@ -1747,15 +1759,13 @@ glm::quat quatFrom(const std::vector<float>& o, size_t base) {
     return glm::quat(o[base + 3], o[base + 0], o[base + 1], o[base + 2]);
 }
 
-// Sample a rotation sampler at time t → normalized quaternion. LINEAR uses
-// slerp; CUBICSPLINE does the Hermite on quat components then renormalizes.
-glm::quat sampleQuat(const AnimSampler& s, float t) {
+// sampleQuat's body; the caller has checked samplerReadable(s, 4).
+glm::quat sampleQuatChecked(const AnimSampler& s, float t) {
     const std::vector<float>& in = s.input;
     const size_t n = in.size();
     const int stride = (s.interp == AnimInterp::CubicSpline) ? 12 : 4;
     const int valOff = (s.interp == AnimInterp::CubicSpline) ? 4 : 0;
 
-    if (n == 0) return glm::quat(1, 0, 0, 0);
     if (t <= in.front() || n == 1) return glm::normalize(quatFrom(s.output, 0 * stride + valOff));
     if (t >= in.back())            return glm::normalize(quatFrom(s.output, (n-1) * stride + valOff));
 
@@ -1778,6 +1788,16 @@ glm::quat sampleQuat(const AnimSampler& s, float t) {
     }
     return glm::normalize(glm::slerp(glm::normalize(quatFrom(s.output, k * stride)),
                                      glm::normalize(quatFrom(s.output, (k + 1) * stride)), u));
+}
+
+// Sample a rotation sampler at time t → normalized quaternion in `q`. LINEAR
+// uses slerp; CUBICSPLINE does the Hermite on quat components then
+// renormalizes. Returns false (q untouched, the node keeps its rest rotation)
+// when the sampler has no keys or too few output values.
+bool sampleQuat(const AnimSampler& s, float t, glm::quat& q) {
+    if (!samplerReadable(s, 4)) return false;
+    q = sampleQuatChecked(s, t);
+    return true;
 }
 
 // Compose a node's local matrix from its (possibly animated) TRS, or its
@@ -1837,13 +1857,17 @@ void ModelRenderer::updateAnimation(float dtSeconds) {
     //    node. Channel-driven components are fully recomputed every frame, so
     //    mutating nodes_ in place is safe; untargeted components keep their base.
     for (const AnimChannel& ch : anim.channels) {
+        if (ch.sampler < 0 || ch.sampler >= (int)anim.samplers.size() ||
+            ch.targetNode < 0 || ch.targetNode >= (int)nodes_.size())
+            continue;
         const AnimSampler& s = anim.samplers[ch.sampler];
         ModelNode& node = nodes_[ch.targetNode];
         switch (ch.path) {
             case AnimPath::Translation: sampleVec(s, 3, animTime_, node.translation); break;
             case AnimPath::Scale:       sampleVec(s, 3, animTime_, node.scale);       break;
             case AnimPath::Rotation: {
-                glm::quat q = sampleQuat(s, animTime_);
+                glm::quat q;
+                if (!sampleQuat(s, animTime_, q)) break;
                 node.rotation[0] = q.x; node.rotation[1] = q.y;
                 node.rotation[2] = q.z; node.rotation[3] = q.w;
                 break;
@@ -2112,13 +2136,17 @@ void ModelRenderer::recomputeAnimatedBounds(const std::vector<ModelVertex>& vert
         // Sample channels onto a fresh copy of the bind-pose TRS.
         std::vector<ModelNode> nd = nodes_;
         for (const AnimChannel& ch : anim.channels) {
+            if (ch.sampler < 0 || ch.sampler >= (int)anim.samplers.size() ||
+                ch.targetNode < 0 || ch.targetNode >= (int)nd.size())
+                continue;
             const AnimSampler& s = anim.samplers[ch.sampler];
             ModelNode& node = nd[ch.targetNode];
             switch (ch.path) {
                 case AnimPath::Translation: sampleVec(s, 3, t, node.translation); break;
                 case AnimPath::Scale:       sampleVec(s, 3, t, node.scale);       break;
                 case AnimPath::Rotation: {
-                    glm::quat q = sampleQuat(s, t);
+                    glm::quat q;
+                    if (!sampleQuat(s, t, q)) break;
                     node.rotation[0]=q.x; node.rotation[1]=q.y; node.rotation[2]=q.z; node.rotation[3]=q.w;
                 } break;
                 case AnimPath::Weights:
