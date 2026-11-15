@@ -29,6 +29,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <initializer_list>
 
 namespace {
 
@@ -180,14 +181,183 @@ uint32_t readIndex(const tinygltf::Model& m, const tinygltf::Accessor& acc,
     }
 }
 
+// ── Scene-graph and index validation (#125) ─────────────────────────────────
+// The readers above trust every index and byte range the file declares. The
+// checks below run before them, so a malformed file degrades (a dropped edge, a
+// skipped primitive, a default material) instead of reading out of bounds or
+// recursing without end. They check ranges only; they decode nothing.
+
+// Deepest node chain kept. Real skeletons are tens of levels deep; the cap only
+// stops a pathological chain from exhausting the stack in processNode().
+constexpr int kMaxNodeDepth = 256;
+
+// Index/range problems that are repaired in place rather than skipping a
+// primitive. Logged once, as one summary line, at the end of the load.
+struct IndexIssues {
+    size_t badMesh = 0;         // node.mesh out of range -> node draws nothing
+    size_t badSkin = 0;         // node.skin out of range -> primitives unskinned
+    size_t badMaterial = 0;     // primitive.material out of range -> default material
+    size_t badJoint = 0;        // skin.joints[] entry out of range -> -1 (identity)
+    size_t badInverseBind = 0;  // inverseBindMatrices unreadable -> identity
+};
+
+// `idx` as an accessor of `type` with one of `compTypes`, whose bufferView and
+// buffer exist and whose last element (strided the way accessorPtr() strides
+// it) ends inside both; nullptr otherwise.
+const tinygltf::Accessor* checkedAccessor(const tinygltf::Model& m, int idx, int type,
+                                          std::initializer_list<int> compTypes) {
+    if (idx < 0 || idx >= (int)m.accessors.size()) return nullptr;
+    const tinygltf::Accessor& acc = m.accessors[(size_t)idx];
+    if (acc.type != type) return nullptr;
+    if (std::find(compTypes.begin(), compTypes.end(), acc.componentType) == compTypes.end())
+        return nullptr;
+    // accessorPtr() dereferences the bufferView even for an empty accessor.
+    if (acc.bufferView < 0 || acc.bufferView >= (int)m.bufferViews.size()) return nullptr;
+    const tinygltf::BufferView& bv = m.bufferViews[(size_t)acc.bufferView];
+    if (bv.buffer < 0 || bv.buffer >= (int)m.buffers.size()) return nullptr;
+    const size_t bufSize = m.buffers[(size_t)bv.buffer].data.size();
+    if (bv.byteOffset > bufSize || bv.byteLength > bufSize - bv.byteOffset) return nullptr;
+    if (acc.count == 0) return &acc;
+    const size_t elem =
+        (size_t)tinygltf::GetNumComponentsInType((uint32_t)acc.type) *
+        (size_t)tinygltf::GetComponentSizeInBytes((uint32_t)acc.componentType);
+    const size_t stride = bv.byteStride ? bv.byteStride : elem;
+    if (acc.byteOffset > bv.byteLength) return nullptr;
+    const size_t avail = bv.byteLength - acc.byteOffset;
+    if (elem > avail || (acc.count - 1) > (avail - elem) / stride) return nullptr;
+    return &acc;
+}
+
+// Why `prim` cannot be read safely, or nullptr when it can. `skinned` = the
+// primitive will be read as skinned (valid node.skin + JOINTS_0 + WEIGHTS_0).
+const char* primitiveProblem(const tinygltf::Model& m, const tinygltf::Primitive& prim,
+                             bool skinned) {
+    constexpr int kF  = TINYGLTF_COMPONENT_TYPE_FLOAT;
+    constexpr int kUB = TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE;
+    constexpr int kUS = TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT;
+    constexpr int kUI = TINYGLTF_COMPONENT_TYPE_UNSIGNED_INT;
+
+    auto itPos = prim.attributes.find("POSITION");
+    const tinygltf::Accessor* pos = itPos == prim.attributes.end() ? nullptr
+        : checkedAccessor(m, itPos->second, TINYGLTF_TYPE_VEC3, {kF});
+    if (!pos) return "POSITION accessor is out of range or malformed";
+    const size_t vcount = pos->count;
+
+    // An optional attribute must, when present, be readable and per-vertex.
+    auto attrOk = [&](const char* name, int type, std::initializer_list<int> comps) {
+        auto it = prim.attributes.find(name);
+        if (it == prim.attributes.end()) return true;
+        const tinygltf::Accessor* a = checkedAccessor(m, it->second, type, comps);
+        return a != nullptr && a->count == vcount;
+    };
+    if (!attrOk("NORMAL", TINYGLTF_TYPE_VEC3, {kF}))
+        return "NORMAL accessor is out of range, malformed or not per-vertex";
+    if (!attrOk("TEXCOORD_0", TINYGLTF_TYPE_VEC2, {kF}))
+        return "TEXCOORD_0 accessor is out of range, malformed or not per-vertex";
+    if (skinned) {
+        if (!attrOk("JOINTS_0", TINYGLTF_TYPE_VEC4, {kUB, kUS}))
+            return "JOINTS_0 accessor is out of range, malformed or not per-vertex";
+        if (!attrOk("WEIGHTS_0", TINYGLTF_TYPE_VEC4, {kF, kUB, kUS}))
+            return "WEIGHTS_0 accessor is out of range, malformed or not per-vertex";
+    }
+
+    for (const auto& tgt : prim.targets) {
+        for (const char* name : {"POSITION", "NORMAL"}) {
+            auto it = tgt.find(name);
+            if (it != tgt.end() && !checkedAccessor(m, it->second, TINYGLTF_TYPE_VEC3, {kF}))
+                return "morph-target accessor is out of range or malformed";
+        }
+    }
+
+    if (prim.indices >= 0) {
+        const tinygltf::Accessor* ia =
+            checkedAccessor(m, prim.indices, TINYGLTF_TYPE_SCALAR, {kUB, kUS, kUI});
+        if (!ia) return "indices accessor is out of range or malformed";
+        size_t istride = 0;
+        const unsigned char* ibase = accessorPtr(m, *ia, istride);
+        for (size_t i = 0; i < ia->count; ++i)
+            if (readIndex(m, *ia, ibase, istride, i) >= vcount)
+                return "an index names a vertex outside the primitive";
+    }
+    return nullptr;
+}
+
+// Turns the file's node graph into a tree before anything walks it: every
+// child index in range, at most one parent per node, no edge closing a cycle,
+// no chain deeper than kMaxNodeDepth. `kids` = the surviving child lists
+// (1:1 with m.nodes, file order kept); `roots` = the valid, distinct nodes of
+// scene `sceneIdx`, or, when there is no such scene, every node no surviving
+// edge points at. Dropped roots and edges are counted into one log line.
+void validateNodeGraph(const tinygltf::Model& m, int sceneIdx,
+                       std::vector<std::vector<int>>& kids, std::vector<int>& roots) {
+    const int n = (int)m.nodes.size();
+    kids.assign((size_t)n, {});
+    roots.clear();
+
+    std::vector<int> candidates;
+    const bool haveScene = sceneIdx >= 0 && sceneIdx < (int)m.scenes.size();
+    if (haveScene) {
+        candidates = m.scenes[(size_t)sceneIdx].nodes;
+    } else {
+        std::vector<char> pointedAt((size_t)n, 0);
+        for (const tinygltf::Node& node : m.nodes)
+            for (int c : node.children)
+                if (c >= 0 && c < n) pointedAt[(size_t)c] = 1;
+        for (int i = 0; i < n; ++i)
+            if (!pointedAt[(size_t)i]) candidates.push_back(i);
+    }
+
+    std::vector<char> reached((size_t)n, 0);
+    std::vector<std::pair<int, int>> stack;  // (node, depth)
+    size_t badRoots = 0, badEdges = 0;
+    for (int r : candidates) {
+        if (r < 0 || r >= n || reached[(size_t)r]) { ++badRoots; continue; }
+        reached[(size_t)r] = 1;
+        roots.push_back(r);
+        stack.assign(1, {r, 0});
+        while (!stack.empty()) {
+            const auto [p, depth] = stack.back();
+            stack.pop_back();
+            for (int c : m.nodes[(size_t)p].children) {
+                if (c < 0 || c >= n || reached[(size_t)c] || depth + 1 > kMaxNodeDepth) {
+                    ++badEdges;
+                    continue;
+                }
+                reached[(size_t)c] = 1;
+                kids[(size_t)p].push_back(c);
+                stack.push_back({c, depth + 1});
+            }
+        }
+    }
+    size_t unreached = 0;
+    if (!haveScene)
+        for (int i = 0; i < n; ++i) if (!reached[(size_t)i]) ++unreached;
+
+    if (!haveScene && !m.scenes.empty())
+        std::fprintf(stderr,
+                     "[model_loader] scene %d does not exist (%zu scene(s)); walking every "
+                     "parentless node instead\n", sceneIdx, m.scenes.size());
+    if (badRoots || badEdges || unreached)
+        std::fprintf(stderr,
+                     "[model_loader] node graph repaired: dropped %zu scene root(s) and %zu "
+                     "child edge(s) (index out of range, second parent, cycle, or deeper than "
+                     "%d); %zu node(s) unreachable\n",
+                     badRoots, badEdges, kMaxNodeDepth, unreached);
+}
+
 void processNode(const tinygltf::Model& m, int nodeIdx, const glm::mat4& parent,
+                 const std::vector<std::vector<int>>& kids, IndexIssues& issues,
                  ModelData& out) {
     const tinygltf::Node& node = m.nodes[nodeIdx];
     const glm::mat4 world = parent * nodeLocalMatrix(node);
 
+    if (node.mesh < -1 || node.mesh >= (int)m.meshes.size()) ++issues.badMesh;
+    const bool skinValid = node.skin >= 0 && node.skin < (int)m.skins.size();
+    if (node.skin < -1 || node.skin >= (int)m.skins.size()) ++issues.badSkin;
     if (node.mesh >= 0 && node.mesh < (int)m.meshes.size()) {
         const tinygltf::Mesh& mesh = m.meshes[node.mesh];
-        for (const auto& prim : mesh.primitives) {
+        for (size_t primIdx = 0; primIdx < mesh.primitives.size(); ++primIdx) {
+            const tinygltf::Primitive& prim = mesh.primitives[primIdx];
             if (prim.mode != TINYGLTF_MODE_TRIANGLES && prim.mode != -1) continue;
 
             auto itPos = prim.attributes.find("POSITION");
@@ -197,19 +367,36 @@ void processNode(const tinygltf::Model& m, int nodeIdx, const glm::mat4& parent,
             auto itJnt = prim.attributes.find("JOINTS_0");
             auto itWgt = prim.attributes.find("WEIGHTS_0");
 
+            // A primitive is skinned only when the node has a (valid) skin AND
+            // carries both joint + weight attributes.
+            const bool skinned = skinValid &&
+                                 itJnt != prim.attributes.end() &&
+                                 itWgt != prim.attributes.end();
+            if (const char* why = primitiveProblem(m, prim, skinned)) {
+                std::fprintf(stderr, "[model_loader] mesh %d primitive %zu skipped: %s\n",
+                             node.mesh, primIdx, why);
+                continue;
+            }
+
             std::vector<float> pos, nrm, uv, wgt;
             std::vector<uint16_t> jnt;
             readVec(m, itPos->second, 3, pos);
             readVec(m, itNrm != prim.attributes.end() ? itNrm->second : -1, 3, nrm);
             readVec(m, itUv  != prim.attributes.end() ? itUv->second  : -1, 2, uv);
-            // A primitive is skinned only when the node has a skin AND carries
-            // both joint + weight attributes.
-            const bool skinned = node.skin >= 0 &&
-                                 itJnt != prim.attributes.end() &&
-                                 itWgt != prim.attributes.end();
             if (skinned) {
                 readJoints(m, itJnt->second, jnt);
                 readWeights(m, itWgt->second, wgt);
+                // Every joint a vertex names must exist in the skin: the joint
+                // matrices are indexed by jointBase + j on the GPU and on the CPU.
+                const size_t nj = m.skins[(size_t)node.skin].joints.size();
+                if (std::any_of(jnt.begin(), jnt.end(),
+                                [nj](uint16_t j) { return (size_t)j >= nj; })) {
+                    std::fprintf(stderr,
+                                 "[model_loader] mesh %d primitive %zu skipped: JOINTS_0 "
+                                 "names a joint skin %d does not have (%zu joints)\n",
+                                 node.mesh, primIdx, node.skin, nj);
+                    continue;
+                }
             }
 
             const size_t vcount = pos.size() / 3;
@@ -283,6 +470,10 @@ void processNode(const tinygltf::Model& m, int nodeIdx, const glm::mat4& parent,
             ModelPrimitive mp{};
             mp.firstIndex = (uint32_t)out.indices.size();
             mp.material = prim.material;
+            if (mp.material < -1 || mp.material >= (int)m.materials.size()) {
+                ++issues.badMaterial;
+                mp.material = -1;  // renderer default material
+            }
             mp.node = nodeIdx;   // owning node → animated world matrix per frame
             mp.skin = skinned ? node.skin : -1;  // jointBase filled in after skins parse
             mp.firstVertex = vertexBase;
@@ -309,7 +500,8 @@ void processNode(const tinygltf::Model& m, int nodeIdx, const glm::mat4& parent,
         }
     }
 
-    for (int child : node.children) processNode(m, child, world, out);
+    // `kids` is the validated tree (validateNodeGraph), not node.children.
+    for (int child : kids[(size_t)nodeIdx]) processNode(m, child, world, kids, issues, out);
 }
 
 }  // namespace
@@ -395,14 +587,16 @@ bool model_load_gltf(const char* gltfPath, ModelData& out) {
         out.materials.push_back(mm);
     }
 
-    // Walk the default scene (or scene 0).
+    // Walk the default scene (or scene 0) over the validated tree: `kids`
+    // replaces node.children everywhere below (bake walk + retained graph), so
+    // neither this walk nor the renderer's per-frame DFS can meet a cycle.
     const int sceneIdx = model.defaultScene >= 0 ? model.defaultScene : 0;
     const glm::mat4 ident(1.0f);
-    if (sceneIdx >= 0 && sceneIdx < (int)model.scenes.size()) {
-        for (int n : model.scenes[sceneIdx].nodes) processNode(model, n, ident, out);
-    } else {
-        for (int n = 0; n < (int)model.nodes.size(); ++n) processNode(model, n, ident, out);
-    }
+    std::vector<std::vector<int>> kids;
+    std::vector<int> roots;
+    validateNodeGraph(model, sceneIdx, kids, roots);
+    IndexIssues issues;
+    for (int n : roots) processNode(model, n, ident, kids, issues, out);
 
     out.primitiveCount = (uint32_t)out.primitives.size();
     if (out.primitiveCount == 0 || out.vertices.empty()) {
@@ -417,9 +611,8 @@ bool model_load_gltf(const char* gltfPath, ModelData& out) {
         const tinygltf::Node& src = model.nodes[i];
         ModelNode& dst = out.nodes[i];
         dst.mesh = src.mesh;
-        dst.children.assign(src.children.begin(), src.children.end());
-        for (int c : src.children)
-            if (c >= 0 && c < (int)out.nodes.size()) out.nodes[c].parent = (int)i;
+        dst.children = kids[i];
+        for (int c : kids[i]) out.nodes[(size_t)c].parent = (int)i;
         if (src.matrix.size() == 16) {
             dst.hasMatrix = true;
             for (int k = 0; k < 16; ++k) dst.matrix[k] = (float)src.matrix[k];
@@ -445,14 +638,8 @@ bool model_load_gltf(const char* gltfPath, ModelData& out) {
             }
         }
     }
-    // Scene roots (same selection the world-bake walk used above).
-    if (sceneIdx >= 0 && sceneIdx < (int)model.scenes.size()) {
-        out.rootNodes.assign(model.scenes[sceneIdx].nodes.begin(),
-                             model.scenes[sceneIdx].nodes.end());
-    } else {
-        for (int n = 0; n < (int)out.nodes.size(); ++n)
-            if (out.nodes[n].parent < 0) out.rootNodes.push_back(n);
-    }
+    // Scene roots (same validated selection the world-bake walk used above).
+    out.rootNodes = roots;
 
     // ── Parse skins[] (joint lists + inverse-bind matrices) ───────────────────
     // Joint matrices for every skin are packed back-to-back; jointBase is each
@@ -464,9 +651,15 @@ bool model_load_gltf(const char* gltfPath, ModelData& out) {
         const tinygltf::Skin& src = model.skins[s];
         ModelSkin& dst = out.skins[s];
         dst.joints.assign(src.joints.begin(), src.joints.end());
+        for (int& j : dst.joints)
+            if (j < 0 || j >= (int)model.nodes.size()) { ++issues.badJoint; j = -1; }
         const size_t nj = dst.joints.size();
         if (src.inverseBindMatrices >= 0) {
-            readAccessorFloats(model, src.inverseBindMatrices, dst.inverseBind);
+            if (checkedAccessor(model, src.inverseBindMatrices, TINYGLTF_TYPE_MAT4,
+                                {TINYGLTF_COMPONENT_TYPE_FLOAT}))
+                readAccessorFloats(model, src.inverseBindMatrices, dst.inverseBind);
+            else
+                ++issues.badInverseBind;
         }
         if (dst.inverseBind.size() != nj * 16) {  // absent / malformed → identity
             dst.inverseBind.assign(nj * 16, 0.0f);
@@ -524,6 +717,15 @@ bool model_load_gltf(const char* gltfPath, ModelData& out) {
         }
         if (!anim.channels.empty()) out.animations.push_back(std::move(anim));
     }
+
+    if (issues.badMesh || issues.badSkin || issues.badMaterial || issues.badJoint ||
+        issues.badInverseBind)
+        std::fprintf(stderr,
+                     "[model_loader] out-of-range indices repaired: %zu node mesh, %zu node "
+                     "skin (unskinned), %zu primitive material (default), %zu skin joint "
+                     "(identity), %zu inverseBindMatrices (identity)\n",
+                     issues.badMesh, issues.badSkin, issues.badMaterial, issues.badJoint,
+                     issues.badInverseBind);
 
     std::fprintf(stderr,
         "[model_loader] '%s': %u prims, %zu verts, %zu indices, %zu materials, "
