@@ -111,7 +111,7 @@ cp -P "$OPENXR_DIR"/lib/libopenxr_loader*.dylib "$ARTIFACT_DIR/lib/"
 
 # Bundled Vulkan + MoltenVK via Homebrew. Resolve through `brew --prefix
 # <formula>` so we don't hardcode arm64 (/opt/homebrew) vs x86_64
-# (/usr/local) — CI runners on macos-14 and local Apple Silicon dev
+# (/usr/local) — CI runners on macos-15 and local Apple Silicon dev
 # machines diverge here.
 copy_from_brew_formula() {
     local formula="$1"
