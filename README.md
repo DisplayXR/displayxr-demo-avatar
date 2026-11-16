@@ -58,7 +58,6 @@ renderer (`model_common/`), specialised into an avatar shell.
 | `N` / `K` | Next animation clip / play-pause |
 | `Ctrl+O` | Open a different model |
 | `Ctrl+T` | Toggle transparent background (desktop see-through) |
-| `T` | Toggle the eye-tracking mode (MANAGED ⇄ MANUAL) |
 | `G` | Toggle the alpha edge-softening post-pass |
 | `P` then `X`/`Y`/`Z` | Arm, then toggle, the per-axis dynamic-recenter pins |
 | `B` | Toggle window decoration — borderless ⇄ title bar for OS move/resize |

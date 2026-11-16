@@ -2407,6 +2407,9 @@ static void RenderThreadFunc(
             // above); clear them on the shared state so they fire exactly once.
             g_inputState.cycleRenderingModeRequested = false;
             g_inputState.absoluteRenderingModeRequested = -1;
+            // T (eye-tracking MANAGED/MANUAL) is a cube-test-app key only: this
+            // demo stays on the runtime default (MANAGED). Clear the shared flag
+            // so it never latches.
             g_inputState.eyeTrackingModeToggleRequested = false;
             if (g_inputState.transparentBgToggleRequested) {
                 g_inputState.transparentBgToggleRequested = false;
@@ -2450,18 +2453,6 @@ static void RenderThreadFunc(
         // lands on inputSnapshot.viewParams.ipdFactor (what the render path reads).
         // Runtime owns current mode via xr->currentModeIndex.
         XrSessionUpdateModeSwitch(*xr, inputSnapshot, perfStats.deltaTime);
-
-        // Handle eye tracking mode toggle (T key)
-        if (inputSnapshot.eyeTrackingModeToggleRequested) {
-            if (xr->pfnRequestEyeTrackingModeEXT && xr->session != XR_NULL_HANDLE) {
-                XrEyeTrackingModeDXR newMode = (xr->activeEyeTrackingMode == XR_EYE_TRACKING_MODE_MANAGED_DXR)
-                    ? XR_EYE_TRACKING_MODE_MANUAL_DXR : XR_EYE_TRACKING_MODE_MANAGED_DXR;
-                XrResult etResult = xr->pfnRequestEyeTrackingModeEXT(xr->session, newMode);
-                LOG_INFO("Eye tracking mode -> %s (%s)",
-                    newMode == XR_EYE_TRACKING_MODE_MANUAL_DXR ? "MANUAL" : "MANAGED",
-                    XR_SUCCEEDED(etResult) ? "OK" : "unsupported");
-            }
-        }
 
         UpdatePerformanceStats(perfStats);
         UpdateCameraMovement(inputSnapshot, perfStats.deltaTime, xr->displayHeightM);
@@ -2645,7 +2636,6 @@ static void RenderThreadFunc(
                 inputSnapshot.fullscreenToggleRequested ||
                 inputSnapshot.cycleRenderingModeRequested ||
                 inputSnapshot.absoluteRenderingModeRequested >= 0 ||
-                inputSnapshot.eyeTrackingModeToggleRequested ||
                 windowW != g_throttlePrevWinW || windowH != g_throttlePrevWinH;
 
             g_throttlePrevWinW = windowW;
@@ -2672,8 +2662,7 @@ static void RenderThreadFunc(
                 if (resetRequested || animateToggle || cycleClip || playPause || bgToggled ||
                     inputSnapshot.teleportRequested || inputSnapshot.fullscreenToggleRequested ||
                     inputSnapshot.cycleRenderingModeRequested ||
-                    inputSnapshot.absoluteRenderingModeRequested >= 0 ||
-                    inputSnapshot.eyeTrackingModeToggleRequested) nInput++;
+                    inputSnapshot.absoluteRenderingModeRequested >= 0) nInput++;
                 if (headMoved) nHead++;
                 if (active) nActive++;
                 if (nowMs - s_dbgT0 >= 2000) {

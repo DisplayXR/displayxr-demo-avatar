@@ -114,7 +114,6 @@ struct InputState {
     bool hudVisible = false;  // Hidden by default; toggle with Tab.
     bool cameraMode = false;
     float nominalViewerZ = 0.5f;
-    bool eyeTrackingModeToggleRequested = false;
     bool loadRequested = false;
     bool teleportRequested = false;
     float teleportMouseX = 0.0f, teleportMouseY = 0.0f; // logical points
@@ -712,13 +711,12 @@ static void OpenLoadDialog() {
             break;
         case 't': case 'T':
             // Ctrl+T toggles transparent background (mirrors the Windows + gauss
-            // demos); plain T stays the eye-tracking-mode toggle.
+            // demos). Plain T is unbound: eye-tracking MANAGED/MANUAL switching
+            // is a cube-test-app key; this demo stays on MANAGED.
             if ([event modifierFlags] & NSEventModifierFlagControl) {
                 bool now = !g_transparentBg.load();
                 g_transparentBg.store(now);
                 LOG_INFO("Transparent background: %s (Ctrl+T)", now ? "ON" : "OFF");
-            } else {
-                g_input.eyeTrackingModeToggleRequested = true;
             }
             break;
         // (model open moved to Cmd+O — see the modifier check above keyDown's switch)
@@ -1019,7 +1017,6 @@ struct AppXrSession {
 
     // Function pointers
     PFN_xrRequestDisplayModeDXR pfnRequestDisplayModeEXT = nullptr;
-    PFN_xrRequestEyeTrackingModeDXR pfnRequestEyeTrackingModeEXT = nullptr;
     PFN_xrRequestDisplayRenderingModeDXR pfnRequestDisplayRenderingModeEXT = nullptr;
     PFN_xrEnumerateDisplayRenderingModesDXR pfnEnumerateDisplayRenderingModesEXT = nullptr;
 
@@ -1265,8 +1262,6 @@ static bool InitializeOpenXR(AppXrSession& xr) {
             LOG_INFO("Display desktop position: (%d, %d)", xr.displayScreenLeft, xr.displayScreenTop);
         }
         xrGetInstanceProcAddr(xr.instance, "xrRequestDisplayModeDXR", (PFN_xrVoidFunction*)&xr.pfnRequestDisplayModeEXT);
-        if (xr.supportedEyeTrackingModes != 0)
-            xrGetInstanceProcAddr(xr.instance, "xrRequestEyeTrackingModeDXR", (PFN_xrVoidFunction*)&xr.pfnRequestEyeTrackingModeEXT);
 
         // Load unified rendering mode function pointers (v7)
         xrGetInstanceProcAddr(xr.instance, "xrRequestDisplayRenderingModeDXR", (PFN_xrVoidFunction*)&xr.pfnRequestDisplayRenderingModeEXT);
@@ -2847,16 +2842,6 @@ int main(int argc, char** argv) {
                 }
             } else {
                 g_input.viewParams.ipdFactor = steady;
-            }
-        }
-
-        // Handle eye tracking mode toggle
-        if (g_input.eyeTrackingModeToggleRequested) {
-            g_input.eyeTrackingModeToggleRequested = false;
-            if (xr.pfnRequestEyeTrackingModeEXT && xr.session != XR_NULL_HANDLE) {
-                XrEyeTrackingModeDXR newMode = (xr.activeEyeTrackingMode == XR_EYE_TRACKING_MODE_MANAGED_DXR)
-                    ? XR_EYE_TRACKING_MODE_MANUAL_DXR : XR_EYE_TRACKING_MODE_MANAGED_DXR;
-                xr.pfnRequestEyeTrackingModeEXT(xr.session, newMode);
             }
         }
 
