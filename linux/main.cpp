@@ -752,11 +752,6 @@ struct AppXrSession {
     uint32_t renderingModeTileRows[8] = {};
     PFN_xrRequestDisplayRenderingModeDXR pfnRequestRenderingMode = nullptr;
 
-    // Eye-tracking mode toggle (T). MANAGED vs MANUAL — see
-    // docs/specs/vendor/eye-tracking-modes.md in displayxr-runtime.
-    PFN_xrRequestEyeTrackingModeDXR pfnRequestEyeTrackingMode = nullptr;
-    XrEyeTrackingModeDXR activeEyeTrackingMode = XR_EYE_TRACKING_MODE_MANAGED_DXR;
-
     // Multi-view atlas capture (I) — XR_DXR_atlas_capture.
     bool hasAtlasCapture = false;
     PFN_xrCaptureAtlasDXR pfnCaptureAtlas = nullptr;
@@ -987,7 +982,6 @@ static void RefreshRenderingModes(AppXrSession& xr, bool logTable);
  *   Esc                   quit                 WM_KEYDOWN VK_ESCAPE
  *   Ctrl+O                open a model         OpenModelDialog
  *   Ctrl+T                transparent/opaque   transparentBgToggleRequested
- *   T                     eye-tracking mode    eyeTrackingModeToggleRequested
  *   V / 0..8              rendering mode       cycle / absolute
  *   N / K                 next clip / play     cycleClip / playPause
  *   Space                 reset the view       resetViewRequested
@@ -1020,7 +1014,7 @@ static void HandleWindowEvent(AppXrSession& xr, const DxrWindowEvent& ev) {
         const bool ctrl = (ev.mods & DxrModCtrl) != 0;
 
         // Ctrl-chords first, so the bare-key handlers below cannot swallow
-        // them (Ctrl+T must not reach the plain-T eye-tracking toggle).
+        // them (Ctrl+T must never fall through to a bare-T binding).
         if (ctrl) {
             switch (sym) {
             case XK_o: case XK_O:
@@ -1092,22 +1086,6 @@ static void HandleWindowEvent(AppXrSession& xr, const DxrWindowEvent& ev) {
                 const bool now = !g_modelRenderer.edgeSoftenEnabled();
                 g_modelRenderer.setEdgeSoftenEnabled(now);
                 LOG_INFO("Edge-soften post-pass: %s (G)", now ? "ON" : "OFF");
-                break;
-            }
-
-            case XK_t: case XK_T: {
-                if (xr.pfnRequestEyeTrackingMode == nullptr || xr.session == XR_NULL_HANDLE) {
-                    LOG_INFO("Eye-tracking mode toggle unavailable (no XR_DXR_display_info entry point)");
-                    break;
-                }
-                const XrEyeTrackingModeDXR want =
-                    (xr.activeEyeTrackingMode == XR_EYE_TRACKING_MODE_MANAGED_DXR)
-                        ? XR_EYE_TRACKING_MODE_MANUAL_DXR : XR_EYE_TRACKING_MODE_MANAGED_DXR;
-                const XrResult r = xr.pfnRequestEyeTrackingMode(xr.session, want);
-                if (XR_SUCCEEDED(r)) xr.activeEyeTrackingMode = want;
-                LOG_INFO("Eye tracking mode -> %s (%s)",
-                         want == XR_EYE_TRACKING_MODE_MANUAL_DXR ? "MANUAL" : "MANAGED",
-                         XR_SUCCEEDED(r) ? "OK" : "unsupported");
                 break;
             }
 
@@ -1918,13 +1896,11 @@ static bool CreateSession(AppXrSession& xr, VkInstance vkInstance, VkPhysicalDev
         LOG_INFO("Runtime named no active rendering mode — assuming the 2-view default");
     }
 
-    // V / 0-8 (mode switching) and T (eye-tracking mode) both live behind
-    // XR_DXR_display_info. Unresolved is not fatal: the key handlers say so.
+    // V / 0-8 (mode switching) lives behind XR_DXR_display_info. Unresolved
+    // is not fatal: the key handler says so.
     if (xr.hasDisplayInfo) {
         xrGetInstanceProcAddr(xr.instance, "xrRequestDisplayRenderingModeDXR",
                               (PFN_xrVoidFunction*)&xr.pfnRequestRenderingMode);
-        xrGetInstanceProcAddr(xr.instance, "xrRequestEyeTrackingModeDXR",
-                              (PFN_xrVoidFunction*)&xr.pfnRequestEyeTrackingMode);
     }
     if (xr.hasAtlasCapture) {
         xrGetInstanceProcAddr(xr.instance, "xrCaptureAtlasDXR",

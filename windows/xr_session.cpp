@@ -250,12 +250,6 @@ bool InitializeOpenXR(XrSessionManager& xr) {
         xrGetInstanceProcAddr(xr.instance, "xrRequestDisplayModeDXR",
             (PFN_xrVoidFunction*)&xr.pfnRequestDisplayModeEXT);
 
-        // Load xrRequestEyeTrackingModeDXR function pointer
-        if (xr.supportedEyeTrackingModes != 0) {
-            xrGetInstanceProcAddr(xr.instance, "xrRequestEyeTrackingModeDXR",
-                (PFN_xrVoidFunction*)&xr.pfnRequestEyeTrackingModeEXT);
-        }
-
         // Load unified rendering mode function pointers (v7)
         xrGetInstanceProcAddr(xr.instance, "xrRequestDisplayRenderingModeDXR",
             (PFN_xrVoidFunction*)&xr.pfnRequestDisplayRenderingModeEXT);
