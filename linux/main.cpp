@@ -1300,6 +1300,7 @@ static bool InitializeOpenXR(AppXrSession& xr, DxrWindowBackend requestedBackend
     bool hasLocal3DZone = false;
     bool hasDisplayZones = false;
     bool hasAtlasCapture = false;
+    bool hasWorkspaceInput = false;
     for (const auto& ext : extensions) {
         if (strcmp(ext.extensionName, XR_KHR_VULKAN_ENABLE_EXTENSION_NAME) == 0) hasVulkan = true;
         if (strcmp(ext.extensionName, XR_DXR_XLIB_WINDOW_BINDING_EXTENSION_NAME) == 0) hasXlibBinding = true;
@@ -1310,6 +1311,7 @@ static bool InitializeOpenXR(AppXrSession& xr, DxrWindowBackend requestedBackend
         if (strcmp(ext.extensionName, XR_DXR_DISPLAY_ZONES_EXTENSION_NAME) == 0) hasDisplayZones = true;
         if (strcmp(ext.extensionName, XR_DXR_ATLAS_CAPTURE_EXTENSION_NAME) == 0) hasAtlasCapture = true;
         if (strcmp(ext.extensionName, XR_DXR_WEAVE_EXTENSION_NAME) == 0) xr.hasWeave = true;
+        if (strcmp(ext.extensionName, XR_DXR_WORKSPACE_CLIENT_INPUT_EXTENSION_NAME) == 0) hasWorkspaceInput = true;
         if (strcmp(ext.extensionName, XR_DXR_CURSOR_DEPTH_EXTENSION_NAME) == 0 &&
             avatar::CursorDepthWanted())
             xr.cursorDepthSpecVersion = ext.extensionVersion;
@@ -1422,6 +1424,14 @@ static bool InitializeOpenXR(AppXrSession& xr, DxrWindowBackend requestedBackend
     if (xr.hasWeave) {
         enabledExtensions.push_back(XR_DXR_WEAVE_EXTENSION_NAME);
     }
+    // XR_DXR_workspace_client_input: inside the DisplayXR workspace the window
+    // is hidden and the service owns the pointer and keyboard; this lets the
+    // window helper drain the app's routed share and deliver it as ordinary
+    // window events (displayxr-common's DxrLinuxWindow, armed by
+    // attach_session). A no-op outside a workspace, so enable it whenever the
+    // runtime advertises it.
+    if (hasWorkspaceInput) enabledExtensions.push_back(XR_DXR_WORKSPACE_CLIENT_INPUT_EXTENSION_NAME);
+    LOG_INFO("XR_DXR_workspace_client_input: %s", hasWorkspaceInput ? "ENABLED" : "NOT FOUND");
 
     XrInstanceCreateInfo createInfo = {XR_TYPE_INSTANCE_CREATE_INFO};
     strncpy(createInfo.applicationInfo.applicationName, "AvatarHandleVkLinux",
