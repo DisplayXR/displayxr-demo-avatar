@@ -213,6 +213,32 @@ bool ModelRenderer::init(VkInstance instance,
     width_ = renderWidth;
     height_ = renderHeight;
 
+    // Qualcomm Adreno on Windows: with the internal targets shrunk to (or near)
+    // the viewport, this renderer's pass hangs the GPU engine whenever a D3D12
+    // application is running beside the app -- Windows logs LiveKernelEvent 141
+    // against the Qualcomm kernel driver and this process loses its VkDevice
+    // (the avatar freezes as a flat image). Measured on an Adreno X2-45 next to
+    // a D3D12 cube: targets of 1.0x, 1.26x and 1.5x the viewport hang on every
+    // launch, 2x and the init-time display-sized targets never do, with or
+    // without MSAA and whether or not a resize happens mid-session. The cause is
+    // inside the driver and is not understood, so keep the init-time targets
+    // there: they still grow with the window, they just never shrink.
+    // DXR_AVATAR_TARGET_SHRINK=1 restores the shrink for an A/B.
+#ifdef _WIN32
+    {
+        VkPhysicalDeviceProperties props = {};
+        vkGetPhysicalDeviceProperties(physDevice_, &props);
+        const char* e = std::getenv("DXR_AVATAR_TARGET_SHRINK");
+        const bool forceShrink = e != nullptr && std::atoi(e) != 0;
+        keepLargeTargets_ = props.vendorID == 0x5143 /* Qualcomm */ && !forceShrink;
+        if (keepLargeTargets_) {
+            std::fprintf(stderr, "ModelRenderer: Qualcomm GPU on Windows - keeping the init-sized "
+                                 "render targets (%ux%u), no shrink (DXR_AVATAR_TARGET_SHRINK=1 reverts)\n",
+                         width_, height_);
+        }
+    }
+#endif
+
     // The frame ring (INV-4.10): N command buffers + fences + the per-view
     // UBO, allocated ONCE. Created first — the IBL bake and every upload below
     // go through its immediate-submit buffer, and createPipeline() points set 0
@@ -2747,7 +2773,7 @@ void ModelRenderer::renderEye(VkImage swapchainImage,
         // windowed peak (not this call's extent) so the small silhouette pass
         // can't trigger a shrink the next tile render would immediately undo.
         const uint32_t wantW = std::max(peakW_, 1u), wantH = std::max(peakH_, 1u);
-        if (wantW * 2 < width_ || wantH * 2 < height_) {
+        if (!keepLargeTargets_ && (wantW * 2 < width_ || wantH * 2 < height_)) {
             if (!ensureTargets(wantW, wantH)) return;
         }
         peakW_ = 0; peakH_ = 0; sizeObsCalls_ = 0;
