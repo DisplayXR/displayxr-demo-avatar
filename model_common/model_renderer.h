@@ -488,6 +488,8 @@ private:
     uint32_t peakW_ = 0, peakH_ = 0;   // high-water viewport this window
     uint32_t sizeObsCalls_ = 0;        // renderEye calls in the current window
     static constexpr uint32_t kSizeObsWindow = 256;  // ~2 s at 2 views + silhouette
+    //! Never shrink the internal targets (Qualcomm Adreno on Windows; see init()).
+    bool keepLargeTargets_ = false;
 
     // ── GPU timing (DXR_AVATAR_GPUTIME=1) ────────────────────────────────
     // Timestamp pairs bracketing each renderEye inside the frame's command
