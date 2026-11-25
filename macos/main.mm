@@ -58,6 +58,7 @@
 
 #include "view_params.h"
 #include "mode_switch.h" // dxr::ModeSwitch — smooth 2D<->3D disparity ramp (inline on macOS)
+#include "mode_table.h"  // dxr::ModeTable + the v27 table-changed event (displayxr-common)
 #include "display3d_view.h"
 #include "camera3d_view.h"
 #include "projection_depth.h"
@@ -1003,6 +1004,10 @@ struct AppXrSession {
     float nominalViewerX = 0, nominalViewerY = 0, nominalViewerZ = 0.5f;
     float recommendedViewScaleX = 0.5f, recommendedViewScaleY = 1.0f;
     uint32_t displayPixelWidth = 0, displayPixelHeight = 0;
+    // display_info v28 (XrDisplayRenderingWorstCaseDXR on XrSystemProperties):
+    // the largest atlas / per-view rect any mode of any claimed screen can ask
+    // for, fixed for the instance. All zero on an older runtime.
+    XrDisplayRenderingWorstCaseDXR renderingWorstCase = {};
     // 3D-panel top-left in top-down virtual-desktop coordinates, origin at the
     // primary screen's top-left (XrDisplayDesktopPositionDXR, display_info v16,
     // runtime#715). (0,0) = primary/unknown (older runtimes leave the zero-init).
@@ -1055,6 +1060,8 @@ struct AppXrSession {
     // (pre-v13 runtime, or the enumerate failed) — the caller then keeps its
     // own default rather than adopting a number it never got.
     uint32_t activeRenderingMode = UINT32_MAX;
+    //! The full table the arrays above are filled from (RefreshRenderingModes).
+    dxr::ModeTable modeTable;
 
     // Max views the runtime may return from xrLocateViews, taken from
     // xrEnumerateViewConfigurationViews at session init. Some runtimes (e.g.
@@ -1245,8 +1252,18 @@ static bool InitializeOpenXR(AppXrSession& xr) {
         // chain entry and (0,0) = primary keeps the old placement.
         XrDisplayDesktopPositionDXR dp = {};
         dp.type = XR_TYPE_DISPLAY_DESKTOP_POSITION_DXR;
-        di.next = &dp; dp.next = &ec; sp.next = &di;
+        // display_info v28: the instance's worst case, which the atlas
+        // swapchain is sized from. An older runtime leaves it zero.
+        XrDisplayRenderingWorstCaseDXR worstCase = {};
+        worstCase.type = XR_TYPE_DISPLAY_RENDERING_WORST_CASE_DXR;
+        di.next = &dp; dp.next = &ec; ec.next = &worstCase; sp.next = &di;
         if (XR_SUCCEEDED(xrGetSystemProperties(xr.instance, xr.systemId, &sp))) {
+            xr.renderingWorstCase = worstCase;
+            xr.renderingWorstCase.next = nullptr;
+            LOG_INFO("Rendering worst case (display_info v28): atlas %ux%u, view %ux%u, %u views%s",
+                     worstCase.maxAtlasWidthPixels, worstCase.maxAtlasHeightPixels,
+                     worstCase.maxViewWidthPixels, worstCase.maxViewHeightPixels, worstCase.maxViewCount,
+                     worstCase.maxAtlasWidthPixels == 0 ? " (none stated: older runtime)" : "");
             xr.recommendedViewScaleX = di.recommendedViewScaleX;
             xr.recommendedViewScaleY = di.recommendedViewScaleY;
             xr.displayWidthM = di.displaySizeMeters.width;
@@ -1398,6 +1415,74 @@ static bool CreateVulkanDevice(VkPhysicalDevice pd, uint32_t qfi,
     return true;
 }
 
+/*!
+ * Read the session's rendering-mode table into the renderingMode* arrays (each
+ * mode in the slot its modeIndex names). Called once after xrCreateSession
+ * (`initial`: also records the mode the runtime reports active, display_info
+ * v13) and again on XrEventDataRenderingModeTableChangedDXR (display_info v27,
+ * runtime ADR-066 C1): a live 3D-mode switch remaps slot 1 to another entry —
+ * view count, tiles, view scale — while the active index stays put. The frame
+ * loop reads these arrays every frame, so refreshing them is all the tiling
+ * needs. The swapchain is NOT recreated: it is sized from the v28 worst case; a
+ * table that no longer fits it is logged once.
+ */
+static bool RefreshRenderingModes(AppXrSession& xr, bool initial) {
+    if (xr.pfnEnumerateDisplayRenderingModesEXT == nullptr || xr.session == XR_NULL_HANDLE) return false;
+    const bool changed = xr.modeTable.refresh(xr.pfnEnumerateDisplayRenderingModesEXT, xr.session);
+    if (!xr.modeTable.lastRefreshOk()) {
+        LOG_WARN("xrEnumerateDisplayRenderingModesDXR failed; keeping the previous mode table");
+        return false;
+    }
+    if (xr.modeTable.empty()) return false;
+    for (uint32_t i = 0; i < 8; i++) {
+        xr.renderingModeNames[i][0] = '\0';
+        xr.renderingModeViewCounts[i] = 0;
+        xr.renderingModeScaleX[i] = xr.renderingModeScaleY[i] = 0.0f;
+        xr.renderingModeDisplay3D[i] = false;
+        xr.renderingModeTileColumns[i] = xr.renderingModeTileRows[i] = 0;
+    }
+    uint32_t count = 0;
+    LOG_INFO("Display rendering modes (%u):", (uint32_t)xr.modeTable.size());
+    for (const XrDisplayRenderingModeInfoDXR& m : xr.modeTable.modes()) {
+        LOG_INFO("  [%u] %s (views=%u, scale=%.2fx%.2f, tiles=%ux%u, 3D=%d%s)", m.modeIndex, m.modeName,
+                 m.viewCount, m.viewScaleX, m.viewScaleY, m.tileColumns ? m.tileColumns : 1u,
+                 m.tileRows ? m.tileRows : 1u, m.hardwareDisplay3D, m.isActive == XR_TRUE ? ", ACTIVE" : "");
+        if (m.modeIndex >= 8) continue; // past the arrays; kept in modeTable only
+        const uint32_t s = m.modeIndex;
+        strncpy(xr.renderingModeNames[s], m.modeName, XR_MAX_SYSTEM_NAME_SIZE - 1);
+        xr.renderingModeNames[s][XR_MAX_SYSTEM_NAME_SIZE - 1] = '\0';
+        xr.renderingModeViewCounts[s] = m.viewCount;
+        xr.renderingModeScaleX[s] = m.viewScaleX;
+        xr.renderingModeScaleY[s] = m.viewScaleY;
+        xr.renderingModeDisplay3D[s] = (m.hardwareDisplay3D == XR_TRUE);
+        xr.renderingModeTileColumns[s] = m.tileColumns ? m.tileColumns : 1;
+        xr.renderingModeTileRows[s] = m.tileRows ? m.tileRows : 1;
+        // display_info v13: the runtime names the mode that is already active
+        // for this session. Read it instead of assuming — the panel may have
+        // booted into any mode (sim_display's START_3D, a workspace
+        // controller's choice on hardware).
+        if (initial && m.isActive == XR_TRUE) xr.activeRenderingMode = s;
+        if (s + 1 > count) count = s + 1;
+    }
+    xr.renderingModeCount = count;
+    if (xr.swapchain.swapchain != XR_NULL_HANDLE &&
+        !xr.modeTable.fits(xr.displayPixelWidth, xr.displayPixelHeight, xr.swapchain.width, xr.swapchain.height)) {
+        static bool s_warned = false;
+        if (!s_warned) {
+            s_warned = true;
+            uint32_t nw = 0, nh = 0;
+            xr.modeTable.worstCaseAtlas(xr.displayPixelWidth, xr.displayPixelHeight, false, &nw, &nh);
+            LOG_WARN("Rendering mode table needs %ux%u full-screen, larger than the %ux%u swapchain; "
+                     "tiles are clamped to the swapchain (%s)",
+                     nw, nh, xr.swapchain.width, xr.swapchain.height,
+                     xr.renderingWorstCase.maxAtlasWidthPixels == 0
+                         ? "the runtime states no display_info v28 worst case"
+                         : "beyond the runtime's display_info v28 worst case");
+        }
+    }
+    return changed;
+}
+
 static bool CreateSession(AppXrSession& xr, VkInstance vkInstance, VkPhysicalDevice pd,
     VkDevice dev, uint32_t qfi) {
     XrGraphicsBindingVulkanKHR vkBinding = {XR_TYPE_GRAPHICS_BINDING_VULKAN_KHR};
@@ -1498,44 +1583,7 @@ static bool CreateSession(AppXrSession& xr, VkInstance vkInstance, VkPhysicalDev
     }
 
     // Enumerate available rendering modes and store names
-    if (xr.pfnEnumerateDisplayRenderingModesEXT && xr.session != XR_NULL_HANDLE) {
-        uint32_t modeCount = 0;
-        XrResult enumRes = xr.pfnEnumerateDisplayRenderingModesEXT(xr.session, 0, &modeCount, nullptr);
-        if (XR_SUCCEEDED(enumRes) && modeCount > 0) {
-            std::vector<XrDisplayRenderingModeInfoDXR> modes(modeCount);
-            for (uint32_t i = 0; i < modeCount; i++) {
-                modes[i].type = XR_TYPE_DISPLAY_RENDERING_MODE_INFO_DXR;
-                modes[i].next = nullptr;
-            }
-            enumRes = xr.pfnEnumerateDisplayRenderingModesEXT(xr.session, modeCount, &modeCount, modes.data());
-            if (XR_SUCCEEDED(enumRes)) {
-                xr.renderingModeCount = modeCount > 8 ? 8 : modeCount;
-                LOG_INFO("Display rendering modes (%u):", modeCount);
-                for (uint32_t i = 0; i < xr.renderingModeCount; i++) {
-                    strncpy(xr.renderingModeNames[i], modes[i].modeName, XR_MAX_SYSTEM_NAME_SIZE - 1);
-                    xr.renderingModeNames[i][XR_MAX_SYSTEM_NAME_SIZE - 1] = '\0';
-                    xr.renderingModeViewCounts[i] = modes[i].viewCount;
-                    xr.renderingModeScaleX[i] = modes[i].viewScaleX;
-                    xr.renderingModeScaleY[i] = modes[i].viewScaleY;
-                    xr.renderingModeDisplay3D[i] = (modes[i].hardwareDisplay3D == XR_TRUE);
-                    xr.renderingModeTileColumns[i] = modes[i].tileColumns ? modes[i].tileColumns : 1;
-                    xr.renderingModeTileRows[i] = modes[i].tileRows ? modes[i].tileRows : 1;
-                    // display_info v13: the runtime names the mode that is
-                    // already active for this session. Read it instead of
-                    // assuming — the panel may have booted into any mode
-                    // (SIM_DISPLAY_OUTPUT / SIM_DISPLAY_FORCE_MODE on
-                    // sim_display, a workspace controller's choice on hardware).
-                    if (modes[i].isActive == XR_TRUE) xr.activeRenderingMode = i;
-                    LOG_INFO("  [%u] %s (views=%u, scale=%.2fx%.2f, tiles=%ux%u, 3D=%d%s)",
-                        modes[i].modeIndex, modes[i].modeName, modes[i].viewCount,
-                        modes[i].viewScaleX, modes[i].viewScaleY,
-                        xr.renderingModeTileColumns[i], xr.renderingModeTileRows[i],
-                        modes[i].hardwareDisplay3D,
-                        modes[i].isActive == XR_TRUE ? ", ACTIVE" : "");
-                }
-            }
-        }
-    }
+    RefreshRenderingModes(xr, /*initial=*/true);
 
     return true;
 }
@@ -1610,6 +1658,15 @@ static bool CreateSwapchains(AppXrSession& xr) {
             if (maxAtlasW > w) w = maxAtlasW;
             if (maxAtlasH > h) h = maxAtlasH;
         }
+    }
+    // display_info v28: never smaller than the runtime's stated worst case, so a
+    // live 3D-mode switch (or a move to another screen) always fits without
+    // recreating the swapchain. All zero on an older runtime: the size above stands.
+    {
+        const uint32_t cw = w, ch = h;
+        dxr::SizeFromWorstCase(xr.renderingWorstCase, false, cw, ch, &w, &h);
+        LOG_INFO("Swapchain sizing: computed %ux%u, runtime worst case %ux%u -> %ux%u", cw, ch,
+                 xr.renderingWorstCase.maxAtlasWidthPixels, xr.renderingWorstCase.maxAtlasHeightPixels, w, h);
     }
 
     XrSwapchainCreateInfo sci = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
@@ -1947,6 +2004,31 @@ static void PollEvents(AppXrSession& xr) {
                 LOG_INFO("Rendering mode changed: %u -> %u (%s)",
                     rmc->previousModeIndex, rmc->currentModeIndex,
                     xr.renderingModeNames[rmc->currentModeIndex]);
+            }
+        } else if (event.type == (XrStructureType)XR_TYPE_EVENT_DATA_RENDERING_MODE_TABLE_CHANGED_DXR) {
+            // display_info v27: the 3D mode was switched live — the table
+            // changed, the index did not. Re-read it; the per-frame view count,
+            // tile layout, per-view render size and HUD mode name follow from
+            // the arrays.
+            dxr::RenderingModeTableChange change;
+            if (dxr::DecodeRenderingModeTableChanged((const XrEventDataBaseHeader*)&event, &change)) {
+                LOG_INFO("Rendering mode table changed (active mode %u): re-reading it",
+                         change.activeModeIndex);
+                RefreshRenderingModes(xr, /*initial=*/false);
+                g_input.renderingModeCount = xr.renderingModeCount;
+                if (change.activeModeIndex < xr.renderingModeCount) {
+                    g_input.currentRenderingMode = change.activeModeIndex;
+                    g_msLastMode = change.activeModeIndex;
+                }
+                UpdateTopBarButtonTitles(xr);
+                if (change.recreateSwapchains) {
+                    static bool s_recreateWarned = false;
+                    if (!s_recreateWarned) {
+                        s_recreateWarned = true;
+                        LOG_WARN("Rendering mode table change asks for swapchain recreation; not "
+                                 "implemented — keeping the swapchain (the runtime resamples)");
+                    }
+                }
             }
         } else if (event.type == (XrStructureType)XR_TYPE_EVENT_DATA_MCP_TOOL_CALL_DXR) {
             // An agent invoked one of our XR_DXR_mcp_tools tools (#22).
@@ -2881,9 +2963,12 @@ int main(int argc, char** argv) {
                             ? xr.renderingModeViewCounts[g_input.currentRenderingMode] : 2u;
                         if (modeViewCount < 1) modeViewCount = 1;
                         const uint32_t wantedViewCount = modeViewCount;
-                        bool display3D = (xr.renderingModeCount > 0)
-                            ? xr.renderingModeDisplay3D[g_input.currentRenderingMode] : true;
-                        bool monoMode = !display3D;
+                        // Mono = the mode renders ONE view. Decided from the
+                        // view count, never the hardware flag: a 2-view mode may
+                        // leave the hardware flat (anaglyph on an ordinary
+                        // screen), and the 3D slot may be a one-view "same as
+                        // 2D" entry (display_info v27).
+                        bool monoMode = (xr.renderingModeCount > 0) && modeViewCount <= 1;
                         uint32_t tileColumns = (xr.renderingModeCount > 0 && xr.renderingModeTileColumns[g_input.currentRenderingMode] > 0)
                             ? xr.renderingModeTileColumns[g_input.currentRenderingMode]
                             : (monoMode ? 1u : 2u);
@@ -3012,13 +3097,22 @@ int main(int argc, char** argv) {
                         // mode's view_scale and the live window size. Atlas dims
                         // (used for the projection viewport per eye and for the 'I'
                         // capture region) follow as cols × renderW × rows × renderH.
-                        // The swapchain was sized at creation time to fit the
-                        // largest atlas across all advertised modes, so no clamp
-                        // is needed here.
+                        // The swapchain was sized at creation time from the
+                        // runtime's v28 worst case; the clamp below only fires
+                        // against an older runtime whose live 3D-mode switch
+                        // brought in an entry the start-up table did not show.
                         float scaleX = (xr.renderingModeCount > 0 && g_input.currentRenderingMode < xr.renderingModeCount) ? xr.renderingModeScaleX[g_input.currentRenderingMode] : 1.0f;
                         float scaleY = (xr.renderingModeCount > 0 && g_input.currentRenderingMode < xr.renderingModeCount) ? xr.renderingModeScaleY[g_input.currentRenderingMode] : 1.0f;
                         uint32_t renderW = (uint32_t)((double)g_windowW * scaleX);
                         uint32_t renderH = (uint32_t)((double)g_windowH * scaleY);
+                        {
+                            const uint32_t aCols = monoMode ? 1u : tileColumns;
+                            const uint32_t aRows = monoMode ? 1u : ((uint32_t)eyeCount + aCols - 1) / aCols;
+                            if (xr.swapchain.width > 0 && aCols * renderW > xr.swapchain.width)
+                                renderW = xr.swapchain.width / aCols;
+                            if (xr.swapchain.height > 0 && aRows * renderH > xr.swapchain.height)
+                                renderH = xr.swapchain.height / aRows;
+                        }
                         if (renderW == 0) renderW = 1;
                         if (renderH == 0) renderH = 1;
                         g_renderW = renderW; g_renderH = renderH;

@@ -141,6 +141,7 @@
 #include "model_renderer.h"
 #include "recenter_control.h"  // dynamic-recenter per-axis pins (DXR_RECENTER_PIN on Linux)
 #include "mode_switch.h"       // dxr::ModeSwitch — smooth 2D<->3D disparity ramp (V / 0-8)
+#include "mode_table.h"        // dxr::ModeTable + the v27 table-changed event (displayxr-common)
 #include "model_loader.h"
 #include "model_vulkan_utils.h" // modelCreateBuffer / ModelBuffer (bubble staging)
 
@@ -750,6 +751,18 @@ struct AppXrSession {
     // four tiles, a 2D mode one).
     uint32_t renderingModeTileColumns[8] = {};
     uint32_t renderingModeTileRows[8] = {};
+    // Per-mode view scale (fraction of the window per view). The full-tile path
+    // sizes each eye tile window x the ACTIVE mode's scale, so a live 3D-mode
+    // switch (a one-view "same as 2D" slot 1 vs a half-width SBS) resizes the
+    // tiles. 0 = unknown: fall back to display_info's recommended scale.
+    float renderingModeScaleX[8] = {};
+    float renderingModeScaleY[8] = {};
+    //! The full table the arrays above are filled from (RefreshRenderingModes).
+    dxr::ModeTable modeTable;
+    //! display_info v28 (XrDisplayRenderingWorstCaseDXR on XrSystemProperties):
+    //! the largest atlas / per-view rect any mode of any claimed screen can ask
+    //! for, fixed for the instance. All zero on an older runtime.
+    XrDisplayRenderingWorstCaseDXR renderingWorstCase = {};
     PFN_xrRequestDisplayRenderingModeDXR pfnRequestRenderingMode = nullptr;
 
     // Multi-view atlas capture (I) — XR_DXR_atlas_capture.
@@ -1487,9 +1500,20 @@ static bool InitializeOpenXR(AppXrSession& xr, DxrWindowBackend requestedBackend
         XrDisplayInfoDXR displayInfo = {XR_TYPE_DISPLAY_INFO_DXR};
         XrDisplayDesktopPositionDXR desktopPos = {};
         desktopPos.type = XR_TYPE_DISPLAY_DESKTOP_POSITION_DXR;
+        // display_info v28: the instance's worst case, which the atlas and zone
+        // swapchains are sized from. An older runtime leaves it zero.
+        XrDisplayRenderingWorstCaseDXR worstCase = {};
+        worstCase.type = XR_TYPE_DISPLAY_RENDERING_WORST_CASE_DXR;
+        desktopPos.next = &worstCase;
         displayInfo.next = &desktopPos;
         sysProps.next = &displayInfo;
         if (XR_SUCCEEDED(xrGetSystemProperties(xr.instance, xr.systemId, &sysProps))) {
+            xr.renderingWorstCase = worstCase;
+            xr.renderingWorstCase.next = nullptr;
+            LOG_INFO("Rendering worst case (display_info v28): atlas %ux%u, view %ux%u, %u views%s",
+                     worstCase.maxAtlasWidthPixels, worstCase.maxAtlasHeightPixels,
+                     worstCase.maxViewWidthPixels, worstCase.maxViewHeightPixels, worstCase.maxViewCount,
+                     worstCase.maxAtlasWidthPixels == 0 ? " (none stated: older runtime)" : "");
             xr.displayScreenLeft = desktopPos.left;
             xr.displayScreenTop = desktopPos.top;
             xr.displayWidthM = displayInfo.displaySizeMeters.width;
@@ -1676,37 +1700,55 @@ static bool CreateVulkanDevice(VkPhysicalDevice physDevice, uint32_t queueFamily
  */
 static void RefreshRenderingModes(AppXrSession& xr, bool logTable) {
     if (xr.pfnEnumerateRenderingModes == nullptr || xr.session == XR_NULL_HANDLE) return;
-    uint32_t modeCount = 0;
-    if (XR_FAILED(xr.pfnEnumerateRenderingModes(xr.session, 0, &modeCount, nullptr)) ||
-        modeCount == 0) {
-        return;
+    // dxr::ModeTable (displayxr-common): two-call enumerate, entries kept with
+    // the modeIndex the runtime reported. Each entry lands in the slot its
+    // modeIndex names, never its array position.
+    xr.modeTable.refresh(xr.pfnEnumerateRenderingModes, xr.session);
+    if (!xr.modeTable.lastRefreshOk() || xr.modeTable.empty()) return;
+    for (uint32_t i = 0; i < 8; i++) {
+        xr.renderingModeViewCounts[i] = 0;
+        xr.renderingModeIsRequestable[i] = false;
+        xr.renderingModeDisplay3D[i] = false;
+        xr.renderingModeTileColumns[i] = xr.renderingModeTileRows[i] = 0;
+        xr.renderingModeScaleX[i] = xr.renderingModeScaleY[i] = 0.0f;
     }
-    std::vector<XrDisplayRenderingModeInfoDXR> modes(modeCount);
-    for (uint32_t i = 0; i < modeCount; i++) {
-        modes[i].type = XR_TYPE_DISPLAY_RENDERING_MODE_INFO_DXR;
-        modes[i].next = nullptr;
-    }
-    if (XR_FAILED(xr.pfnEnumerateRenderingModes(xr.session, modeCount, &modeCount, modes.data()))) {
-        return;
-    }
-    xr.renderingModeCount = modeCount > 8 ? 8 : modeCount;
+    uint32_t count = 0;
     xr.activeRenderingMode = UINT32_MAX;
-    if (logTable) LOG_INFO("Display rendering modes (%u):", modeCount);
-    for (uint32_t i = 0; i < xr.renderingModeCount; i++) {
-        xr.renderingModeViewCounts[i] = modes[i].viewCount;
-        xr.renderingModeIsRequestable[i] = (modes[i].isRequestable == XR_TRUE);
-        xr.renderingModeDisplay3D[i] = (modes[i].hardwareDisplay3D == XR_TRUE);
-        xr.renderingModeTileColumns[i] = modes[i].tileColumns ? modes[i].tileColumns : 1u;
-        xr.renderingModeTileRows[i] = modes[i].tileRows ? modes[i].tileRows : 1u;
-        if (modes[i].isActive == XR_TRUE) xr.activeRenderingMode = i;
+    if (logTable) LOG_INFO("Display rendering modes (%u):", (uint32_t)xr.modeTable.size());
+    for (const XrDisplayRenderingModeInfoDXR& m : xr.modeTable.modes()) {
         if (logTable) {
-            LOG_INFO("  [%u] %s (views=%u, tiles=%ux%u, 3D=%d%s%s)",
-                     modes[i].modeIndex, modes[i].modeName, modes[i].viewCount,
-                     modes[i].tileColumns ? modes[i].tileColumns : 1u,
-                     modes[i].tileRows ? modes[i].tileRows : 1u,
-                     modes[i].hardwareDisplay3D,
-                     modes[i].isActive == XR_TRUE ? ", ACTIVE" : "",
-                     modes[i].isRequestable == XR_TRUE ? "" : ", LOCKED");
+            LOG_INFO("  [%u] %s (views=%u, scale=%.2fx%.2f, tiles=%ux%u, 3D=%d%s%s)",
+                     m.modeIndex, m.modeName, m.viewCount, m.viewScaleX, m.viewScaleY,
+                     m.tileColumns ? m.tileColumns : 1u, m.tileRows ? m.tileRows : 1u,
+                     m.hardwareDisplay3D, m.isActive == XR_TRUE ? ", ACTIVE" : "",
+                     m.isRequestable == XR_TRUE ? "" : ", LOCKED");
+        }
+        if (m.modeIndex >= 8) continue; // past the arrays; kept in modeTable only
+        const uint32_t i = m.modeIndex;
+        xr.renderingModeViewCounts[i] = m.viewCount;
+        xr.renderingModeIsRequestable[i] = (m.isRequestable == XR_TRUE);
+        xr.renderingModeDisplay3D[i] = (m.hardwareDisplay3D == XR_TRUE);
+        xr.renderingModeTileColumns[i] = m.tileColumns ? m.tileColumns : 1u;
+        xr.renderingModeTileRows[i] = m.tileRows ? m.tileRows : 1u;
+        xr.renderingModeScaleX[i] = m.viewScaleX;
+        xr.renderingModeScaleY[i] = m.viewScaleY;
+        if (m.isActive == XR_TRUE) xr.activeRenderingMode = i;
+        if (i + 1 > count) count = i + 1;
+    }
+    xr.renderingModeCount = count;
+    if (xr.swapchain.swapchain != XR_NULL_HANDLE &&
+        !xr.modeTable.fits(xr.displayPixelWidth, xr.displayPixelHeight, xr.swapchain.width, xr.swapchain.height)) {
+        static bool s_warned = false;
+        if (!s_warned) {
+            s_warned = true;
+            uint32_t nw = 0, nh = 0;
+            xr.modeTable.worstCaseAtlas(xr.displayPixelWidth, xr.displayPixelHeight, false, &nw, &nh);
+            LOG_WARN("Rendering mode table needs %ux%u full-screen, larger than the %ux%u swapchain; "
+                     "tiles are clamped to the swapchain (%s)",
+                     nw, nh, xr.swapchain.width, xr.swapchain.height,
+                     xr.renderingWorstCase.maxAtlasWidthPixels == 0
+                         ? "the runtime states no display_info v28 worst case"
+                         : "beyond the runtime's display_info v28 worst case");
         }
     }
 }
@@ -2000,6 +2042,16 @@ static bool CreateSwapchain(AppXrSession& xr) {
     const auto& view = xr.configViews[0];
     uint32_t scWidth = view.recommendedImageRectWidth * 2; // stereo SBS atlas
     uint32_t scHeight = view.recommendedImageRectHeight;
+    // display_info v28: never smaller than the runtime's stated worst case, so a
+    // live 3D-mode switch (or a move to another screen) always fits without
+    // recreating the swapchain. All zero on an older runtime: the size above stands.
+    {
+        const uint32_t cw = scWidth, ch = scHeight;
+        dxr::SizeFromWorstCase(xr.renderingWorstCase, false, cw, ch, &scWidth, &scHeight);
+        LOG_INFO("Swapchain sizing: computed %ux%u, runtime worst case %ux%u -> %ux%u", cw, ch,
+                 xr.renderingWorstCase.maxAtlasWidthPixels, xr.renderingWorstCase.maxAtlasHeightPixels,
+                 scWidth, scHeight);
+    }
 
     XrSwapchainCreateInfo swapchainInfo = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
     swapchainInfo.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT |
@@ -2067,6 +2119,28 @@ static bool PollEvents(AppXrSession& xr) {
             // above refreshes the per-mode table and the isRequestable gate.
             if (e->currentModeIndex < xr.renderingModeCount)
                 xr.activeRenderingMode = e->currentModeIndex;
+            break;
+        }
+        case (XrStructureType)XR_TYPE_EVENT_DATA_RENDERING_MODE_TABLE_CHANGED_DXR: {
+            // display_info v27: the 3D mode was switched live — the table
+            // changed, the index did not. Re-read it; the submitted view count,
+            // tile grid and per-eye tile size follow from the arrays.
+            dxr::RenderingModeTableChange change;
+            if (dxr::DecodeRenderingModeTableChanged((const XrEventDataBaseHeader*)&event, &change)) {
+                LOG_INFO("Rendering mode table changed (active mode %u): re-reading it",
+                         change.activeModeIndex);
+                RefreshRenderingModes(xr, /*logTable=*/true);
+                if (change.activeModeIndex < xr.renderingModeCount)
+                    xr.activeRenderingMode = change.activeModeIndex;
+                if (change.recreateSwapchains) {
+                    static bool s_recreateWarned = false;
+                    if (!s_recreateWarned) {
+                        s_recreateWarned = true;
+                        LOG_WARN("Rendering mode table change asks for swapchain recreation; not "
+                                 "implemented — keeping the swapchain (the runtime resamples)");
+                    }
+                }
+            }
             break;
         }
         default: break;
@@ -2498,6 +2572,10 @@ static bool TryActivateTigerZone(AppXrSession& xr) {
     const uint32_t dispH = xr.displayPixelHeight ? xr.displayPixelHeight : xr.swapchain.height;
     g_zoneSwW = maxCols * dispW;
     g_zoneSwH = maxRows * ((dispH * 3u) / 4u);
+    // display_info v28: never smaller than the runtime's stated worst case (the
+    // table above shows only the two current slots; a live 3D-mode switch can
+    // bring in a larger entry). All zero on an older runtime.
+    dxr::SizeFromWorstCase(xr.renderingWorstCase, false, g_zoneSwW, g_zoneSwH, &g_zoneSwW, &g_zoneSwH);
     XrSwapchainCreateInfo sci = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
     sci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT |
                      XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
@@ -3216,9 +3294,19 @@ int main(int argc, char** argv) {
                         uint32_t winW = 0, winH = 0;
                         if (xr.usingAppWindow) g_window.current_size(&winW, &winH);
                         uint32_t eyeW, eyeH;
+                        // The ACTIVE mode's view scale (it follows a live
+                        // 3D-mode switch); display_info's recommended scale
+                        // when the runtime named no mode.
+                        float sx = xr.viewScaleX, sy = xr.viewScaleY;
+                        if (xr.activeRenderingMode < xr.renderingModeCount &&
+                            xr.renderingModeScaleX[xr.activeRenderingMode] > 0.0f &&
+                            xr.renderingModeScaleY[xr.activeRenderingMode] > 0.0f) {
+                            sx = xr.renderingModeScaleX[xr.activeRenderingMode];
+                            sy = xr.renderingModeScaleY[xr.activeRenderingMode];
+                        }
                         if (winW > 0 && winH > 0) {
-                            eyeW = (uint32_t)(winW * xr.viewScaleX);
-                            eyeH = (uint32_t)(winH * xr.viewScaleY);
+                            eyeW = (uint32_t)(winW * sx);
+                            eyeH = (uint32_t)(winH * sy);
                         } else {
                             eyeW = xr.viewWidth;   // fallback: recommended (fullscreen envelope)
                             eyeH = xr.viewHeight;

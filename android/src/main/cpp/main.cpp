@@ -49,6 +49,7 @@
 // CMakeLists.txt fetches it), dxr_submit_views.h is this repo's <repo>/common.
 #include "dxr_view_config.h"
 #include "dxr_submit_views.h"
+#include "mode_table.h"  // v27 table-changed event + v28 worst case (displayxr-common)
 
 #include <atomic>
 #include <vector>
@@ -161,6 +162,11 @@ uint32_t g_rmode_rows[8] = {}; // tile rows (1)
 // swapchain is sized to this and never reallocated on a mode switch / rotation.
 uint32_t g_atlas_w = 0;
 uint32_t g_atlas_h = 0;
+// display_info v28 (XrDisplayRenderingWorstCaseDXR on XrSystemProperties): the
+// largest atlas any mode of any claimed screen can ask for, fixed for the
+// instance. The atlas is never smaller than it, so a live 3D-mode switch (the
+// table-changed event, v27) always fits. All zero on an older runtime.
+XrDisplayRenderingWorstCaseDXR g_render_worst_case = {};
 
 // #568 speech bubble — a rounded panel + greeting, rasterized like the button
 // bar but submitted as an XR_DXR_local_3d_zone Local2D layer in the top-25% 2D
@@ -1271,17 +1277,16 @@ push_window_geometry()
 // advertises. Best-effort: logs each mode so we can see (on this device) whether
 // modes differ in view count/tiling (→ render-loop work) or are a pure DP-side
 // 2D/3D toggle (→ app just requests them). Never fails bring-up.
-bool
-enumerate_rendering_modes()
+//
+// Also called again on XrEventDataRenderingModeTableChangedDXR (display_info
+// v27, `refresh`): a live 3D-mode switch remaps slot 1 to another entry (view
+// count, tiles, view scale) while the active index stays put. The per-mode
+// arrays are rewritten; the atlas size is NOT (the swapchain exists by then and
+// is never reallocated: it is sized from the v28 worst case, and the per-frame
+// tile is clamped to it).
+static bool
+read_rendering_modes(bool refresh)
 {
-	xrGetInstanceProcAddr(g_instance, "xrEnumerateDisplayRenderingModesDXR",
-	                      (PFN_xrVoidFunction *)&g_pfnEnumModes);
-	xrGetInstanceProcAddr(g_instance, "xrRequestDisplayRenderingModeDXR",
-	                      (PFN_xrVoidFunction *)&g_pfnReqMode);
-	if (g_pfnEnumModes == nullptr || g_pfnReqMode == nullptr) {
-		LOGI("Display rendering-mode ext entry points not resolved — mode switch disabled");
-		return true;
-	}
 	uint32_t count = 0;
 	XrResult res = g_pfnEnumModes(g_session, 0, &count, nullptr);
 	if (res != XR_SUCCESS || count == 0) {
@@ -1298,9 +1303,17 @@ enumerate_rendering_modes()
 		LOGI("xrEnumerateDisplayRenderingModesDXR (fill) res=%d", (int)res);
 		return true;
 	}
-	g_rmode_count = count;
+	for (uint32_t i = 0; i < 8; ++i) {
+		g_rmode_names[i][0] = '\0';
+		g_rmode_scale_x[i] = g_rmode_scale_y[i] = 0.0f;
+		g_rmode_vc[i] = g_rmode_cols[i] = g_rmode_rows[i] = 0;
+	}
+	g_rmode_count = 0;
 	for (uint32_t i = 0; i < count; ++i) {
 		const auto &m = modes[i];
+		// Slots are named by modeIndex; the count is one past the highest
+		// slot, so a `want < g_rmode_count` check means "that slot exists".
+		if (m.modeIndex < 8 && m.modeIndex + 1 > g_rmode_count) g_rmode_count = m.modeIndex + 1;
 		if (m.modeIndex < 8) {
 			std::strncpy(g_rmode_names[m.modeIndex], m.modeName,
 			             sizeof(g_rmode_names[0]) - 1);
@@ -1316,8 +1329,8 @@ enumerate_rendering_modes()
 			// bounds this mode's atlas; take the per-axis max across modes.
 			const uint32_t edge =
 			    m.viewWidthPixels > m.viewHeightPixels ? m.viewWidthPixels : m.viewHeightPixels;
-			if (cols * edge > g_atlas_w) g_atlas_w = cols * edge;
-			if (rows * edge > g_atlas_h) g_atlas_h = rows * edge;
+			if (!refresh && cols * edge > g_atlas_w) g_atlas_w = cols * edge;
+			if (!refresh && rows * edge > g_atlas_h) g_atlas_h = rows * edge;
 		}
 		if (m.isActive) {
 			g_rmode_current.store(m.modeIndex, std::memory_order_relaxed);
@@ -1333,6 +1346,36 @@ enumerate_rendering_modes()
 	     g_rmode_count, g_rmode_current.load(std::memory_order_relaxed),
 	     (int)g_rmode_requestable);
 	return true;
+}
+
+bool
+enumerate_rendering_modes()
+{
+	xrGetInstanceProcAddr(g_instance, "xrEnumerateDisplayRenderingModesDXR",
+	                      (PFN_xrVoidFunction *)&g_pfnEnumModes);
+	xrGetInstanceProcAddr(g_instance, "xrRequestDisplayRenderingModeDXR",
+	                      (PFN_xrVoidFunction *)&g_pfnReqMode);
+	// display_info v28: the instance's worst case (create_swapchains sizes the
+	// atlas no smaller). An older runtime ignores the struct: all zero.
+	{
+		XrSystemProperties sp = {XR_TYPE_SYSTEM_PROPERTIES};
+		XrDisplayRenderingWorstCaseDXR wc = {};
+		wc.type = XR_TYPE_DISPLAY_RENDERING_WORST_CASE_DXR;
+		sp.next = &wc;
+		if (XR_SUCCEEDED(xrGetSystemProperties(g_instance, g_system_id, &sp))) {
+			g_render_worst_case = wc;
+			g_render_worst_case.next = nullptr;
+		}
+		LOGI("Rendering worst case (display_info v28): atlas %ux%u, view %ux%u, %u views%s",
+		     wc.maxAtlasWidthPixels, wc.maxAtlasHeightPixels, wc.maxViewWidthPixels,
+		     wc.maxViewHeightPixels, wc.maxViewCount,
+		     wc.maxAtlasWidthPixels == 0 ? " (none stated: older runtime)" : "");
+	}
+	if (g_pfnEnumModes == nullptr || g_pfnReqMode == nullptr) {
+		LOGI("Display rendering-mode ext entry points not resolved — mode switch disabled");
+		return true;
+	}
+	return read_rendering_modes(/*refresh=*/false);
 }
 
 bool
@@ -1414,6 +1457,15 @@ create_swapchains()
 	if (aw == 0 || ah == 0) { // no mode info → 2x1 of the recommended rect
 		aw = view_configs[0].recommendedImageRectWidth * 2;
 		ah = view_configs[0].recommendedImageRectHeight;
+	}
+	// display_info v28: never smaller than the runtime's stated worst case — the
+	// enumerate shows only the two current slots, and a live 3D-mode switch can
+	// bring in a larger entry. All zero on an older runtime: the size above stands.
+	{
+		const uint32_t cw = aw, ch = ah;
+		dxr::SizeFromWorstCase(g_render_worst_case, false, cw, ch, &aw, &ah);
+		LOGI("Atlas sizing: computed %ux%u, runtime worst case %ux%u -> %ux%u", cw, ch,
+		     g_render_worst_case.maxAtlasWidthPixels, g_render_worst_case.maxAtlasHeightPixels, aw, ah);
 	}
 	g_views[0].width = aw;
 	g_views[0].height = ah;
@@ -1778,6 +1830,21 @@ poll_xr_events()
 			const auto *e = reinterpret_cast<const XrEventDataRenderingModeChangedDXR *>(&ev);
 			LOGI("rendering mode changed: %u -> %u", e->previousModeIndex, e->currentModeIndex);
 			g_rmode_current.store(e->currentModeIndex, std::memory_order_relaxed);
+		} else if (ev.type == (XrStructureType)XR_TYPE_EVENT_DATA_RENDERING_MODE_TABLE_CHANGED_DXR) {
+			// display_info v27: the 3D mode was switched live — the table
+			// changed, the index did not. Re-read it; the per-frame view count,
+			// tile grid and tile size follow from the g_rmode_* arrays.
+			dxr::RenderingModeTableChange change;
+			if (dxr::DecodeRenderingModeTableChanged((const XrEventDataBaseHeader *)&ev, &change)) {
+				LOGI("rendering mode table changed (active mode %u): re-reading it",
+				     change.activeModeIndex);
+				if (g_pfnEnumModes != nullptr) read_rendering_modes(/*refresh=*/true);
+				g_rmode_current.store(change.activeModeIndex, std::memory_order_relaxed);
+				if (change.recreateSwapchains) {
+					LOGI("rendering mode table change asks for swapchain recreation; not "
+					     "implemented — keeping the atlas (the runtime resamples)");
+				}
+			}
 		} else if (ev.type == XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING) {
 			g_exit_requested = true;
 		}
