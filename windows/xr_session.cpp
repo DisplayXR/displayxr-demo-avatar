@@ -398,7 +398,7 @@ bool CreateVulkanInstance(XrSessionManager& xr, VkInstance& vkInstance) {
 
     VkApplicationInfo appInfo = {};
     appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
-    appInfo.pApplicationName = "SR3DGSOpenXRExtVK";
+    appInfo.pApplicationName = "DisplayXR 3D Avatar";
     appInfo.applicationVersion = VK_MAKE_VERSION(1, 0, 0);
     appInfo.pEngineName = "None";
     appInfo.engineVersion = VK_MAKE_VERSION(1, 0, 0);
