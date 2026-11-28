@@ -16,6 +16,8 @@
 #define TINYGLTF_NO_STB_IMAGE_WRITE  // the stb already linked from common/ — avoids a
 #include <tiny_gltf.h>               // duplicate stb implementation (and stb-config bugs)
 #include "stb_image.h"               // declarations only; impl is in common/d3d11_renderer.cpp
+#include "gltf_accessor.h"           // dxr::gltf (displayxr-common >= v2.33.0); after tiny_gltf.h
+                                     // so it static_asserts tinygltf's codes
 
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
@@ -80,8 +82,10 @@ glm::mat4 nodeLocalMatrix(const tinygltf::Node& node) {
     return m;
 }
 
-// Read accessor element `i`, component `c` as float (handles the float and
-// normalized-integer position/normal/uv cases we care about).
+// Raw pointer to element 0 of an accessor and its byte stride. Decodes
+// nothing: only the index, JOINTS_0 and WEIGHTS_0 readers use it, after
+// checkedAccessor() has range-checked the accessor. Float attributes are read
+// by readVec() through dxr::gltf::ReadFloats instead.
 const unsigned char* accessorPtr(const tinygltf::Model& m,
                                  const tinygltf::Accessor& acc,
                                  size_t& strideOut) {
@@ -93,18 +97,20 @@ const unsigned char* accessorPtr(const tinygltf::Model& m,
     return buf.data.data() + bv.byteOffset + acc.byteOffset;
 }
 
+// Read a vertex attribute or morph-target delta accessor as `comps` floats
+// per element through the shared validated reader (displayxr-common
+// gltf_accessor.h): FLOAT passes through; integer components are decoded with
+// the glTF normalized scaling when `normalized` is set (UBYTE c/255, USHORT
+// c/65535, BYTE max(c/127,-1), SHORT max(c/32767,-1)) and cast as-is when not
+// (KHR_mesh_quantization); byteStride is honoured; sparse overrides are
+// applied (on top of zeros when there is no bufferView). primitiveProblem()
+// has already accepted the accessor; a read that still fails leaves `out`
+// empty.
 void readVec(const tinygltf::Model& m, int accessorIdx, int comps,
              std::vector<float>& out) {
     out.clear();
     if (accessorIdx < 0) return;
-    const tinygltf::Accessor& acc = m.accessors[accessorIdx];
-    size_t stride = 0;
-    const unsigned char* base = accessorPtr(m, acc, stride);
-    out.resize(acc.count * comps);
-    for (size_t i = 0; i < acc.count; ++i) {
-        const float* f = reinterpret_cast<const float*>(base + i * stride);
-        for (int c = 0; c < comps; ++c) out[i * comps + c] = f[c];
-    }
+    if (!dxr::gltf::ReadFloats(m, accessorIdx, comps, out)) out.clear();
 }
 
 // Read an accessor as a flat float array (count * numComponents). Returns the
@@ -228,6 +234,30 @@ const tinygltf::Accessor* checkedAccessor(const tinygltf::Model& m, int idx, int
     return &acc;
 }
 
+// `idx` as a vertex attribute (or morph-target delta) that readVec() decodes
+// exactly: an accessor of `type` with one of `compTypes` that
+// dxr::gltf::ResolveAccessor accepts (every index and byte range in bounds,
+// byteStride >= one element, sparse indices and values in range; no
+// bufferView = zeros plus sparse overrides). `intNormalized` = an integer
+// componentType must also be `normalized` (NORMAL and morph NORMAL hold unit
+// vectors). nullptr otherwise.
+const tinygltf::Accessor* decodableAttribute(const tinygltf::Model& m, int idx, int type,
+                                             std::initializer_list<int> compTypes,
+                                             bool intNormalized) {
+    if (idx < 0 || idx >= (int)m.accessors.size()) return nullptr;
+    const tinygltf::Accessor& acc = m.accessors[(size_t)idx];
+    if (acc.type != type) return nullptr;
+    if (std::find(compTypes.begin(), compTypes.end(), acc.componentType) == compTypes.end())
+        return nullptr;
+    if (intNormalized && acc.componentType != TINYGLTF_COMPONENT_TYPE_FLOAT && !acc.normalized)
+        return nullptr;
+    dxr::gltf::AccessorLayout layout;
+    if (!dxr::gltf::ResolveAccessor(m, idx, tinygltf::GetNumComponentsInType((uint32_t)type),
+                                    layout))
+        return nullptr;
+    return &acc;
+}
+
 // Why `prim` cannot be read safely, or nullptr when it can. `skinned` = the
 // primitive will be read as skinned (valid node.skin + JOINTS_0 + WEIGHTS_0).
 const char* primitiveProblem(const tinygltf::Model& m, const tinygltf::Primitive& prim,
@@ -236,11 +266,15 @@ const char* primitiveProblem(const tinygltf::Model& m, const tinygltf::Primitive
     constexpr int kUB = TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE;
     constexpr int kUS = TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT;
     constexpr int kUI = TINYGLTF_COMPONENT_TYPE_UNSIGNED_INT;
+    constexpr int kB  = TINYGLTF_COMPONENT_TYPE_BYTE;
+    constexpr int kS  = TINYGLTF_COMPONENT_TYPE_SHORT;
 
+    // Float attributes accept the componentTypes readVec() decodes: glTF 2.0
+    // core plus KHR_mesh_quantization. Integer NORMALs must be normalized.
     auto itPos = prim.attributes.find("POSITION");
     const tinygltf::Accessor* pos = itPos == prim.attributes.end() ? nullptr
-        : checkedAccessor(m, itPos->second, TINYGLTF_TYPE_VEC3, {kF});
-    if (!pos) return "POSITION accessor is out of range or malformed";
+        : decodableAttribute(m, itPos->second, TINYGLTF_TYPE_VEC3, {kF, kB, kUB, kS, kUS}, false);
+    if (!pos) return "POSITION accessor is out of range, malformed or of an undecodable type";
     const size_t vcount = pos->count;
 
     // An optional attribute must, when present, be readable and per-vertex.
@@ -250,10 +284,18 @@ const char* primitiveProblem(const tinygltf::Model& m, const tinygltf::Primitive
         const tinygltf::Accessor* a = checkedAccessor(m, it->second, type, comps);
         return a != nullptr && a->count == vcount;
     };
-    if (!attrOk("NORMAL", TINYGLTF_TYPE_VEC3, {kF}))
-        return "NORMAL accessor is out of range, malformed or not per-vertex";
-    if (!attrOk("TEXCOORD_0", TINYGLTF_TYPE_VEC2, {kF}))
-        return "TEXCOORD_0 accessor is out of range, malformed or not per-vertex";
+    auto floatAttrOk = [&](const char* name, int type, std::initializer_list<int> comps,
+                           bool intNormalized) {
+        auto it = prim.attributes.find(name);
+        if (it == prim.attributes.end()) return true;
+        const tinygltf::Accessor* a = decodableAttribute(m, it->second, type, comps, intNormalized);
+        return a != nullptr && a->count == vcount;
+    };
+    if (!floatAttrOk("NORMAL", TINYGLTF_TYPE_VEC3, {kF, kB, kS}, true))
+        return "NORMAL accessor is out of range, malformed, of an undecodable type or not per-vertex";
+    if (!floatAttrOk("TEXCOORD_0", TINYGLTF_TYPE_VEC2, {kF, kB, kUB, kS, kUS}, false))
+        return "TEXCOORD_0 accessor is out of range, malformed, of an undecodable type or not "
+               "per-vertex";
     if (skinned) {
         if (!attrOk("JOINTS_0", TINYGLTF_TYPE_VEC4, {kUB, kUS}))
             return "JOINTS_0 accessor is out of range, malformed or not per-vertex";
@@ -264,8 +306,10 @@ const char* primitiveProblem(const tinygltf::Model& m, const tinygltf::Primitive
     for (const auto& tgt : prim.targets) {
         for (const char* name : {"POSITION", "NORMAL"}) {
             auto it = tgt.find(name);
-            if (it != tgt.end() && !checkedAccessor(m, it->second, TINYGLTF_TYPE_VEC3, {kF}))
-                return "morph-target accessor is out of range or malformed";
+            const bool isNormal = std::strcmp(name, "NORMAL") == 0;
+            if (it != tgt.end() &&
+                !decodableAttribute(m, it->second, TINYGLTF_TYPE_VEC3, {kF, kB, kS}, isNormal))
+                return "morph-target accessor is out of range, malformed or of an undecodable type";
         }
     }
 
