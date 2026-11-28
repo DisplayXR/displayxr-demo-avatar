@@ -1434,7 +1434,7 @@ static bool InitializeOpenXR(AppXrSession& xr, DxrWindowBackend requestedBackend
     LOG_INFO("XR_DXR_workspace_client_input: %s", hasWorkspaceInput ? "ENABLED" : "NOT FOUND");
 
     XrInstanceCreateInfo createInfo = {XR_TYPE_INSTANCE_CREATE_INFO};
-    strncpy(createInfo.applicationInfo.applicationName, "AvatarHandleVkLinux",
+    strncpy(createInfo.applicationInfo.applicationName, "DisplayXR 3D Avatar",
             sizeof(createInfo.applicationInfo.applicationName) - 1);
     createInfo.applicationInfo.applicationVersion = 1;
     strncpy(createInfo.applicationInfo.engineName, "None",
@@ -1549,7 +1549,7 @@ static bool CreateVulkanInstance(AppXrSession& xr, VkInstance& vkInstance) {
 
     VkApplicationInfo appInfo = {};
     appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
-    appInfo.pApplicationName = "AvatarHandleVkLinux";
+    appInfo.pApplicationName = "DisplayXR 3D Avatar";
     appInfo.applicationVersion = VK_MAKE_VERSION(1, 0, 0);
     appInfo.pEngineName = "None";
     appInfo.apiVersion = VK_API_VERSION_1_1;
